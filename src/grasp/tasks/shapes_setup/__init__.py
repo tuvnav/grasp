@@ -177,13 +177,8 @@ Reference description:
             {
                 "name": "show_setup",
                 "description": "Show the current patterns and description for the shape index.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": False,
-                },
-                "strict": True,
+                # an empty object schema makes some vllm models generate endlessly
+                "parameters": {},
             },
             {
                 "name": "set_instance_pattern",
@@ -237,6 +232,7 @@ Reference description:
             {
                 "name": "stop",
                 "description": "Stop the setup process.",
+                "parameters": {},
             },
         ]
 
