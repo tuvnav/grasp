@@ -84,7 +84,8 @@ def functions(managers: list[KgManager]) -> list[dict]:
             "name": "confirm_equivalence",
             "description": """\
 Confirms a 1:1 equivalence correspondence between an entity from the source \
-ontology and one from the target ontology suggested by the prematcher.\
+ontology and an entity from the target ontology. This candidate correspondence \
+was suggested by an upstream matcher (the prematcher).\
 """,
             "parameters": {
                 "type": "object",
@@ -106,8 +107,9 @@ ontology and one from the target ontology suggested by the prematcher.\
         {
             "name": "reject_equivalence",
             "description": """\
-Rejects a candidate 1:1 equivalence between a source and a target entity \
-suggested by the prematcher.""",
+Rejects a candidate 1:1 equivalence between an entity from the source \
+ontology and an entity from the target ontology. This candidate correspondence \
+was suggested by an upstream matcher (the prematcher).""",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -128,7 +130,7 @@ suggested by the prematcher.""",
         {
             "name": "undo_verdict",
             "description": """\
-Revokes a previous confirmation or rejection of a candidate euqivalence.""",
+Revokes a previous confirmation or rejection of a candidate equivalence.""",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -147,10 +149,10 @@ Revokes a previous confirmation or rejection of a candidate euqivalence.""",
             "strict": True,
         },
         {
-            "name": "show_decisions",
+            "name": "show_verdicts",
             "description": "Displays the currently confirmed and rejected mappings. "
             "If 'num' is provided, "
-            "it shows a random sample; otherwise, it lists all correspondences.",
+            "it shows a random sample; otherwise, it lists all verdicts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -166,9 +168,7 @@ Revokes a previous confirmation or rejection of a candidate euqivalence.""",
         },
         {
             "name": "stop",
-            "description": "Finalize your mappings and stop the alignment process. May be "
-            "rejected if there is still an unresolved logical conflict in the current "
-            "alignment - resolve it and call this again.",
+            "description": "Finalize your verdicts and stop the process.",
         },
     ]
     return fns
@@ -215,32 +215,31 @@ def add_verdict(
         if equivalent:
             message += f"You confirmed {entity_source} from {kg_source} is equivalent to {entity_target} from {kg_target}."
         else:
-            message += f"You rejected an equivalence between {entity_source} from {kg_source} to {entity_target} from {kg_target}."
+            message += f"You rejected an equivalence between {entity_source} from {kg_source} and {entity_target} from {kg_target}."
 
         if existing_with_source or existing_with_target:
             message += (
-                "\nNotice that you verdict concerns entities "
-                "which are already involved in a previously set verdict:")
+                "\nNotice that your verdict concerns an entity "
+                "which is already involved in another or multiple other verdicts:")
 
         if existing_with_source:
             for v in existing_with_source:
                 message += (
-                    f"\n{v.entity_source.identifier} has been jugded as "
+                    f"\n{v.entity_source.identifier} has been judged as "
                     f"{'' if v.equivalent else 'not '}equivalent to "
                     f"{v.entity_target.identifier}.")
 
         if existing_with_target:
             for v in existing_with_target:
                 message += (
-                    f"\n{v.entity_source.identifier} has been jugded as "
-                    f"{'' if v.equivalent else 'not '} equivalent to "
+                    f"\n{v.entity_source.identifier} has been judged as "
+                    f"{'' if v.equivalent else 'not '}equivalent to "
                     f"{v.entity_target.identifier}.")
 
         if existing_with_source or existing_with_target:
             message += (
-                "\nYou should verify whether your currently set verdict conflicts "
-                "with the previously set ones. If so, use 'undo_verdict' to "
-                "revise your new verdict or old verdicts.")
+                "\nCheck whether this verdict conflicts with the other one(s). "
+                "If so, use 'undo_verdict' to revise either.")
 
         return message
 
@@ -256,15 +255,15 @@ def undo_verdict(
     verdict = state.get_verdict(entity1, entity2)
     if verdict is None:
         raise FunctionCallException(
-            f"There is no verdict concerning a potential equivalence between"
+            f"There is no verdict concerning a potential equivalence between "
             f"{entity1} and {entity2} yet. "
-            "Notice you have to use the full IRI as entity reference."
+            "Note: use the full IRI as the entity reference."
             )
     state.undo_verdict(entity1, entity2)
     if verdict.equivalent:
-        return f"{entity1} and {entity2} are not longer considered as equivalent"
+        return f"{entity1} and {entity2} are no longer considered equivalent"
     else:
-        return f"{entity1} and {entity2} are not longer considered as not equivalent"
+        return f"{entity1} and {entity2} are no longer considered non-equivalent"
 
 
 def call_function(
@@ -285,7 +284,7 @@ def call_function(
 
     if fn_name == "confirm_equivalence":
         if state is None:
-            return "No OracleState was provided. Cannot set verdicts without AlignmentState"
+            return "No OracleState was provided. Cannot record verdicts without an OracleState"
         kg1 = state.task_input.source_kg  # type: ignore
         kg2 = state.task_input.target_kg  # type: ignore
 
@@ -300,7 +299,7 @@ def call_function(
 
     elif fn_name == "reject_equivalence":
         if state is None:
-            return "No OracleState was provided. Cannot set correspondences without AlignmentState"
+            return "No OracleState was provided. Cannot record verdicts without an OracleState"
         kg1 = state.task_input.source_kg  # type: ignore
         kg2 = state.task_input.target_kg  # type: ignore
 
@@ -312,7 +311,7 @@ def call_function(
             know_before_use
         )
 
-    elif fn_name == "show_decisions":
+    elif fn_name == "show_verdicts":
         return state.format(num=fn_args.get("num"))
 
     elif fn_name == "undo_verdict":
@@ -353,18 +352,22 @@ def input_instructions(
         raise FunctionCallException("Input instructions for LLM must contain candidates for equivalence.")
 
     quantifier_qe = "candidate equivalences"
-    filler_1 = "each"
-    filler_2 = " for each "
     if len_qe == 1:
         quantifier_qe = "a candidate equivalence"
-        filler_1 = "it"
-        filler_2 = " "
     instructions += f"You are given {quantifier_qe} found by a prematcher."
     if agentic:
-        instructions += f"""\
-Verify whether {filler_1} is an actual equivalence, and call \
-'confirm_equivalence'{filler_2}if so.\
-"""
+        if len_qe > 1:
+            instructions += (
+                " Verify whether each is an actual equivalence. Call "
+                "'confirm_equivalence' for each one that holds, and "
+                "'reject_equivalence' for each one that does not."
+            )
+        else:
+            instructions += (
+                " Verify whether it is an actual equivalence. Call "
+                "'confirm_equivalence' if it holds, and 'reject_equivalence' "
+                "if it does not."
+            )
     else:
         if len_qe > 1:
             instructions += "Do these equivalences hold? Answer with 'True' or 'False'"
