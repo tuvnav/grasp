@@ -1,29 +1,92 @@
 import random
 from typing import Any
-from enum import StrEnum
 
+from grasp.utils import FunctionCallException
 from pydantic import BaseModel
 from universal_ml_utils.table import generate_table
 
-from grasp.configs import GraspConfig, ShapeConfig
+from grasp.configs import GraspConfig
 from grasp.functions import (
     find_manager,
-    update_known_from_shape_iris,
     SHAPE_CAVEAT,
 )
-from grasp.manager import KgManager, format_kgs
+from grasp.manager import KgManager
 from grasp.model import Message
-from grasp.sparql.types import AskResult
-from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import Entity, prepare_entity
 from grasp.tasks.om import (
-    format_entity, Relation, Correspondence,
-    PotentialCorrespondences, AlignmentTaskInput, AlignmentState,
-    entity_exists_in_kg, ensure_known, get_entity_shape_text
+    format_entity, AlignmentTaskInput,
+    ensure_known, get_entity_shape_text
     )
-from grasp.utils import FunctionCallException, format_list, format_notes
-from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
+
+
+class CandidateEquivalence(BaseModel):
+    entity_source: Entity
+    entity_target: Entity
+
+
+class OracleTaskInput:
+    candidate_equivalences: list[CandidateEquivalence]
+    source_kg: str
+    target_kg: str
+
+
+class Verdict(BaseModel):
+    entity_source: Entity
+    entity_target: Entity
+    equivalent: bool
+
+
+class OracleState:
+    def __init__(self):
+        self.task_input: OracleTaskInput | None = None
+        self.verdicts: dict[str, Verdict]
+
+    def add_verdict(self, verdict: Verdict):
+        self.verdicts[verdict.entity_source.identifier] = verdict
+        self.verdicts[verdict.entity_target.identifier] = verdict
+
+    def undo_verdict(self, entity_source, entity_target):
+        self.verdicts.pop(entity_source)
+        self.verdicts.pop(entity_target)
+
+    def discard_verdict_of(self, entity: str):
+        existing = self.verdicts.pop(entity, None)
+        if existing is None:
+            return
+        other = (
+            existing.entity_target.identifier
+            if existing.entity_source.identifier == entity
+            else existing.entity_source.identifier
+        )
+        self.verdicts.pop(other, None)
+
+    def get_verdict(self, entity) -> Verdict | None:
+        return self.verdicts.get(entity)
+
+    def to_dict(self) -> dict:
+        unique_verdicts = {id(c): c for c in self.verdicts.values()}
+        return {
+            "formatted": self.format(),
+            "verdicts": [c.model_dump() for c in unique_verdicts.values()]
+        }
+
+    def format(self, num: int | None = None) -> str:
+        unique_verdicts = list({id(c): c for c in self.verdicts.values()}.values())
+
+        if not unique_verdicts:
+            return "No verdicts yet."
+
+        if num is not None and num < len(unique_verdicts):
+            unique_verdicts = random.sample(unique_verdicts, num)
+
+        data = [
+            [v.entity_source.identifier, v.entity_target.identifier, str(v.equivalent)]
+            for v in unique_verdicts
+        ]
+        headers = [["Source Entity (Ontology 1)", "Target Entity (Ontology 2)", "Equivalent?"]]
+
+        return generate_table(data=data, headers=headers)
 
 
 def functions(managers: list[KgManager]) -> list[dict]:
@@ -52,18 +115,20 @@ ontology and one from the target ontology suggested by the prematcher.\
             "strict": True,
         },
         {
-            "name": "delete_equivalence",
-            "description": "Delete a formerly confirmed equivalence.",
+            "name": "reject_equivalence",
+            "description": """\
+Rejects a candidate 1:1 equivalence between a source and a target entity \
+suggested by the prematcher.""",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source_entity": {
                         "type": "string",
-                        "description": "The full IRI of the source entity whose correspondence should be removed",
+                        "description": "The full IRI of the source entity",
                     },
                     "target_entity": {
                         "type": "string",
-                        "description": "The full IRI of the target entity whose correspondence should be removed",
+                        "description": "The full IRI of the target entity",
                     },
                 },
                 "required": ["source_entity", "target_entity"],
@@ -72,8 +137,30 @@ ontology and one from the target ontology suggested by the prematcher.\
             "strict": True,
         },
         {
-            "name": "show_correspondences",
-            "description": "Displays the currently confirmed mappings. If 'num' is provided, "
+            "name": "undo_verdict",
+            "description": """\
+Revokes a previous confirmation or rejection of a candidate euqivalence.""",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_entity": {
+                        "type": "string",
+                        "description": "The full IRI of the source entity",
+                    },
+                    "target_entity": {
+                        "type": "string",
+                        "description": "The full IRI of the target entity",
+                    },
+                },
+                "required": ["source_entity", "target_entity"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+        {
+            "name": "show_decisions",
+            "description": "Displays the currently confirmed and rejected mappings. "
+            "If 'num' is provided, "
             "it shows a random sample; otherwise, it lists all correspondences.",
             "parameters": {
                 "type": "object",
@@ -98,17 +185,14 @@ ontology and one from the target ontology suggested by the prematcher.\
     return fns
 
 
-def rules() -> list[str]:
-    return []
-
-
-def confirm_equivalence(
+def add_verdict(
         managers: list[KgManager],
         kg_source: str,
         kg_target: str,
         entity_source: str,
         entity_target: str,
-        state: AlignmentState,
+        equivalent: bool,
+        state: OracleState,
         known: set[str],
         know_before_use: bool = True,
         ) -> str:
@@ -125,28 +209,70 @@ def confirm_equivalence(
             ensure_known(manager_source, full_iri_source, known)
             ensure_known(manager_target, full_iri_target, known)
 
-        correspondence = Correspondence(entity_source=entity_object_source, entity_target=entity_object_target)
-        state.add_1_to_1_correspondence(correspondence)
-        return f"You confirmed {entity_source} from {kg_source} is equivalent to {entity_target} from {kg_target}."
+        message = ""
+
+        existing_source_v = state.get_verdict(full_iri_source)
+        existing_target_v = state.get_verdict(full_iri_target)
+
+        verdict = Verdict(
+            entity_source=entity_object_source,
+            entity_target=entity_object_target,
+            equivalent=equivalent
+        )
+        state.add_verdict(verdict)
+
+        if equivalent:
+            message += f"You confirmed {entity_source} from {kg_source} is equivalent to {entity_target} from {kg_target}."
+        else:
+            message += f"You rejected an equivalence between {entity_source} from {kg_source} to {entity_target} from {kg_target}."
+
+        if existing_source_v or existing_source_v:
+            message += (
+                "\nNotice that you verdict concerns entities "
+                "which are already involved in a previously set verdict:")
+
+        if existing_source_v:
+            message += (
+                f"\n{existing_source_v.entity_source} has been jugded as "
+                f"{"not" if existing_source_v.equivalent else ""} equivalent to "
+                f"{existing_source_v.entity_target}.")
+
+        if existing_target_v:
+            message += (
+                f"\n{existing_target_v.entity_source} has been jugded as "
+                f"{"not" if existing_target_v.equivalent else ""} equivalent to "
+                f"{existing_target_v.entity_target}.")
+
+        if existing_source_v or existing_source_v:
+            message += (
+                "\nYou should verify whether your currently set verdict conflicts "
+                "with the previously set ones. If so, use 'undo_verdict' to "
+                "revise your new verdict or old verdicts.")
+
+        return message
 
     except ValueError as e:
         raise FunctionCallException(str(e)) from e
 
 
-def delete_correspondence(
+def undo_verdict(
         entity1: str,
         entity2: str,
-        state: AlignmentState,
+        state: OracleState,
         ) -> str:
-    correspondence1 = state.get_correspondence(entity1)
-    correspondence2 = state.get_correspondence(entity2)
-    if correspondence1 is None or correspondence1 is not correspondence2:
+    verdict1 = state.get_verdict(entity1)
+    verdict2 = state.get_verdict(entity2)
+    if verdict1 is None or verdict1 is not verdict2:
         raise FunctionCallException(
-            f"There is no Correspondence aligning {entity1} to {entity2} yet. "
+            f"There is no verdict concerning a potential equivalence between"
+            f"{entity1} and {entity2} yet. "
             "Notice you have to use the full IRI as entity reference."
             )
-    state.remove_correspondence(entity1, entity2)
-    return f"Deleted correspondence between {entity1} and {entity2}"
+    state.undo_verdict(entity1, entity2)
+    if verdict1.equivalent:
+        return f"{entity1} and {entity2} are not longer considered as equivalent"
+    else:
+        return f"{entity1} and {entity2} are not longer considered as not equivalent"
 
 
 def call_function(
@@ -155,38 +281,45 @@ def call_function(
     fn_name: str,
     fn_args: dict,
     known: set[str],
-    state: AlignmentState | None = None,
+    state: OracleState | None = None,
     example_indices: dict | None = None,
 ) -> str:
-    assert isinstance(state, AlignmentState), (
-        "Alignments must be provided as state for OM task"
+    assert isinstance(state, OracleState), (
+        "Alignments must be provided as state for OM Oracle task"
     )
-    assert not example_indices, "Example indices are not supported for OM task"
+    assert not example_indices, "Example indices are not supported for OM Oracle task"
 
     om_oracle_kwargs = config.task_kwargs.get("om_oracle", {})
 
     if fn_name == "confirm_equivalence":
         if state is None:
-            return "No AlignmentState was provided. Cannot set correspondences without AlignmentState"
+            return "No OracleState was provided. Cannot set correspondences without AlignmentState"
         kg1 = state.task_input.source_kg  # type: ignore
         kg2 = state.task_input.target_kg  # type: ignore
 
         ent1, ent2 = fn_args["source_entity"], fn_args["target_entity"]
         know_before_use = om_oracle_kwargs.get("know_before_use", True)
 
-        return confirm_equivalence(
-            managers, kg1, kg2, ent1, ent2, state, known,
+        return add_verdict(
+            managers, kg1, kg2, ent1, ent2, True, state, known,
             know_before_use
         )
 
-    elif fn_name == "delete_correspondence":
-        return delete_correspondence(
-            fn_args["source_entity"],
-            fn_args["target_entity"],
-            state
-            )
+    elif fn_name == "reject_equivalence":
+        if state is None:
+            return "No OracleState was provided. Cannot set correspondences without AlignmentState"
+        kg1 = state.task_input.source_kg  # type: ignore
+        kg2 = state.task_input.target_kg  # type: ignore
 
-    elif fn_name == "show_correspondences":
+        ent1, ent2 = fn_args["source_entity"], fn_args["target_entity"]
+        know_before_use = om_oracle_kwargs.get("know_before_use", True)
+
+        return add_verdict(
+            managers, kg1, kg2, ent1, ent2, False, state, known,
+            know_before_use
+        )
+
+    elif fn_name == "show_decisions":
         return state.format(num=fn_args.get("num"))
 
     elif fn_name == "stop":
@@ -197,8 +330,8 @@ def call_function(
 
 
 def input_instructions(
-    task_input: AlignmentTaskInput,
-    state: AlignmentState,
+    task_input: OracleTaskInput,
+    state: OracleState,
     managers: list[KgManager],
     known: set[str],
     agentic: bool = True  # for outside of GRASP use of `input_instructions`
@@ -218,39 +351,35 @@ def input_instructions(
             block += f"\n```shape: \n{shape_text}\n```\n"
         return block
 
-    len_pc = len(task_input.potential_correspondences)
-    if len_pc == 0:
-        raise FunctionCallException("Input instructions for LLM must contain candidates for equivalence")
+    len_qe = len(task_input.candidate_equivalences)
+    if len_qe == 0:
+        raise FunctionCallException("Input instructions for LLM must contain candidates for equivalence.")
 
-    quantity_corrs = "candidate equivalences"
+    quantifier_qe = "candidate equivalences"
     filler_1 = "each"
     filler_2 = " for each "
-    if len_pc == 1:
-        quantity_corrs = "a candidate equivalence"
+    if len_qe == 1:
+        quantifier_qe = "a candidate equivalence"
         filler_1 = "it"
         filler_2 = " "
-    instructions += f"You are given {quantity_corrs} found by a prematcher."
+    instructions += f"You are given {quantifier_qe} found by a prematcher."
     if agentic:
         instructions += f"""\
 Verify whether {filler_1} is an actual equivalence, and call \
 'confirm_equivalence'{filler_2}if so.\
 """
     else:
-        if len_pc > 1:
+        if len_qe > 1:
             instructions += "Do these equivalences hold? Answer with 'True' or 'False'"
         else:
             instructions += "Does this equivalence hold? Answer with 'True' or 'False'"
 
-    for corr in task_input.potential_correspondences:
-        if len_pc > 1:
+    for qe in task_input.candidate_equivalences:
+        if len_qe > 1:
             block_num += 1
             instructions += f"### Entity {block_num}\n"
-        instructions += entity_block(corr.source_entity, source_manager, "Source")
-        if len(corr.candidates) == 1:
-            instructions += entity_block(corr.candidates[0], target_manager, "Target")
-        else:
-            for j, c in enumerate(corr.candidates, start=1):
-                instructions += entity_block(c, target_manager, f"Target Candidate {j}")
+        instructions += entity_block(qe.entity_source, source_manager, "Source")
+        instructions += entity_block(qe.entity_target, target_manager, "Target")
         instructions += "\n"
 
     if shape_shown:
@@ -264,17 +393,14 @@ def input_and_state(
     config: GraspConfig,
     managers: list[KgManager],
     known: set[str],
-) -> tuple[str, AlignmentState]:
+) -> tuple[str, OracleState]:
     try:
-        task_input = AlignmentTaskInput(**input)
+        task_input = OracleTaskInput(**input)
     except Exception as e:
-        raise ValueError("OM task input must match AlignmentTaskInput schema") from e
+        raise ValueError("OM Oracle task input must match OracleTaskInput schema") from e
 
-    state = AlignmentState()
+    state = OracleState()
     state.task_input = task_input
-    for correspondence in state.task_input.input_alignment:
-        state.add_1_to_1_correspondence(correspondence)
-
     instructions = input_instructions(task_input, state, managers, known)
     return instructions, state
 
@@ -290,7 +416,8 @@ class OmOracleTask(GraspTask):
 
     def system_information(self) -> str:
         output = ""
-        prompt_file = self.config.task_kwargs["om_oracle"]["prompt_file"]
+        om_oracle_kwargs = self.config.task_kwargs.get("om_oracle", {})
+        prompt_file = om_oracle_kwargs.get("prompt_file")
         if prompt_file is not None:
             with open(prompt_file, "r") as f:
                 output = "\n".join(f.readlines())
