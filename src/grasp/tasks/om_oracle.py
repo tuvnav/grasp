@@ -246,8 +246,8 @@ Verify whether {filler_1} is an actual equivalence, and call \
             block_num += 1
             instructions += f"### Entity {block_num}\n"
         instructions += entity_block(corr.source_entity, source_manager, "Source")
-        if len(corr.candidates) > 1:
-            instructions += entity_block(c, target_manager, "Target")
+        if len(corr.candidates) == 1:
+            instructions += entity_block(corr.candidates[0], target_manager, "Target")
         else:
             for j, c in enumerate(corr.candidates, start=1):
                 instructions += entity_block(c, target_manager, f"Target Candidate {j}")
