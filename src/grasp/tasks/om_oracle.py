@@ -25,7 +25,7 @@ class CandidateEquivalence(BaseModel):
     entity_target: Entity
 
 
-class OracleTaskInput:
+class OracleTaskInput(BaseModel):
     candidate_equivalences: list[CandidateEquivalence]
     source_kg: str
     target_kg: str
@@ -40,49 +40,38 @@ class Verdict(BaseModel):
 class OracleState:
     def __init__(self):
         self.task_input: OracleTaskInput | None = None
-        self.verdicts: dict[str, Verdict]
+        self.verdicts: dict[tuple[str, str], Verdict] = {}
 
     def add_verdict(self, verdict: Verdict):
-        self.verdicts[verdict.entity_source.identifier] = verdict
-        self.verdicts[verdict.entity_target.identifier] = verdict
+        self.verdicts[(
+            verdict.entity_source.identifier, verdict.entity_target.identifier
+        )] = verdict
 
     def undo_verdict(self, entity_source, entity_target):
-        self.verdicts.pop(entity_source)
-        self.verdicts.pop(entity_target)
+        self.verdicts.pop((entity_source, entity_target), None)
 
-    def discard_verdict_of(self, entity: str):
-        existing = self.verdicts.pop(entity, None)
-        if existing is None:
-            return
-        other = (
-            existing.entity_target.identifier
-            if existing.entity_source.identifier == entity
-            else existing.entity_source.identifier
-        )
-        self.verdicts.pop(other, None)
-
-    def get_verdict(self, entity) -> Verdict | None:
-        return self.verdicts.get(entity)
+    def get_verdict(self, entity_source, entity_target) -> Verdict | None:
+        return self.verdicts.get((entity_source, entity_target))
 
     def to_dict(self) -> dict:
-        unique_verdicts = {id(c): c for c in self.verdicts.values()}
+        verdicts = list(self.verdicts.values())
         return {
             "formatted": self.format(),
-            "verdicts": [c.model_dump() for c in unique_verdicts.values()]
+            "verdicts": [v.model_dump() for v in verdicts]
         }
 
     def format(self, num: int | None = None) -> str:
-        unique_verdicts = list({id(c): c for c in self.verdicts.values()}.values())
+        verdicts = list(self.verdicts.values())
 
-        if not unique_verdicts:
+        if not verdicts:
             return "No verdicts yet."
 
-        if num is not None and num < len(unique_verdicts):
-            unique_verdicts = random.sample(unique_verdicts, num)
+        if num is not None and num < len(verdicts):
+            verdicts = random.sample(verdicts, num)
 
         data = [
             [v.entity_source.identifier, v.entity_target.identifier, str(v.equivalent)]
-            for v in unique_verdicts
+            for v in verdicts
         ]
         headers = [["Source Entity (Ontology 1)", "Target Entity (Ontology 2)", "Equivalent?"]]
 
@@ -211,8 +200,10 @@ def add_verdict(
 
         message = ""
 
-        existing_source_v = state.get_verdict(full_iri_source)
-        existing_target_v = state.get_verdict(full_iri_target)
+        existing_with_source = [v for (s, t), v in state.verdicts.items()
+                                if s == full_iri_source and t != full_iri_target]
+        existing_with_target = [v for (s, t), v in state.verdicts.items()
+                                if t == full_iri_target and s != full_iri_source]
 
         verdict = Verdict(
             entity_source=entity_object_source,
@@ -226,24 +217,26 @@ def add_verdict(
         else:
             message += f"You rejected an equivalence between {entity_source} from {kg_source} to {entity_target} from {kg_target}."
 
-        if existing_source_v or existing_source_v:
+        if existing_with_source or existing_with_target:
             message += (
                 "\nNotice that you verdict concerns entities "
                 "which are already involved in a previously set verdict:")
 
-        if existing_source_v:
-            message += (
-                f"\n{existing_source_v.entity_source} has been jugded as "
-                f"{"not" if existing_source_v.equivalent else ""} equivalent to "
-                f"{existing_source_v.entity_target}.")
+        if existing_with_source:
+            for v in existing_with_source:
+                message += (
+                    f"\n{v.entity_source.identifier} has been jugded as "
+                    f"{'' if v.equivalent else 'not '}equivalent to "
+                    f"{v.entity_target.identifier}.")
 
-        if existing_target_v:
-            message += (
-                f"\n{existing_target_v.entity_source} has been jugded as "
-                f"{"not" if existing_target_v.equivalent else ""} equivalent to "
-                f"{existing_target_v.entity_target}.")
+        if existing_with_target:
+            for v in existing_with_target:
+                message += (
+                    f"\n{v.entity_source.identifier} has been jugded as "
+                    f"{'' if v.equivalent else 'not '} equivalent to "
+                    f"{v.entity_target.identifier}.")
 
-        if existing_source_v or existing_source_v:
+        if existing_with_source or existing_with_target:
             message += (
                 "\nYou should verify whether your currently set verdict conflicts "
                 "with the previously set ones. If so, use 'undo_verdict' to "
@@ -260,16 +253,15 @@ def undo_verdict(
         entity2: str,
         state: OracleState,
         ) -> str:
-    verdict1 = state.get_verdict(entity1)
-    verdict2 = state.get_verdict(entity2)
-    if verdict1 is None or verdict1 is not verdict2:
+    verdict = state.get_verdict(entity1, entity2)
+    if verdict is None:
         raise FunctionCallException(
             f"There is no verdict concerning a potential equivalence between"
             f"{entity1} and {entity2} yet. "
             "Notice you have to use the full IRI as entity reference."
             )
     state.undo_verdict(entity1, entity2)
-    if verdict1.equivalent:
+    if verdict.equivalent:
         return f"{entity1} and {entity2} are not longer considered as equivalent"
     else:
         return f"{entity1} and {entity2} are not longer considered as not equivalent"
@@ -293,11 +285,12 @@ def call_function(
 
     if fn_name == "confirm_equivalence":
         if state is None:
-            return "No OracleState was provided. Cannot set correspondences without AlignmentState"
+            return "No OracleState was provided. Cannot set verdicts without AlignmentState"
         kg1 = state.task_input.source_kg  # type: ignore
         kg2 = state.task_input.target_kg  # type: ignore
 
         ent1, ent2 = fn_args["source_entity"], fn_args["target_entity"]
+
         know_before_use = om_oracle_kwargs.get("know_before_use", True)
 
         return add_verdict(
@@ -321,6 +314,10 @@ def call_function(
 
     elif fn_name == "show_decisions":
         return state.format(num=fn_args.get("num"))
+
+    elif fn_name == "undo_verdict":
+        ent1, ent2 = fn_args["source_entity"], fn_args["target_entity"]
+        return undo_verdict(ent1, ent2, state)
 
     elif fn_name == "stop":
         return "Stopping"
