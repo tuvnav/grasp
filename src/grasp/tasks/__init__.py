@@ -19,6 +19,7 @@ from grasp.tasks.sparql_qa import SparqlQaTask
 from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
 from grasp.tasks.om import OmTask
+from grasp.tasks.om_oracle import OmOracleTask
 
 
 # official tasks supported by GRASP, excluding exploration
@@ -31,6 +32,7 @@ class Task(StrEnum):
     S2Q = "sparql-to-question"
     ENTITY_LINKING = "entity-linking"
     OM = "om"
+    OM_ORACLE = "om-oracle"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {
@@ -50,6 +52,7 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         AutoSetupTask,
         OmTask,
         ShapesSetupTask,
+        OmOracleTask
     ]
 }
 
