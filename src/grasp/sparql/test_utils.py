@@ -9,13 +9,16 @@ from grasp.sparql.utils import (
     stream_with_timeout,
     complete_prefix,
     derive_constraint_query_from_sparql,
+    filter_out_blank_node_identifiers,
     find,
     find_connected_top_level_triples,
     fix_prefixes,
+    is_blank_node_identifier,
     load_iri_and_literal_parser,
     load_sparql_parser,
     parse_string,
     parse_to_string_with_whitespace,
+    prepare_identifier_for_sparql,
     query_type,
 )
 
@@ -668,3 +671,44 @@ class TestParseToStringWithWhitespace:
         assert clause is not None
         out = parse_to_string_with_whitespace(clause, sparql.encode())
         assert out == "SELECT ?x"
+
+
+class TestBlankNodeIdentifiers:
+    # regression: a blank node identifier (e.g. one that ended up "known"
+    # because it was mistakenly indexed as an entity, see
+    # conference_ekaw's real entity index) used to be embedded unwrapped
+    # into a VALUES clause by prepare_identifier_for_sparql, exactly like a
+    # real IRI - which breaks the whole VALUES clause it appears in, since
+    # blank node labels are not valid, stable, citable constants across
+    # separate queries.
+
+    def test_is_blank_node_identifier_true_for_bnode(self):
+        assert is_blank_node_identifier("_:bn7", IRI_PARSER)
+
+    def test_is_blank_node_identifier_false_for_uri(self):
+        assert not is_blank_node_identifier("http://ekaw#Document", IRI_PARSER)
+
+    def test_is_blank_node_identifier_false_for_prefixed_uri(self):
+        assert not is_blank_node_identifier("wd:Q7", IRI_PARSER)
+
+    def test_prepare_identifier_for_sparql_does_not_wrap_blank_node(self):
+        # documents the underlying issue: prepare_identifier_for_sparql alone
+        # does not reject blank nodes, so callers batching several
+        # identifiers into one VALUES clause must filter them out first
+        # (via filter_out_blank_node_identifiers) rather than assume every
+        # identifier is safe to embed as-is
+        assert prepare_identifier_for_sparql("_:bn7", IRI_PARSER) == "_:bn7"
+
+    def test_filter_out_blank_node_identifiers_drops_only_bnodes(self):
+        identifiers = [
+            "http://ekaw#Document",
+            "_:bn7",
+            "_:bn30",
+            "http://ekaw#Paper",
+        ]
+        kept = filter_out_blank_node_identifiers(identifiers, IRI_PARSER)
+        assert kept == ["http://ekaw#Document", "http://ekaw#Paper"]
+
+    def test_filter_out_blank_node_identifiers_keeps_all_when_no_bnodes(self):
+        identifiers = ["http://ekaw#Document", "http://ekaw#Paper"]
+        assert filter_out_blank_node_identifiers(identifiers, IRI_PARSER) == identifiers

@@ -129,15 +129,20 @@ class OpenAICompletionsModel(Model):
         if config is None:
             config = self.config
 
-        response: ChatCompletion = self.client.chat.completions.create(
-            model=config.model,
-            messages=self.prepare_messages(messages),  # type: ignore
-            tools=[{"type": "function", "function": fn} for fn in fns],  # type: ignore
-            tool_choice=config.tool_choice,  # type: ignore
-            parallel_tool_calls=config.parallel_tool_calls,
-            max_completion_tokens=config.max_completion_tokens,
+        kwargs: dict[str, Any] = {
+            "model": config.model,
+            "messages": self.prepare_messages(messages),
+            "max_completion_tokens": config.max_completion_tokens,
             **config.model_kwargs,
-        )
+        }
+        if fns:
+            # some backends (e.g. vLLM behind litellm) reject an explicit but
+            # empty "tools" array instead of treating it like an omitted one
+            kwargs["tools"] = [{"type": "function", "function": fn} for fn in fns]
+            kwargs["tool_choice"] = config.tool_choice
+            kwargs["parallel_tool_calls"] = config.parallel_tool_calls
+
+        response: ChatCompletion = self.client.chat.completions.create(**kwargs)  # type: ignore
 
         check_api_response(response, ChatCompletion, config.model_endpoint)
 
@@ -327,18 +332,23 @@ class OpenAIResponsesModel(Model):
         if config is None:
             config = self.config
 
-        # use responses API
-        response = self.client.responses.create(
-            model=config.model,
-            input=self.prepare_input(messages),  # type: ignore
-            tools=[{"type": "function", **fn} for fn in fns],  # type: ignore
-            tool_choice=config.tool_choice,  # type: ignore
-            parallel_tool_calls=config.parallel_tool_calls,
-            max_output_tokens=config.max_completion_tokens,
+        kwargs: dict[str, Any] = {
+            "model": config.model,
+            "input": self.prepare_input(messages),
+            "max_output_tokens": config.max_completion_tokens,
             **config.model_kwargs,
-            store=False,
-            include=["reasoning.encrypted_content", "message.input_image.image_url"],
-        )
+            "store": False,
+            "include": ["reasoning.encrypted_content", "message.input_image.image_url"],
+        }
+        if fns:
+            # some backends reject an explicit but empty "tools" array instead
+            # of treating it like an omitted one
+            kwargs["tools"] = [{"type": "function", **fn} for fn in fns]
+            kwargs["tool_choice"] = config.tool_choice
+            kwargs["parallel_tool_calls"] = config.parallel_tool_calls
+
+        # use responses API
+        response = self.client.responses.create(**kwargs)  # type: ignore
 
         check_api_response(response, OpenAIResponse, config.model_endpoint)
 

@@ -385,6 +385,14 @@ def generate(
                 # we are done
                 should_stop = True
 
+        if should_stop:
+            incomplete_reason = task.incomplete_reason()
+            if incomplete_reason is not None:
+                logger.warning(f"Task reports incomplete state: {incomplete_reason}")
+                messages.append(Message.user(incomplete_reason, name="incomplete"))
+                yield {"type": "incomplete", "content": incomplete_reason}
+                should_stop = False
+
         # only log now to show also tool calls results
         logger.debug(format_response(response))
 

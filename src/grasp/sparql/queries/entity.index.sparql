@@ -6,7 +6,7 @@ SELECT DISTINCT ?id ?value ?tags WHERE {
   # Get ids and their frequencies for score
   {
     SELECT ?id (SUM(?freq) AS ?score) WHERE {
-      { SELECT ?id ("SUB" AS ?pos) (COUNT(?id) AS ?freq) WHERE { ?id ?p ?o } GROUP BY ?id } 
+      { SELECT ?id ("SUB" AS ?pos) (COUNT(?id) AS ?freq) WHERE { ?id ?p ?o . FILTER(ISIRI(?id)) } GROUP BY ?id }
       UNION
       { SELECT ?id ("OBJ" AS ?pos) (COUNT(?id) AS ?freq) WHERE { ?s ?p ?id . FILTER(ISIRI(?id)) } GROUP BY ?id }
     } GROUP BY ?id

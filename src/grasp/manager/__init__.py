@@ -58,6 +58,7 @@ from grasp.sparql.utils import (
     ask_to_select,
     derive_constraint_query_from_sparql,
     execute,
+    filter_out_blank_node_identifiers,
     find_longest_prefix,
     fix_prefixes,
     format_identifier,
@@ -730,6 +731,9 @@ class KgManager:
         try:
             assert "{IDS}" in info_sparql, (
                 "SPARQL must contain {IDS} placeholder for identifiers"
+            )
+            identifiers = filter_out_blank_node_identifiers(
+                identifiers, self.iri_literal_parser, self.logger
             )
             info_sparql = info_sparql.replace(
                 "{IDS}",

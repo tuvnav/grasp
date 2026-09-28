@@ -360,7 +360,10 @@ def input_instructions(
             instructions += (
                 " Verify whether each is an actual equivalence. Call "
                 "'confirm_equivalence' for each one that holds, and "
-                "'reject_equivalence' for each one that does not."
+                "'reject_equivalence' for each one that does not. You may "
+                "call these functions multiple times within the same turn "
+                "(once per candidate) instead of one at a time, once you "
+                "have gathered enough information to judge several of them."
             )
         else:
             instructions += (
@@ -369,15 +372,12 @@ def input_instructions(
                 "if it does not."
             )
     else:
-        if len_qe > 1:
-            instructions += "Do these equivalences hold? Answer with 'True' or 'False'"
-        else:
-            instructions += "Does this equivalence hold? Answer with 'True' or 'False'"
+        instructions += "Does this equivalence hold? Answer with exactly one word: 'True' or 'False'"
 
     for qe in task_input.candidate_equivalences:
         if len_qe > 1:
             block_num += 1
-            instructions += f"### Entity {block_num}\n"
+            instructions += f"\n### Entity {block_num}\n"
         instructions += entity_block(qe.entity_source, source_manager, "Source")
         instructions += entity_block(qe.entity_target, target_manager, "Target")
         instructions += "\n"
@@ -424,13 +424,39 @@ class OmOracleTask(GraspTask):
         return output
 
     def rules(self) -> list[str]:
-        return []
+        return [
+            "Before calling 'stop', make sure every candidate equivalence you "
+            "were given has been judged via 'confirm_equivalence' or "
+            "'reject_equivalence'. If any are still missing a verdict when "
+            "you try to stop, you will be asked to judge them first.",
+        ]
 
     def function_definitions(self) -> list[dict]:
         return functions(self.managers)
 
     def output(self, messages: list[Message]) -> dict:
         return self.state.to_dict()
+
+    def incomplete_reason(self) -> str | None:
+        task_input = self.state.task_input
+        if task_input is None:
+            return None
+
+        all_pairs = [
+            (ce.entity_source.identifier, ce.entity_target.identifier)
+            for ce in task_input.candidate_equivalences
+        ]
+        missing = [pair for pair in all_pairs if pair not in self.state.verdicts]
+        if not missing:
+            return None
+
+        lines = "\n".join(f"- {source} <-> {target}" for source, target in missing)
+        return (
+            f"You have not yet judged {len(missing)} of the "
+            f"{len(all_pairs)} candidate equivalence(s) you were given. "
+            "Call 'confirm_equivalence' or 'reject_equivalence' for each of "
+            f"the following before stopping:\n{lines}"
+        )
 
     def call_function(
         self,

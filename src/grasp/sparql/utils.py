@@ -3,7 +3,8 @@ import re
 import time
 import uuid
 from copy import deepcopy
-from typing import Any, Iterator
+from logging import Logger
+from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse, urlunparse
 
 import ijson
@@ -1194,6 +1195,47 @@ def prepare_identifier_for_sparql(identifier: str, parser: LR1Parser) -> str:
         return identifier
 
     return binding.sparql()
+
+
+def is_blank_node_identifier(identifier: str, parser: LR1Parser) -> bool:
+    """
+    Whether `identifier` denotes an RDF blank node (e.g. "_:bn7"). Blank node
+    labels are scoped to a single query result/graph and cannot be used as
+    stable, citable constants across separate queries - embedding one in a
+    VALUES clause (as if it were an IRI) is invalid usage that silently
+    breaks the whole VALUES list it appears in, not just that one entry.
+    """
+    binding = parse_into_binding(identifier, parser)
+    return binding is not None and binding.typ == "bnode"
+
+
+def filter_out_blank_node_identifiers(
+    identifiers: Iterable[str],
+    parser: LR1Parser,
+    logger: Logger | None = None,
+) -> list[str]:
+    """
+    Drops blank-node identifiers from `identifiers` before they get embedded
+    in a VALUES clause (see is_blank_node_identifier) - a stray blank node
+    (e.g. one that ended up "known" because it was mistakenly indexed as an
+    entity) would otherwise break the query for every other identifier
+    batched alongside it, not just itself.
+    """
+    kept = []
+    dropped = []
+    for identifier in identifiers:
+        if is_blank_node_identifier(identifier, parser):
+            dropped.append(identifier)
+        else:
+            kept.append(identifier)
+
+    if dropped and logger is not None:
+        logger.debug(
+            f"Dropped {len(dropped)} blank node identifier(s) before building "
+            f"a SPARQL VALUES clause (not valid as stable constants): {dropped}"
+        )
+
+    return kept
 
 
 def format_literal(

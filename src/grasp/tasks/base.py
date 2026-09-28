@@ -65,6 +65,17 @@ class GraspTask(ABC):
         assert isinstance(input, str), f"Input for {self.name} must be a string"
         return input
 
+    def incomplete_reason(self) -> str | None:
+        """
+        Optional hook, checked whenever the model is about to stop (either via
+        an explicit task-defined "done" tool call, or by emitting a response
+        with no tool calls at all). Returning a non-None message tells
+        core.generate() the task isn't actually finished: the message is
+        injected as a user turn and the loop continues instead of ending.
+        Default: never incomplete (most tasks don't need this).
+        """
+        return None
+
     @property
     def default_input_field(self) -> str | None:
         return None

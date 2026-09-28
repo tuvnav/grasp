@@ -116,6 +116,15 @@ class ModelConfig(BaseModel):
     max_completion_tokens: int = 8192  # 8k, leaves enough space for reasoning models
     num_retries: int = 2
 
+    # separate from num_retries (the SDK client's own low-level retry count,
+    # meant for transient connection blips): a 429 rate/budget limit can stay
+    # in effect for tens of seconds, well beyond what a couple of quick SDK
+    # retries can ride out - especially for a fast, non-agentic model that
+    # can otherwise fire off many requests within a single minute. Model.
+    # __call__ retries specifically on HTTP 429 with this fixed backoff.
+    rate_limit_max_retries: int = 5
+    rate_limit_backoff_seconds: float = 30.0
+
 
 class JudgeConfig(ModelConfig):
     # optional knowledge graph; required when judge evaluation is run with

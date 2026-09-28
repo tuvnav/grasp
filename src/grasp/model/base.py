@@ -119,17 +119,30 @@ class Response(BaseModel):
         return content
 
     def hash(self) -> str:
-        msg: dict[str, Any] = {
-            "msg": self.message.content
-            if isinstance(self.message, ResponseMessage)
-            else self.message,
-            "reasoning": self.reasoning.model_dump(exclude={"id"})
-            if self.reasoning
-            else None,
-            "tool_calls": sorted(
-                (tc.name, json.dumps(tc.args, sort_keys=True)) for tc in self.tool_calls
-            ),
-        }
+        # loop detection cares about whether the model is stuck making the
+        # same tool call(s) again, regardless of any surrounding free-text
+        # commentary - a chatty model can phrase its reasoning differently
+        # every turn while repeating the exact same (often broken) tool call,
+        # which a hash mixing in that free text would never flag as a repeat.
+        # Only fall back to comparing message/reasoning text when there are
+        # no tool calls to key off of (e.g. the model repeating a plain
+        # non-answer).
+        if self.tool_calls:
+            msg: dict[str, Any] = {
+                "tool_calls": sorted(
+                    (tc.name, json.dumps(tc.args, sort_keys=True))
+                    for tc in self.tool_calls
+                ),
+            }
+        else:
+            msg = {
+                "msg": self.message.content
+                if isinstance(self.message, ResponseMessage)
+                else self.message,
+                "reasoning": self.reasoning.model_dump(exclude={"id"})
+                if self.reasoning
+                else None,
+            }
         return json.dumps(msg, sort_keys=True)
 
 
@@ -157,7 +170,22 @@ class Model:
 
     def __call__(self, *args, **kwargs) -> Response:
         start = time.monotonic()
-        response = self.call(*args, **kwargs)
+        attempt = 0
+        while True:
+            try:
+                response = self.call(*args, **kwargs)
+                break
+            except Exception as e:
+                # some backends (e.g. a shared OpenWebUI deployment) enforce a
+                # per-minute request/budget limit that a fast, non-agentic
+                # model can trip by firing off many short requests in a row -
+                # the client's own num_retries is meant for brief connection
+                # blips, not a limit that stays in effect for tens of seconds,
+                # so this is a separate, longer backoff specifically for 429s
+                if getattr(e, "status_code", None) != 429 or attempt >= self.config.rate_limit_max_retries:
+                    raise
+                attempt += 1
+                time.sleep(self.config.rate_limit_backoff_seconds)
         response.elapsed = time.monotonic() - start
         return response
 
