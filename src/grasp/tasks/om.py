@@ -1,9 +1,9 @@
 import random
-from typing import Any
-from enum import StrEnum
+from collections import deque
+from typing import Any, Literal
 
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from universal_ml_utils.table import generate_table
 
 from grasp.configs import GraspConfig, ShapeConfig
@@ -35,16 +35,99 @@ def format_entity(entity: Entity) -> str:
     return output
 
 
-class Relation(StrEnum):
-    EQUIVALENCE = "="
-    SUBSUMPTION = "<="
-    COMPLEX = "complex"
+class RelationSpec(BaseModel):
+    """
+    A relation that may hold between a source and a target entity, together
+    with the mathematical properties the system uses for consistency checks.
+    `iri` is the relation's identifier; for OAEI relations the Alignment API
+    symbol (e.g. "=") is used so that exported alignments stay unchanged.
+    """
+    iri: str
+    description: str
+    symmetric: bool = False
+    transitive: bool = False
+    inverse_of: str | None = None
+    # relations that cannot hold for the same entity pair simultaneously
+    excludes: list[str] = []
+    # weaker relations that hold for an entity pair whenever this one holds
+    # (e.g. skos:exactMatch implies skos:closeMatch)
+    implies: list[str] = []
+
+    @model_validator(mode="after")
+    def check_symmetry(self) -> "RelationSpec":
+        # a relation is symmetric iff it is its own inverse
+        if self.symmetric:
+            if self.inverse_of is None:
+                self.inverse_of = self.iri
+            elif self.inverse_of != self.iri:
+                raise ValueError(
+                    f"Relation {self.iri} is symmetric, so it must be its "
+                    f"own inverse, but inverse_of is {self.inverse_of}"
+                )
+        elif self.inverse_of == self.iri:
+            self.symmetric = True
+        return self
+
+
+class RelationProfile(BaseModel):
+    """
+    The set of relations the LLM may choose from within one alignment task.
+    """
+    name: str
+    relations: list[RelationSpec]
+    # alignment-level cardinality in Alignment API notation (11, 1?, ??, **);
+    # informational for now, not enforced
+    cardinality: str = "**"
+
+    @model_validator(mode="after")
+    def check_references(self) -> "RelationProfile":
+        iris = [r.iri for r in self.relations]
+        if not iris:
+            raise ValueError(f"Relation profile {self.name} has no relations")
+        if len(iris) != len(set(iris)):
+            raise ValueError(f"Relation profile {self.name} has duplicate relations")
+        for r in self.relations:
+            for ref in [r.inverse_of, *r.excludes, *r.implies]:
+                if ref is not None and ref not in iris:
+                    raise ValueError(
+                        f"Relation {r.iri} in profile {self.name} references "
+                        f"unknown relation {ref}"
+                    )
+        return self
+
+    def get(self, iri: str) -> RelationSpec | None:
+        return next((r for r in self.relations if r.iri == iri), None)
+
+
+EQUIVALENCE = RelationSpec(
+    iri="=",
+    description="The source and the target entity denote an equivalent concept.",
+    symmetric=True,
+    transitive=True,
+)
+
+RELATION_PROFILES: dict[str, RelationProfile] = {
+    "equivalence": RelationProfile(
+        name="equivalence", relations=[EQUIVALENCE], cardinality="11"
+    ),
+}
+
+
+def get_relation_profile(config: GraspConfig) -> RelationProfile:
+    name = config.task_kwargs.get("om", {}).get("relation_profile", "equivalence")
+    if name not in RELATION_PROFILES:
+        raise ValueError(
+            f"Unknown relation profile {name}, available: {list(RELATION_PROFILES)}"
+        )
+    return RELATION_PROFILES[name]
+
+
+Side = Literal["source", "target"]
 
 
 class Correspondence(BaseModel):
-    # TODO: Enxtendable to handle an entity from
-    # one ontology and a corresponding complex
-    # pattern from another onology?
+    # TODO: Enxtendable to handle complex patterns
+    # besides atomic components?
     """
     A singe correspondence between two entities
     from different ontologies.
@@ -54,7 +137,12 @@ class Correspondence(BaseModel):
 
     # OAEI standard
     measure: float = 1.0
-    relation: Relation = Relation.EQUIVALENCE
+    # iri of a RelationSpec from the task's relation profile
+    relation: str = EQUIVALENCE.iri
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.entity_source.identifier, self.entity_target.identifier, self.relation)
 
 
 class PotentialCorrespondences(BaseModel):
@@ -75,104 +163,206 @@ class AlignmentTaskInput(BaseModel):
 
 class AlignmentState:
 
-    __global_correspondences: dict[str, Correspondence] = {}
+    # class-level on purpose: shared across all jsonl lines processed in one
+    # process, so single-entity runs build on each other's correspondences
+    __global_correspondences: dict[tuple[str, str, str], Correspondence] = {}
 
-    def __init__(self):
+    def __init__(self, profile: RelationProfile | None = None):
         self.task_input: AlignmentTaskInput | None = None
-        # mapping from each processed entity IRI to its correspondence object
-        self.correspondences: dict[str, Correspondence] = AlignmentState.__global_correspondences
+        self.profile = profile or RELATION_PROFILES["equivalence"]
+        # mapping from (source IRI, target IRI, relation) to the correspondence;
+        # an entity pair may hold several relations
+        self.correspondences: dict[tuple[str, str, str], Correspondence] = AlignmentState.__global_correspondences
+        # TODO: Dicts for entity -> Correspondences
+        # consistency warnings already shown to the LLM: key of the proposed
+        # correspondence -> keys of the existing correspondences the warning
+        # was about. Per conversation, unlike the shared correspondences.
+        self.pending_warnings: dict[tuple[str, str, str], frozenset[tuple[str, str, str]]] = {}
 
-    def add_1_to_1_correspondence(self, correspondence: Correspondence):
-        self.correspondences[correspondence.entity_source.identifier] = correspondence
-        self.correspondences[correspondence.entity_target.identifier] = correspondence
+    @classmethod
+    def clear_global(cls):
+        cls.__global_correspondences.clear()
 
-    def get_correspondence(self, entity: str) -> Correspondence | None:
-        """
-        returns a `Correspondence`-object in which the full IRI `entity`
-        is mapped to another entity or `None`, if `entity` is not
-        matched yet.
-        """
-        return self.correspondences.get(entity)
+    def add_correspondence(self, correspondence: Correspondence):
+        """Adds the correspondence without any checks."""
+        self.correspondences[correspondence.key] = correspondence
 
-    def remove_correspondence(self, entity_source: str, entity_target: str):
-        self.correspondences.pop(entity_source)
-        self.correspondences.pop(entity_target)
+    def get_correspondence(
+        self, entity_source: str, entity_target: str, relation: str
+    ) -> Correspondence | None:
+        return self.correspondences.get((entity_source, entity_target, relation))
 
-    def discard_correspondence_of(self, entity: str):
+    def remove_correspondence(
+        self, entity_source: str, entity_target: str, relation: str
+    ) -> Correspondence | None:
+        return self.correspondences.pop((entity_source, entity_target, relation), None)
+
+    def correspondences_of_pair(self, entity_source: str, entity_target: str) -> list[Correspondence]:
+        """All correspondences between `entity_source` and `entity_target`, of any relation."""
+        return [
+            c for key, c in self.correspondences.items()
+            if key[0] == entity_source and key[1] == entity_target
+        ]
+
+    # TODO: To be optimized by using a dict entity -> Correspondences
+    def correspondences_of(
+        self,
+        entity: str,
+        side: Side,
+        relation: str | None = None,
+    ) -> list[Correspondence]:
         """
-        Removes whatever correspondence `entity` is currently part of (if any),
-        fully - i.e. also pops its *other* side's dict entry, not just `entity`
-        itself. Used to clean up before overwriting, so the previous
-        correspondence's other side does not linger as a stale, dangling entry
-        that still shows up in the final alignment.
+        All correspondences in which the full IRI `entity` takes part as
+        source or target entity (`side`), optionally only those of `relation`.
         """
-        existing = self.correspondences.pop(entity, None)
-        if existing is None:
-            return
-        other = (
-            existing.entity_target.identifier
-            if existing.entity_source.identifier == entity
-            else existing.entity_source.identifier
-        )
-        self.correspondences.pop(other, None)
+        idx = 0 if side == "source" else 1
+        return [
+            c for key, c in self.correspondences.items()
+            if key[idx] == entity and (relation is None or c.relation == relation)
+        ]
+
+    def discard_correspondences_of(self, entity: str, side: Side, relation: str | None = None):
+        for c in self.correspondences_of(entity, side, relation):
+            self.correspondences.pop(c.key, None)
+
+    def connected_correspondences(
+        self,
+        entity_source: str,
+        entity_target: str,
+        relation: str,
+    ) -> list[Correspondence]:
+        """
+        All existing correspondences of `relation` that would end up in one
+        connected component with the (possibly not yet existing) pair
+        (`entity_source`, `entity_target`). For a symmetric and transitive
+        relation all entities of this component are implied to be pairwise
+        related by it.
+        """
+        # nodes are (side, IRI), since the same IRI may occur in both ontologies
+        start: list[tuple[Side, str]] = [("source", entity_source), ("target", entity_target)]
+        seen = set(start)
+        queue = deque(start)
+        found: dict[tuple[str, str, str], Correspondence] = {}
+        while queue:
+            side, iri = queue.popleft()
+            for c in self.correspondences_of(iri, side, relation):
+                found[c.key] = c
+                other: tuple[Side, str] = (
+                    ("target", c.entity_target.identifier) if side == "source"
+                    else ("source", c.entity_source.identifier)
+                )
+                if other not in seen:
+                    seen.add(other)
+                    queue.append(other)
+        found.pop((entity_source, entity_target, relation), None)
+        return list(found.values())
 
     def to_dict(self) -> dict:
-        unique_correspondences = {id(c): c for c in self.correspondences.values()}
         return {
             "formatted": self.format(),
-            "correspondences": [c.model_dump() for c in unique_correspondences.values()]
+            "correspondences": [c.model_dump() for c in self.correspondences.values()]
         }
 
     def format(self, num: int | None = None) -> str:
-        unique_correspondences = list({id(c): c for c in self.correspondences.values()}.values())
+        correspondences = list(self.correspondences.values())
 
-        if not unique_correspondences:
+        if not correspondences:
             return "No correspondences established yet."
 
-        if num is not None and num < len(unique_correspondences):
-            unique_correspondences = random.sample(unique_correspondences, num)
+        if num is not None and num < len(correspondences):
+            correspondences = random.sample(correspondences, num)
 
         data = [
-            [c.entity_source.identifier, c.entity_target.identifier, str(c.relation.value)]
-            for c in unique_correspondences
+            [c.entity_source.identifier, c.entity_target.identifier, c.relation]
+            for c in correspondences
         ]
         headers = [["Source Entity (Ontology 1)", "Target Entity (Ontology 2)", "Relation"]]
 
         return generate_table(data=data, headers=headers)
 
 
-def functions(managers: list[KgManager]) -> list[dict]:
+def set_correspondence_description(profile: RelationProfile) -> str:
+    description = """\
+Establishes a semantic correspondence between an entity from the source \
+ontology and one from the target ontology."""
+    if len(profile.relations) > 1:
+        description += """ An entity pair may hold several relations.
+
+The system checks the new correspondence against the relations already set for \
+the same entity pair (contradicting or implied relations) and, for symmetric and \
+transitive relations (such as equivalence), against the existing correspondences \
+it would be connected to, since that would imply relations between entities of \
+the same ontology."""
+    else:
+        description += """
+
+For symmetric and transitive relations (such as equivalence), the system checks \
+the new correspondence against the existing correspondences it would be connected \
+to, since that would imply relations between entities of the same ontology."""
+    description += """ In case of such issues the correspondence is not set yet. \
+Instead, a warning lists the involved correspondences and your options. To set \
+the correspondence anyway, call this function again with the same arguments.
+Use this to lock in your alignment decisions."""
+    return description
+
+
+def relation_property(profile: RelationProfile) -> dict:
+    return {
+        "type": "string",
+        "enum": [r.iri for r in profile.relations],
+        "description": "The relation holding from the source to the target entity:\n"
+        + "\n".join(f"- '{r.iri}': {r.description}" for r in profile.relations),
+    }
+
+
+def resolve_relation(fn_args: dict, profile: RelationProfile) -> RelationSpec:
+    # with a single relation, the functions have no relation parameter
+    relation_iri = fn_args.get("relation", profile.relations[0].iri)
+    relation = profile.get(relation_iri)
+    if relation is None:
+        raise FunctionCallException(
+            f"Unknown relation '{relation_iri}', must be one of "
+            f"{[r.iri for r in profile.relations]}."
+        )
+    return relation
+
+
+def functions(managers: list[KgManager], profile: RelationProfile) -> list[dict]:
+    set_properties: dict[str, dict] = {
+        "source_entity": {
+            "type": "string",
+            "description": "The exact IRI of the source entity",
+        },
+        "target_entity": {
+            "type": "string",
+            "description": "The exact IRI of the target entity",
+        },
+    }
+    # with a single relation the LLM has nothing to choose
+    if len(profile.relations) > 1:
+        set_properties["relation"] = relation_property(profile)
+
+    delete_properties: dict[str, dict] = {
+        "source_entity": {
+            "type": "string",
+            "description": "The full IRI of the source entity whose correspondence should be removed",
+        },
+        "target_entity": {
+            "type": "string",
+            "description": "The full IRI of the target entity whose correspondence should be removed",
+        },
+    }
+    if len(profile.relations) > 1:
+        delete_properties["relation"] = relation_property(profile)
+
     fns = [
         {
             "name": "set_correspondence",
-            "description": """\
-Establishes a 1:1 semantic correspondence between an entity from the source \
-ontology and one from the target ontology.
-
-The system automatically enforces 1:1 mapping constraints. If either the source \
-or target entity is already involved in an existing mapping:
-1. If 'overwrite' is False (default), the function returns a conflict warning \
-detailing the existing match to prompt a manual review.
-2. If 'overwrite' is True, the previous mapping is silently replaced by the new one.
-Use this to lock in your alignment decisions.""",
+            "description": set_correspondence_description(profile),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "source_entity": {
-                        "type": "string",
-                        "description": "The exact IRI of the source entity",
-                    },
-                    "target_entity": {
-                        "type": "string",
-                        "description": "The exact IRI of the target entity",
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "If True, resolves mapping collisions by overwriting existing "
-                        "correspondences involving these entities.",
-                    },
-                },
-                "required": ["source_entity", "target_entity", "overwrite"],
+                "properties": set_properties,
+                "required": list(set_properties),
                 "additionalProperties": False,
             },
             "strict": True,
@@ -182,17 +372,8 @@ Use this to lock in your alignment decisions.""",
             "description": "Delete an existing correspondence.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "source_entity": {
-                        "type": "string",
-                        "description": "The full IRI of the source entity whose correspondence should be removed",
-                    },
-                    "target_entity": {
-                        "type": "string",
-                        "description": "The full IRI of the target entity whose correspondence should be removed",
-                    },
-                },
-                "required": ["source_entity", "target_entity"],
+                "properties": delete_properties,
+                "required": list(delete_properties),
                 "additionalProperties": False,
             },
             "strict": True,
@@ -356,17 +537,125 @@ def get_entity_shape_text(
     return emit_pseudo_shex(profile, manager, shape_config)
 
 
-# TODO: Refactor to eliminate code duplicates to `annotate`-method from cea.py
-def add_1_to_1_correspondence(
+def pair_inconsistencies(
+        relation: RelationSpec,
+        pair: list[Correspondence],
+        profile: RelationProfile,
+        ) -> tuple[list[Correspondence], list[Correspondence], list[Correspondence]]:
+    """
+    Checks a new `relation` against the relations already set for the same
+    entity pair. Returns the existing correspondences that (1) contradict it
+    (`excludes`, in either direction), (2) make it redundant because they
+    imply it, and (3) become redundant because it implies them.
+    """
+    contradicting, implying, implied = [], [], []
+    for c in pair:
+        other = profile.get(c.relation)
+        if other is None:
+            continue
+        if other.iri in relation.excludes or relation.iri in other.excludes:
+            contradicting.append(c)
+        elif relation.iri in other.implies:
+            implying.append(c)
+        elif other.iri in relation.implies:
+            implied.append(c)
+    return contradicting, implying, implied
+
+
+def format_consistency_warning(
+        entity_source: str,
+        entity_target: str,
+        full_iri_source: str,
+        full_iri_target: str,
+        kg_source: str,
+        kg_target: str,
+        relation: RelationSpec,
+        contradicting: list[Correspondence],
+        implying: list[Correspondence],
+        implied: list[Correspondence],
+        connected: list[Correspondence],
+        ) -> str:
+    """
+    Warning for a proposed correspondence that is not consistent with, or
+    redundant to, existing ones. `entity_source` and `entity_target` are the
+    IRIs as given by the LLM.
+    """
+    r = relation.iri
+    new = f"'{entity_source}' {r} '{entity_target}'"
+
+    def line(c: Correspondence) -> str:
+        return f"- '{c.entity_source.entity}' {c.relation} '{c.entity_target.entity}'\n"
+
+    message = f"Consistency warning for {new}:\n"
+
+    if contradicting:
+        message += (
+            f"\nThe following existing relations of the same entity pair contradict '{r}', "
+            "i.e. they cannot hold at the same time:\n"
+        )
+        message += "".join(line(c) for c in contradicting)
+    if implying:
+        message += (
+            f"\nThe following existing relations of the same entity pair already imply '{r}', "
+            "so the new correspondence would be redundant:\n"
+        )
+        message += "".join(line(c) for c in implying)
+    if implied:
+        message += (
+            f"\n'{r}' implies the following existing relations of the same entity pair, "
+            "so they would become redundant:\n"
+        )
+        message += "".join(line(c) for c in implied)
+
+    if connected:
+        # all entities of the resulting component per side, as displayed to the LLM
+        sources = {full_iri_source: entity_source}
+        targets = {full_iri_target: entity_target}
+        for c in connected:
+            sources.setdefault(c.entity_source.identifier, c.entity_source.entity)
+            targets.setdefault(c.entity_target.identifier, c.entity_target.entity)
+
+        implied_within = []
+        for names, kg, side in [(sources, kg_source, "source"), (targets, kg_target, "target")]:
+            displayed = list(names.values())
+            for i, a in enumerate(displayed):
+                for b in displayed[i + 1:]:
+                    implied_within.append(f"- '{a}' {r} '{b}' (within the {side} ontology {kg})\n")
+
+        message += (
+            f"\n'{r}' is symmetric and transitive. The new correspondence would be connected "
+            f"to these existing '{r}' correspondences:\n"
+        )
+        message += "".join(line(c) for c in connected)
+        message += "Together they would imply the following relations within the same ontology:\n"
+        message += "".join(implied_within)
+
+    message += (
+        "\nThe new correspondence has NOT been set yet. The following options are "
+        "equally valid - compare all involved entities semantically and structurally and "
+        "choose deliberately:\n"
+        "- Do not set the new correspondence: no further action needed, the existing "
+        "correspondences are kept.\n"
+        "- Replace (some of) the existing correspondences: remove those you consider wrong "
+        "with `delete_correspondence`, then call `set_correspondence` again with the same "
+        "arguments.\n"
+        "- Keep all: if all relations listed above actually hold together, call "
+        "`set_correspondence` again with the same arguments. The new correspondence is then "
+        "set in addition to the existing ones."
+    )
+    return message
+
+
+def add_correspondence(
         managers: list[KgManager],
         kg_source: str,
         kg_target: str,
         entity_source: str,
         entity_target: str,
+        relation: RelationSpec,
         state: AlignmentState,
         known: set[str],
         know_before_use: bool = True,
-        overwrite: bool = False,
         ) -> str:
 
     try:
@@ -381,47 +670,60 @@ def add_1_to_1_correspondence(
             ensure_known(manager_source, full_iri_source, known)
             ensure_known(manager_target, full_iri_target, known)
 
-        if not overwrite:
-            existing_source_corr = state.get_correspondence(full_iri_source)
-            existing_target_corr = state.get_correspondence(full_iri_target)
+        if state.get_correspondence(full_iri_source, full_iri_target, relation.iri) is not None:
+            return (
+                f"{entity_source} from {kg_source} is already aligned with "
+                f"{entity_target} from {kg_target} by '{relation.iri}'."
+            )
 
-            entity_1 = None
-            entity_2 = None
-            entity_3 = None
+        # cheap local checks: other relations of the same pair, and for
+        # symmetric and transitive relations the connected component
+        contradicting, implying, implied = pair_inconsistencies(
+            relation,
+            state.correspondences_of_pair(full_iri_source, full_iri_target),
+            state.profile,
+        )
+        connected = []
+        if relation.symmetric and relation.transitive:
+            connected = state.connected_correspondences(
+                full_iri_source, full_iri_target, relation.iri
+            )
+        involved = frozenset(c.key for c in [*contradicting, *implying, *implied, *connected])
 
-            if existing_source_corr is not None:
-                entity_1 = entity_source
-                entity_2 = existing_source_corr.entity_target.entity
-                entity_3 = entity_target
+        key = (full_iri_source, full_iri_target, relation.iri)
+        warned = state.pending_warnings.get(key)
+        # warn on the first call, and again on a repeated call if the existing
+        # correspondences changed in a way the LLM has not seen yet; a repeated
+        # call after a warning means "keep all"
+        if involved and (warned is None or not involved <= warned):
+            state.pending_warnings[key] = involved
+            return format_consistency_warning(
+                entity_source, entity_target,
+                full_iri_source, full_iri_target,
+                kg_source, kg_target,
+                relation, contradicting, implying, implied, connected,
+            )
+        state.pending_warnings.pop(key, None)
 
-            if existing_target_corr is not None:
-                entity_1 = entity_target
-                entity_2 = existing_target_corr.entity_source.entity
-                entity_3 = entity_source
+        correspondence = Correspondence(
+            entity_source=entity_object_source,
+            entity_target=entity_object_target,
+            relation=relation.iri,
+        )
+        state.add_correspondence(correspondence)
 
-            if existing_source_corr or existing_target_corr:
-                return (
-                    f"Mapping Conflict detected: The entity '{entity_1}' has already been mapped to "
-                    f"'{entity_2}', but you proposed a new mapping to '{entity_3}'.\n\n"
-                    "Do not default to keeping the existing mapping. Treat both candidates as hypotheses and evaluate them from scratch:\n"
-                    f"- Option A (Current):   '{entity_1}' ≡ '{entity_2}'\n"
-                    f"- Option B (New candidate): '{entity_1}' ≡ '{entity_3}'\n\n"
-                    "Compare both semantically and structurally. Which target entity is genuinely the better conceptual match?\n"
-                    "- If Option B is superior: Re-submit by calling `set_correspondence(..., overwrite=True)`.\n"
-                    "- If Option A is superior: It will be automatically retained. Find a different valid match for the unmapped entity or leave it unmapped."
-                )
-
-        else:
-            # clear out whatever the source/target entities were previously
-            # mapped to - otherwise the previous correspondence's other side
-            # (not part of the new mapping) would linger as a stale, dangling
-            # entry that still shows up in the final alignment
-            state.discard_correspondence_of(full_iri_source)
-            state.discard_correspondence_of(full_iri_target)
-
-        correspondence = Correspondence(entity_source=entity_object_source, entity_target=entity_object_target)
-        state.add_1_to_1_correspondence(correspondence)
-        return f"Aligned {entity_source} from {kg_source} with {entity_target} from {kg_target}."
+        note = ""
+        if involved:
+            note = (
+                f" It is set in addition to the {len(involved)} existing "
+                "correspondence(s) from the warning."
+            )
+        if len(state.profile.relations) == 1:
+            return f"Aligned {entity_source} from {kg_source} with {entity_target} from {kg_target}.{note}"
+        return (
+            f"Aligned {entity_source} from {kg_source} with {entity_target} "
+            f"from {kg_target} by '{relation.iri}'.{note}"
+        )
 
     except ValueError as e:
         raise FunctionCallException(str(e)) from e
@@ -430,17 +732,16 @@ def add_1_to_1_correspondence(
 def delete_correspondence(
         entity1: str,
         entity2: str,
+        relation: str,
         state: AlignmentState,
         ) -> str:
-    correspondence1 = state.get_correspondence(entity1)
-    correspondence2 = state.get_correspondence(entity2)
-    if correspondence1 is None or correspondence1 is not correspondence2:
+    c = state.remove_correspondence(entity1, entity2, relation)
+    if c is None:
         raise FunctionCallException(
-            f"There is no Correspondence aligning {entity1} to {entity2} yet. "
+            f"There is no Correspondence aligning {entity1} to {entity2} by '{relation}' yet. "
             "Notice you have to use the full IRI as entity reference."
             )
-    state.remove_correspondence(entity1, entity2)
-    return f"Deleted correspondence between {entity1} and {entity2}"
+    return f"Deleted correspondence with relation {c.relation} between {entity1} and {entity2}"
 
 
 def call_function(
@@ -464,20 +765,21 @@ def call_function(
             return "No AlignmentState was provided. Cannot set correspondences without AlignmentState"
         kg1 = state.task_input.source_kg  # type: ignore
         kg2 = state.task_input.target_kg  # type: ignore
-        overwrite = fn_args.get("overwrite", False)
-
         ent1, ent2 = fn_args["source_entity"], fn_args["target_entity"]
         know_before_use = om_kwargs.get("know_before_use", True)
 
-        return add_1_to_1_correspondence(
-            managers, kg1, kg2, ent1, ent2, state, known,
-            know_before_use, overwrite
+        relation = resolve_relation(fn_args, state.profile)
+
+        return add_correspondence(
+            managers, kg1, kg2, ent1, ent2, relation, state, known,
+            know_before_use,
         )
 
     elif fn_name == "delete_correspondence":
         return delete_correspondence(
             fn_args["source_entity"],
             fn_args["target_entity"],
+            resolve_relation(fn_args, state.profile).iri,
             state
             )
 
@@ -485,6 +787,17 @@ def call_function(
         return state.format(num=fn_args.get("num"))
 
     elif fn_name == "stop":
+        # TODO: Consistency warnings the LLM never answered (state.pending_warnings)
+        # are dropped silently on stop, i.e. "do not set the new correspondence"
+        # is the implicit default and the three options are not equal in effect.
+        # Options: send the pending warnings back and refuse to stop (would need
+        # `OmTask.done()` to return False while warnings are pending - om.py only),
+        # or resolve them automatically. Note that a conversation also ends when
+        # the LLM answers without any tool call, which bypasses `done()` entirely
+        # (see the `should_stop` handling in core.py) - covering that path needs
+        # a change in core.py, to be decided with the GRASP maintainers. The
+        # feedback loop (`feedback_instructions`) could be another place to
+        # surface pending warnings.
         return "Stopping"
 
     else:
@@ -575,10 +888,23 @@ def input_and_state(
     except Exception as e:
         raise ValueError("OM task input must match AlignmentTaskInput schema") from e
 
-    state = AlignmentState()
+    profile = get_relation_profile(config)
+    state = AlignmentState(profile)
     state.task_input = task_input
     for correspondence in state.task_input.input_alignment:
-        state.add_1_to_1_correspondence(correspondence)
+        relation = profile.get(correspondence.relation)
+        if relation is None:
+            raise ValueError(
+                f"Input correspondence {correspondence.key} has relation "
+                f"'{correspondence.relation}', which is not part of the relation "
+                f"profile {profile.name}"
+            )
+        # input correspondences win over conflicting ones in the shared state,
+        # by replacing the conflicting ones, without asking the LLM
+        if relation.symmetric and relation.transitive:
+            state.discard_correspondences_of(correspondence.key[0], "source", relation.iri)
+            state.discard_correspondences_of(correspondence.key[1], "target", relation.iri)
+        state.add_correspondence(correspondence)
 
     instructions = input_instructions(task_input, state, managers, known)
     return instructions, state
@@ -640,7 +966,7 @@ class OmTask(GraspTask, FeedbackTask):
         return rules()
 
     def function_definitions(self) -> list[dict]:
-        return functions(self.managers)
+        return functions(self.managers, get_relation_profile(self.config))
 
     def output(self, messages: list[Message]) -> dict:
         return self.state.to_dict()
