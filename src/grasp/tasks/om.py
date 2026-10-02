@@ -1,5 +1,6 @@
 import random
 from collections import deque
+from itertools import combinations
 from typing import Any, Literal
 
 import requests
@@ -14,7 +15,7 @@ from grasp.functions import (
 )
 from grasp.manager import KgManager, format_kgs
 from grasp.model import Message
-from grasp.sparql.types import AskResult
+from grasp.sparql.types import AskResult, SelectResult
 from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import FeedbackTask, GraspTask
 from grasp.tasks.entities import Entity, prepare_entity
@@ -41,6 +42,9 @@ class RelationSpec(BaseModel):
     with the mathematical properties the system uses for consistency checks.
     `iri` is the relation's identifier; for OAEI relations the Alignment API
     symbol (e.g. "=") is used so that exported alignments stay unchanged.
+    `description` is shown to the LLM and should state the functional
+    criterion of the relation, read from the source to the target entity:
+    what a query for one entity should return in the other system.
     """
     iri: str
     description: str
@@ -101,14 +105,60 @@ class RelationProfile(BaseModel):
 
 EQUIVALENCE = RelationSpec(
     iri="=",
-    description="The source and the target entity denote an equivalent concept.",
+    description="The source and the target entity refer to the same real-world things: "
+    "a query for either entity should also return the entries of the other.",
     symmetric=True,
     transitive=True,
 )
 
+# relation types of the STROMA/TaSeR datasets, as used in the OAEI Beyond
+# Equivalence track (MELT: TrackRepository.GeneralRelation)
+STROMA_RELATIONS = [
+    EQUIVALENCE.model_copy(update={"excludes": ["<", ">"]}),
+    RelationSpec(
+        iri="<",
+        description="The source entity is narrower than the target entity: a query for the "
+        "target entity should also return all entries of the source entity, but not vice "
+        "versa (e.g. 'Jeans' < 'Clothing').",
+        transitive=True,
+        inverse_of=">",
+        excludes=["=", ">"],
+    ),
+    RelationSpec(
+        iri=">",
+        description="The source entity is broader than the target entity: a query for the "
+        "source entity should also return all entries of the target entity, but not vice "
+        "versa (e.g. 'Clothing' > 'Jeans').",
+        transitive=True,
+        inverse_of="<",
+        excludes=["=", "<"],
+    ),
+    RelationSpec(
+        iri="HasA",
+        description="Entries of the target entity are parts or components of entries of the "
+        "source entity (e.g. 'Suit' HasA 'Trousers').",
+        inverse_of="PartOf",
+    ),
+    RelationSpec(
+        iri="PartOf",
+        description="Entries of the source entity are parts or components of entries of the "
+        "target entity (e.g. 'Trousers' PartOf 'Suit').",
+        inverse_of="HasA",
+    ),
+    RelationSpec(
+        iri="Related",
+        description="The entities are closely associated, so a system using one of them "
+        "should link to the other, but none of the other relations holds.",
+        symmetric=True,
+    ),
+]
+
 RELATION_PROFILES: dict[str, RelationProfile] = {
     "equivalence": RelationProfile(
         name="equivalence", relations=[EQUIVALENCE], cardinality="11"
+    ),
+    "stroma": RelationProfile(
+        name="stroma", relations=STROMA_RELATIONS, cardinality="**"
     ),
 }
 
@@ -257,11 +307,19 @@ class AlignmentState:
         found.pop((entity_source, entity_target, relation), None)
         return list(found.values())
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, reduced: list[Correspondence] | None = None) -> dict:
+        """
+        With `reduced`, "correspondences" holds the reduced alignment (what
+        evaluation reads) and "raw_correspondences" everything the LLM set.
+        """
+        output = {
             "formatted": self.format(),
             "correspondences": [c.model_dump() for c in self.correspondences.values()]
         }
+        if reduced is not None:
+            output["raw_correspondences"] = output["correspondences"]
+            output["correspondences"] = [c.model_dump() for c in reduced]
+        return output
 
     def format(self, num: int | None = None) -> str:
         correspondences = list(self.correspondences.values())
@@ -405,57 +463,103 @@ def functions(managers: list[KgManager], profile: RelationProfile) -> list[dict]
     return fns
 
 
-def system_information() -> str:
-    # TODO: extend for other matching tasks
-    return """\
-You are an expert ontology alignment assistant. Your mission is to establish precise \
-T-Box (schema) correspondences between a source and a target ontology.
-You will process the source ontology in batches and must identify equivalent classes and properties \
-within the target ontology. Follow this step-by-step approach:
-1. Analyze the source and target ontology to understand their core domain \
-and conceptual scope. Consider how concepts might be represented, structured or labeled \
-differently in the target ontology.
-2. Identify equivalent classes or properties in the target ontology. Start \
-by establishing high-confidence matches, regardless of their position in the hierarchy, \
-with obvious matches based on strict lexical similarities (e.g., exact label matches, \
-identical local names, or unambiguous synonyms). These initial 1:1 correspondences will \
-serve as your structural anchors for the rest of the process.
-3. Leverage the established anchors to explore their structural neighborhood. \
-Use the provided functions to compare the superclasses, subclasses, domains, and ranges \
-of your anchored entities. Use this structural context to discover new, less obvious mappings \
-and to validate the semantic correctness of your baseline alignment.
-4. Once all significant correspondences have been established and \
-verified, use the stop function to finalize the alignment and terminate \
-the process."""
+def system_information(profile: RelationProfile) -> str:
+    relations = "\n".join(f"- '{r.iri}': {r.description}" for r in profile.relations)
+    if len(profile.relations) == 1:
+        relation_intro = "Each correspondence relates them by the following relation:"
+    else:
+        relation_intro = "You can relate them by the following relations:"
+    return f"""\
+You are an expert ontology alignment assistant. Your mission is to establish \
+correspondences between the entities (e.g. classes, properties and instances) of a source \
+and a target ontology. A correspondence <source entity> <relation> <target entity> \
+is always read from the source to the target entity. {relation_intro}
+{relations}
+
+Whether a correspondence holds is ultimately a functional question: ontology \
+alignments are used to support cross-ontology queries and interoperability \
+between different systems, one using each ontology. Ask yourself what a query \
+for an entity in one system should return in the other one - the relation \
+descriptions above state this for each relation. Lexical and structural \
+information are your evidence for answering this question.
+
+Follow this step-by-step approach:
+1. Analyze the source and target ontology to understand their core domain and \
+conceptual scope. Consider how concepts in the source ontology might be \
+represented, structured or labeled differently in the target ontology.
+2. For each given source entity:
+a. Search the target ontology for entities that are lexically related to it, \
+based on labels, synonyms and other lexical information of the entity and of \
+its neighboring entities.
+b. Check the structural context of the source entity and of the candidates in \
+both ontologies, e.g. their hierarchies and relations to other entities, for \
+support or contradiction.
+c. Decide from the functional point of view which relation, if any, holds \
+between the source entity and each candidate, and set the corresponding \
+correspondences. If no relation holds, leave the source entity unmatched.
+3. Once all given source entities have been processed, use the stop function \
+to finalize the alignment."""
 
 
-def rules() -> list[str]:
-    return [
-        "Injectivity: Each entity from the source graph must map to exactly one entity in the target graph. "
-        "Every new correspondence will be automatically validated by the system. If a collision "
-        "occurs (an entity is already mapped), the system will present the conflicting mappings to "
-        "you. You must then review both the previous and the new match to determine which is "
-        "conceptually superior and resolve the conflict.",
-        "Strict Equivalence: Do not set correspondences between source and target entities if "
-        "they are not truly equivalent. Mappings must not cause logical contradictions.",
-        "Precision over Recall: If you cannot find a suitable reference entity in the target graph,"
-        "leave the source entity unmatched. It is better to set fewer but fully logically "
-        "consistent correspondences than more but less robust equivalences.",
-        "Lexical anchor mappings: For exact lexical matches (e.g., identical local names or labels "
-        "like 'Person' and 'Person'), treat them as high probability matches. Do not reject exact string "
-        "matches due to minor structural or modeling differences, unless they are clear and "
-        "unambiguous homonyms (e.g., 'Title' as a book vs. 'Title' as a degree) or they cause "
-        "hard logical contradictions.",
-        "Batch over Iteration: To improve efficiency and avoid hitting context limits, "
-        "favor batch-retrieval SPARQL queries over repetitive individual searches when "
-        "executing manual SPARQL queries for identifying patterns across multiple entities",
-        "Built-in functions: Before writing custom SPARQL queries, prioritize using the built-in "
-        "search, list and shapes functions to explore the target ontology quickly.",
-        "Completeness: Perform a final comprehensive review of all established correspondences "
-        "before concluding the task. You must explicitly evaluate every single entity provided "
-        "in the source list. Do not stop until you have attempted to match all of them. "
-        "If an entity truly has no match, explain briefly why, but do not simply skip it."
-    ]
+def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
+    """
+    Only rules needed to understand the task. Rules derived from relation
+    properties explain the consistency checks the system performs.
+    """
+    rules = []
+
+    reducible = [r.iri for r in profile.relations if r.iri in REDUCIBLE]
+    if alignment_form == "reduced" and reducible:
+        listed = " and ".join(f"'{iri}'" for iri in reducible)
+        rules.append(
+            f"Most specific correspondences: Only the most specific {listed} "
+            "correspondences are needed. Correspondences implied by other correspondences "
+            "together with the hierarchies of the ontologies (e.g. 's < t2' is implied by "
+            "'s < t1' if t1 is below t2 in the target hierarchy) are removed automatically "
+            "from the final alignment, so you do not need to set them."
+        )
+
+    for r in profile.relations:
+        if r.symmetric and r.transitive:
+            rules.append(
+                f"Transitivity and near-injectivity of '{r.iri}': If several source entities "
+                f"are related by '{r.iri}' to the same target entity (or one source entity to "
+                f"several target entities), they are implied to be pairwise '{r.iri}' to each "
+                "other within their own ontology. In most cases, only one of them is correct."
+            )
+
+    # mutually exclusive relations, grouped where possible, e.g. {=, <, >}
+    def excluded(a: str, b: str) -> bool:
+        return b in profile.get(a).excludes or a in profile.get(b).excludes  # type: ignore
+
+    covered: set[frozenset[str]] = set()
+    for r in profile.relations:
+        group = [x.iri for x in profile.relations if x.iri == r.iri or excluded(r.iri, x.iri)]
+        pairs = {frozenset(p) for p in combinations(group, 2)}
+        if len(group) < 2 or pairs <= covered:
+            continue
+        if all(excluded(a, b) for a, b in combinations(group, 2)):
+            rules.append(
+                "Mutually exclusive relations: At most one of "
+                + ", ".join(f"'{iri}'" for iri in group)
+                + " holds for an entity pair."
+            )
+            covered |= pairs
+        else:
+            others = [iri for iri in group if iri != r.iri]
+            rules.append(
+                f"Exclusion: '{r.iri}' cannot hold for an entity pair together with "
+                + ", ".join(f"'{iri}'" for iri in others) + "."
+            )
+            covered |= {frozenset((r.iri, o)) for o in others}
+
+    rules.append(
+        "Completeness: Perform a final comprehensive review of all established "
+        "correspondences before concluding the task. You must explicitly evaluate every "
+        "single entity provided in the source list. If an entity truly has no match, "
+        "explain briefly why, but do not simply skip it."
+    )
+    return rules
 
 
 def entity_exists_in_kg(manager: KgManager, iri: str) -> bool:
@@ -910,10 +1014,110 @@ def input_and_state(
     return instructions, state
 
 
+RDFS_SUBCLASS_OF = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+
+# relations reducible via the ontology hierarchies, with the relations that can
+# imply them: (a < b) follows from (a' r b') with r in {<, =}, a below-or-equal
+# a' in the source and b' below-or-equal b in the target hierarchy; '>' the
+# other way round. '=' never follows from hierarchies alone.
+REDUCIBLE: dict[str, tuple[str, ...]] = {"<": ("<", "="), ">": (">", "=")}
+
+
+def hierarchy_predicate(om_kwargs: dict, kg: str) -> str:
+    """
+    The predicate forming the hierarchy of `kg`, e.g. rdfs:subClassOf or
+    skos:broader. `hierarchy_predicate` in the om task kwargs is either one
+    IRI for all knowledge graphs or a mapping from knowledge graph name to IRI.
+    """
+    pred = om_kwargs.get("hierarchy_predicate", RDFS_SUBCLASS_OF)
+    if isinstance(pred, dict):
+        return pred.get(kg, RDFS_SUBCLASS_OF)
+    return pred
+
+
+def fetch_ancestors(
+    manager: KgManager,
+    iris: set[str],
+    predicate: str,
+    chunk_size: int = 200,
+) -> dict[str, set[str]]:
+    """Transitive ancestors of each of the given IRIs along `predicate`."""
+    ancestors: dict[str, set[str]] = {iri: set() for iri in iris}
+    wrapped_pred = prepare_identifier_for_sparql(predicate, manager.iri_literal_parser)
+    ordered = sorted(iris)
+    for i in range(0, len(ordered), chunk_size):
+        values = " ".join(
+            prepare_identifier_for_sparql(iri, manager.iri_literal_parser)
+            for iri in ordered[i:i + chunk_size]
+        )
+        sparql = (
+            f"SELECT ?c ?p WHERE {{ VALUES ?c {{ {values} }} "
+            f"?c {wrapped_pred}+ ?p . FILTER(isIRI(?p)) }}"
+        )
+        result = manager.execute_sparql(sparql)
+        assert isinstance(result, SelectResult)
+        for row in result.rows():
+            if "c" in row and "p" in row:
+                ancestors.setdefault(row["c"].identifier(), set()).add(row["p"].identifier())
+    return ancestors
+
+
+def reduce_alignment(
+    correspondences: list[Correspondence],
+    source_ancestors: dict[str, set[str]],
+    target_ancestors: dict[str, set[str]],
+) -> list[Correspondence]:
+    """
+    Removes '<' and '>' correspondences that are implied by another
+    correspondence together with the source and target hierarchies. If two
+    correspondences imply each other (e.g. via cyclic hierarchies), the one
+    with the smaller key is kept.
+    """
+    def leq(ancestors: dict[str, set[str]], x: str, y: str) -> bool:
+        return x == y or y in ancestors.get(x, set())
+
+    def implies(d: Correspondence, c: Correspondence) -> bool:
+        (a, b, r), (a2, b2, r2) = c.key, d.key
+        if (a, b) == (a2, b2) or r2 not in REDUCIBLE.get(r, ()):
+            return False
+        if r == "<":
+            return leq(source_ancestors, a, a2) and leq(target_ancestors, b2, b)
+        return leq(source_ancestors, a2, a) and leq(target_ancestors, b, b2)
+
+    def redundant(c: Correspondence) -> bool:
+        if c.relation not in REDUCIBLE:
+            return False
+        return any(
+            implies(d, c) and not (implies(c, d) and c.key < d.key)
+            for d in correspondences if d is not c
+        )
+
+    return [c for c in correspondences if not redundant(c)]
+
+
+def reduced_correspondences(
+    state: AlignmentState,
+    managers: list[KgManager],
+    om_kwargs: dict,
+) -> list[Correspondence]:
+    correspondences = list(state.correspondences.values())
+    if not any(c.relation in REDUCIBLE for c in correspondences):
+        return correspondences
+    assert state.task_input is not None
+    sides = []
+    for kg, idx in [(state.task_input.source_kg, 0), (state.task_input.target_kg, 1)]:
+        manager, _ = find_manager(managers, kg)
+        iris = {c.key[idx] for c in correspondences}
+        sides.append(fetch_ancestors(manager, iris, hierarchy_predicate(om_kwargs, kg)))
+    return reduce_alignment(correspondences, sides[0], sides[1])
+
+
 def feedback_system_message(
     managers: list[KgManager],
     kg_notes: dict[str, list[str]],
     notes: list[str],
+    profile: RelationProfile,
+    alignment_form: str = "raw",
 ) -> str:
     return f"""\
 You are an expert ontology matching judge. Your task is to evaluate if the assistant has correctly identified and set correspondences between the entities.
@@ -925,7 +1129,7 @@ The system was provided the following notes across all knowledge graphs:
 {format_notes(notes)}
 
 The system was provided the following rules to follow:
-{format_list(rules()) if rules() else "None"}
+{format_list(rules(profile, alignment_form))}
 
 Provide your feedback with the give_feedback function.\
 """
@@ -960,16 +1164,29 @@ class OmTask(GraspTask, FeedbackTask):
         return instructions
 
     def system_information(self) -> str:
-        return system_information()
+        return system_information(get_relation_profile(self.config))
 
     def rules(self) -> list[str]:
-        return rules()
+        return rules(
+            get_relation_profile(self.config),
+            self.config.task_kwargs.get("om", {}).get("alignment_form", "raw"),
+        )
 
     def function_definitions(self) -> list[dict]:
         return functions(self.managers, get_relation_profile(self.config))
 
     def output(self, messages: list[Message]) -> dict:
-        return self.state.to_dict()
+        om_kwargs = self.config.task_kwargs.get("om", {})
+        if om_kwargs.get("alignment_form", "raw") != "reduced":
+            return self.state.to_dict()
+        try:
+            reduced = reduced_correspondences(self.state, self.managers, om_kwargs)
+        except Exception as e:
+            # never lose a run because of the reduction
+            output = self.state.to_dict()
+            output["reduction_error"] = str(e)
+            return output
+        return self.state.to_dict(reduced)
 
     def call_function(
         self,
@@ -998,7 +1215,10 @@ class OmTask(GraspTask, FeedbackTask):
     def feedback_system_message(
         self, kg_notes: dict[str, list[str]], notes: list[str]
     ) -> str:
-        return feedback_system_message(self.managers, kg_notes, notes)
+        return feedback_system_message(
+            self.managers, kg_notes, notes, get_relation_profile(self.config),
+            self.config.task_kwargs.get("om", {}).get("alignment_form", "raw"),
+        )
 
     def feedback_instructions(self, inputs: list[str], output: dict) -> str:
         return feedback_instructions(inputs, output)
