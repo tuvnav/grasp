@@ -508,15 +508,28 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
     """
     rules = []
 
+    # alignment-level cardinality in Alignment API notation: '*' or '+' on a
+    # side means its entities may take part in several correspondences
+    many = any(c in profile.cardinality for c in "*+")
+    if many:
+        directed = next((r.iri for r in profile.relations if not r.symmetric), None)
+        example = (
+            f" (e.g. a source entity can be related by '{directed}' to several target entities)"
+            if directed else ""
+        )
+        rules.append(
+            "Multiple correspondences: An entity may take part in several correspondences, "
+            f"also of different relations{example}. Set every correspondence that holds."
+        )
+
     reducible = [r.iri for r in profile.relations if r.iri in REDUCIBLE]
     if alignment_form == "reduced" and reducible:
-        listed = " and ".join(f"'{iri}'" for iri in reducible)
         rules.append(
-            f"Most specific correspondences: Only the most specific {listed} "
-            "correspondences are needed. Correspondences implied by other correspondences "
-            "together with the hierarchies of the ontologies (e.g. 's < t2' is implied by "
-            "'s < t1' if t1 is below t2 in the target hierarchy) are removed automatically "
-            "from the final alignment, so you do not need to set them."
+            "Implied correspondences: Correspondences that follow from other correspondences "
+            "together with the hierarchies of the ontologies are removed automatically from "
+            "the final alignment, so you do not need to set them. E.g. 's < t2' follows from "
+            "'s < t1' if t1 is below t2 in the target hierarchy, and 's > t1' follows from "
+            "'s > t2' or 's = t2' in the same case."
         )
 
     for r in profile.relations:
@@ -553,12 +566,20 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
             )
             covered |= {frozenset((r.iri, o)) for o in others}
 
-    rules.append(
+    completeness = (
         "Completeness: Perform a final comprehensive review of all established "
         "correspondences before concluding the task. You must explicitly evaluate every "
-        "single entity provided in the source list. If an entity truly has no match, "
-        "explain briefly why, but do not simply skip it."
+        "single entity provided in the source list."
     )
+    if many:
+        completeness += (
+            " For each of them, check every relation against all relevant target entities "
+            "and do not stop after the first correspondence found."
+        )
+    completeness += (
+        " If an entity truly has no match, explain briefly why, but do not simply skip it."
+    )
+    rules.append(completeness)
     return rules
 
 
@@ -932,17 +953,16 @@ def input_instructions(
             block += f"\n```shape: \n{shape_text}\n```\n"
         return block
 
-    # potential matches to validate
+    # source entities with candidates from string matching (om_pretask)
     len_pc = len(task_input.potential_correspondences)
     if len_pc > 0:
-        quantity_corrs = "a list of potential correspondences"
-        if len_pc == 1:
-            quantity_corrs = "a potential correspondence"
+        filler = "entities" if len_pc > 1 else "entity"
         instructions += f"""\
-You are given {quantity_corrs} found by simple string matching. \
-Assume by default that exact lexical matches represent valid equivalence correspondences. \
-Your sole responsibility is to filter out clear homonyms e.g., Title as a publication \
-title vs. Title as an academic degree. Do not overthink minor nuances.
+For the following {filler} from the source ontology {task_input.source_kg}, simple \
+string matching found entities with the same normalized name in the target ontology \
+{task_input.target_kg}. They are only candidates: decide which relation, if any, \
+holds for each of them, and search for further correspondences as for any other \
+source entity:
 """
         for corr in task_input.potential_correspondences:
             block_num += 1
