@@ -163,6 +163,14 @@ RELATION_PROFILES: dict[str, RelationProfile] = {
 }
 
 
+def allows_many(profile: RelationProfile) -> bool:
+    """
+    Whether entities may take part in several correspondences, i.e. the
+    profile's cardinality (Alignment API notation) contains '*' or '+'.
+    """
+    return any(c in profile.cardinality for c in "*+")
+
+
 def get_relation_profile(config: GraspConfig) -> RelationProfile:
     name = config.task_kwargs.get("om", {}).get("relation_profile", "equivalence")
     if name not in RELATION_PROFILES:
@@ -510,7 +518,7 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
 
     # alignment-level cardinality in Alignment API notation: '*' or '+' on a
     # side means its entities may take part in several correspondences
-    many = any(c in profile.cardinality for c in "*+")
+    many = allows_many(profile)
     if many:
         directed = next((r.iri for r in profile.relations if not r.symmetric), None)
         example = (
@@ -576,8 +584,9 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
             " For each of them, check every relation against all relevant target entities "
             "and do not stop after the first correspondence found."
         )
+    no_match = "has no correspondence" if many else "has no match"
     completeness += (
-        " If an entity truly has no match, explain briefly why, but do not simply skip it."
+        f" If an entity truly {no_match}, explain briefly why, but do not simply skip it."
     )
     rules.append(completeness)
     return rules
@@ -972,17 +981,23 @@ source entity:
                 instructions += entity_block(c, target_manager, f"Candidate {j}")
             instructions += "\n"
 
-    # naked entities without potential equivalent candidates
+    # source entities without candidates
     len_corrs = len(task_input.unmatched_entities)
     if len_corrs > 0:
-        filler_1 = "entities"
-        filler_2 = "entities"
-        filler_3 = "they have no appropriate matches"
-        if len_corrs == 1:
-            filler_1 = "entity"
-            filler_2 = "an entity"
-            filler_3 = "it has no appropriate match"
-        instructions += f"""\
+        filler_1 = "entities" if len_corrs > 1 else "entity"
+        if allows_many(state.profile):
+            instructions += f"""\
+Find all correspondences between the following {filler_1} from the source ontology \
+{task_input.source_kg} and entities from the target ontology {task_input.target_kg}, \
+using any of the given relations, or verify that none exist:
+"""
+        else:
+            filler_2 = "entities"
+            filler_3 = "they have no appropriate matches"
+            if len_corrs == 1:
+                filler_2 = "an entity"
+                filler_3 = "it has no appropriate match"
+            instructions += f"""\
 Align the following {filler_1} from the source ontology {task_input.source_kg} \
 with {filler_2} from the target ontology {task_input.target_kg} or verify {filler_3}:
 """
