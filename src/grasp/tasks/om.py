@@ -225,56 +225,20 @@ Use this to lock in your alignment decisions.""",
 
 
 def system_information() -> str:
-    # TODO: extend for other matching tasks
     return """\
-You are an expert ontology alignment assistant. Your mission is to establish precise \
-T-Box (schema) correspondences between a source and a target ontology.
-You will process the source ontology in batches and must identify equivalent classes and properties \
-within the target ontology. Follow this step-by-step approach:
-1. Analyze the source and target ontology to understand their core domain \
-and conceptual scope. Consider how concepts might be represented, structured or labeled \
-differently in the target ontology.
-2. Identify equivalent classes or properties in the target ontology. Start \
-by establishing high-confidence matches, regardless of their position in the hierarchy, \
-with obvious matches based on strict lexical similarities (e.g., exact label matches, \
-identical local names, or unambiguous synonyms). These initial 1:1 correspondences will \
-serve as your structural anchors for the rest of the process.
-3. Leverage the established anchors to explore their structural neighborhood. \
-Use the provided functions to compare the superclasses, subclasses, domains, and ranges \
-of your anchored entities. Use this structural context to discover new, less obvious mappings \
-and to validate the semantic correctness of your baseline alignment.
-4. Once all significant correspondences have been established and \
-verified, use the stop function to finalize the alignment and terminate \
-the process."""
+You are an entity matching assistant. Your job is to find the entity in the \
+target knowledge graph that refers to the same thing as a given entity from \
+the source knowledge graph, or to determine that there is no such entity.
+
+1. Explore the given source entity and think about how it might be represented \
+in the target knowledge graph.
+2. Use the provided functions to search and explore the knowledge graphs.
+3. If you found a corresponding entity, set the correspondence. Then use the \
+stop function to finish."""
 
 
 def rules() -> list[str]:
-    return [
-        "Injectivity: Each entity from the source graph must map to exactly one entity in the target graph. "
-        "Every new correspondence will be automatically validated by the system. If a collision "
-        "occurs (an entity is already mapped), the system will present the conflicting mappings to "
-        "you. You must then review both the previous and the new match to determine which is "
-        "conceptually superior and resolve the conflict.",
-        "Strict Equivalence: Do not set correspondences between source and target entities if "
-        "they are not truly equivalent. Mappings must not cause logical contradictions.",
-        "Precision over Recall: If you cannot find a suitable reference entity in the target graph,"
-        "leave the source entity unmatched. It is better to set fewer but fully logically "
-        "consistent correspondences than more but less robust equivalences.",
-        "Lexical anchor mappings: For exact lexical matches (e.g., identical local names or labels "
-        "like 'Person' and 'Person'), treat them as high probability matches. Do not reject exact string "
-        "matches due to minor structural or modeling differences, unless they are clear and "
-        "unambiguous homonyms (e.g., 'Title' as a book vs. 'Title' as a degree) or they cause "
-        "hard logical contradictions.",
-        "Batch over Iteration: To improve efficiency and avoid hitting context limits, "
-        "favor batch-retrieval SPARQL queries over repetitive individual searches when "
-        "executing manual SPARQL queries for identifying patterns across multiple entities",
-        "Built-in functions: Before writing custom SPARQL queries, prioritize using the built-in "
-        "search, list and shapes functions to explore the target ontology quickly.",
-        "Completeness: Perform a final comprehensive review of all established correspondences "
-        "before concluding the task. You must explicitly evaluate every single entity provided "
-        "in the source list. Do not stop until you have attempted to match all of them. "
-        "If an entity truly has no match, explain briefly why, but do not simply skip it."
-    ]
+    return []
 
 
 def entity_exists_in_kg(manager: KgManager, iri: str) -> bool:
