@@ -474,7 +474,7 @@ def input_instructions(
         nonlocal shape_shown
         block = f"**{label}**: {format_entity(entity)}\n"
         shape_text = get_entity_shape_text(manager, entity.identifier, known)
-        if shape_text is not None:
+        if shape_text is not None and "no properties found" not in shape_text:
             shape_shown = True
             block += f"\n```shape: \n{shape_text}\n```\n"
         return block
