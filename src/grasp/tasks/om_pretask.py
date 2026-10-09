@@ -9,8 +9,8 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.utils import derive_label_from_iri, camel_case_split
 from grasp.tasks.entities import Entity
-from grasp.tasks.om import AlignmentTaskInput, PotentialCorrespondences
-from grasp.sparql.types import ObjType
+from grasp.tasks.om import AlignmentTaskInput, PotentialCorrespondences, entity_exists_in_kg
+from grasp.sparql.types import ObjType, SelectResult
 
 
 def normalize_name(name: str) -> str:
@@ -65,7 +65,7 @@ def retrieve_entities_and_properties(kg_manager: KgManager) -> dict[str, Entity]
     """
     Retrieves all classes and properties of a KG using GRASP's own, already
     built entities/properties indices.
-    Does not cover individuals/instances.
+    Does not cover literals.
     """
     entities_data = kg_manager.get_data(ObjType.ENTITY.index_name)
     properties_data = kg_manager.get_data(ObjType.PROPERTY.index_name)
@@ -93,6 +93,125 @@ def retrieve_entities_and_properties(kg_manager: KgManager) -> dict[str, Entity]
     result = _entities_from_ids(kg_manager, entity_ids, entity_info)
     result.update(_entities_from_ids(kg_manager, property_ids, property_info))
     return result
+
+
+def load_iris_file(path: str | Path) -> list[str]:
+    """
+    Reads IRIs from a plain text file, one IRI per line. Empty lines and lines
+    starting with '#' are skipped, optional angle brackets are stripped.
+    """
+    iris = []
+    with Path(path).expanduser().open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            iris.append(line.removeprefix("<").removesuffix(">"))
+    return iris
+
+
+def select_iris_with_sparql(kg_manager: KgManager, sparql: str) -> list[str]:
+    """
+    Executes a single-column SELECT query against the KG and returns the IRIs
+    it yields, in result order. Non-IRI results (literals, blank nodes) are
+    skipped with a warning.
+    """
+    result = kg_manager.execute_sparql(sparql)
+    if not isinstance(result, SelectResult):
+        raise ValueError("source_selection_sparql must be a SELECT query")
+    if result.num_columns != 1:
+        raise ValueError("source_selection_sparql must return a single column")
+
+    iris = []
+    skipped = 0
+    for bindings in result.bindings():
+        binding = next(iter(bindings), None)
+        if binding is None:
+            continue
+        if binding.typ != "uri":
+            skipped += 1
+            continue
+        iris.append(binding.value)
+
+    if skipped:
+        logging.warning(
+            f"Skipped {skipped} non-IRI results of source_selection_sparql."
+        )
+    return iris
+
+
+def retrieve_selected_entities(kg_manager: KgManager, iris: list[str]) -> dict[str, Entity]:
+    """
+    Retrieves only the given IRIs (in the given order) instead of all entities
+    and properties of the KG. They do not need to be part of GRASP's indices,
+    info is retrieved live via the indices' info SPARQL. IRIs that are in the
+    properties index are enriched with the property-specific info SPARQL.
+    """
+    properties_data = kg_manager.try_get_data(ObjType.PROPERTY.index_name)
+
+    def is_property(iri: str) -> bool:
+        return (
+            properties_data is not None
+            and properties_data.id_from_identifier(iri) is not None
+        )
+
+    entity_ids = [iri for iri in iris if not is_property(iri)]
+    property_ids = [iri for iri in iris if is_property(iri)]
+
+    entity_info = kg_manager.get_info_for_identifiers_from_index(
+        entity_ids, ObjType.ENTITY.index_name
+    )
+    property_info = kg_manager.get_info_for_identifiers_from_index(
+        property_ids, ObjType.PROPERTY.index_name
+    ) if property_ids else {}
+
+    entities = _entities_from_ids(kg_manager, entity_ids, entity_info)
+    entities.update(_entities_from_ids(kg_manager, property_ids, property_info))
+    # restore the given order
+    return {iri: entities[iri] for iri in iris}
+
+
+def get_source_iris(kg_manager: KgManager, configs: dict) -> list[str] | None:
+    """
+    Collects the source IRIs selected via source_iris (list), source_iris_file
+    (plain text file, one IRI per line) and source_selection_sparql (single-column
+    SELECT query). Several options can be combined, their IRIs are concatenated
+    in this order without duplicates. Returns None if no option is set, i.e. all
+    entities and properties of the source KG should be used.
+    """
+    source_iris = configs.get("source_iris")
+    source_iris_file = configs.get("source_iris_file")
+    source_selection_sparql = configs.get("source_selection_sparql")
+
+    if source_iris is None and source_iris_file is None and source_selection_sparql is None:
+        return None
+
+    # explicitly given IRIs might be mistyped, so check that they exist;
+    # IRIs from the selection query exist in the KG by construction
+    explicit = list(source_iris or [])
+    if source_iris_file is not None:
+        explicit.extend(load_iris_file(source_iris_file))
+
+    iris = []
+    missing = []
+    for iri in explicit:
+        if entity_exists_in_kg(kg_manager, iri):
+            iris.append(iri)
+        else:
+            missing.append(iri)
+    if missing:
+        logging.warning(
+            f"Skipping {len(missing)} selected IRIs not found in "
+            f"{kg_manager.kg}:\n" + "\n".join(missing)
+        )
+
+    if source_selection_sparql is not None:
+        iris.extend(select_iris_with_sparql(kg_manager, source_selection_sparql))
+
+    # deduplicate, keep first occurrence
+    iris = list(dict.fromkeys(iris))
+    logging.info(f"Selected {len(iris)} source IRIs from {kg_manager.kg}.")
+    return iris
 
 
 def build_string_matching_dict(entities: dict[str, Entity]) -> dict[str, list[Entity]]:
@@ -186,7 +305,12 @@ def om_pretask(source_manager: KgManager, target_manager: KgManager, output_file
     skip_prematching = configs.get("skip_prematching")
     batch_size = configs.get("batch_size")
     limit = configs.get("limit")
-    source_entities = retrieve_entities_and_properties(source_manager)
+
+    source_iris = get_source_iris(source_manager, configs)
+    if source_iris is None:
+        source_entities = retrieve_entities_and_properties(source_manager)
+    else:
+        source_entities = retrieve_selected_entities(source_manager, source_iris)
 
     if skip_prematching:
         matches = []

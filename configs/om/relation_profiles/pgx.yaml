@@ -1,0 +1,65 @@
+# Relatedness levels between reified n-ary tuples of the OAEI Pharmacogenomics
+# track, following the matching rules 1-4 of Monnin et al., "Knowledge-Based
+# Matching of n-ary Tuples", ICCS 2020. Rules are applied in this order and
+# only the first one that holds is kept, so the levels are mutually exclusive.
+# Which components count as more specific (partOf for genetic factors, class
+# hierarchies for drugs and phenotypes) is domain knowledge for the
+# task instructions (om.task_instructions).
+name: pgx
+cardinality: "**"
+# '=' is n:m in the reference, since both ontologies contain duplicate tuples
+duplicates_within: true
+description: >-
+  Tuples are compared argument by argument. An argument of a tuple is the set of
+  its components of one type linked to it by one predicate, where a component
+  linked by a more specific predicate also belongs to the arguments of all more
+  general predicates. An argument that a tuple does not specify is unknown and can
+  be anything. Check the relations in the order '=', 'Close', '<', '>', 'Related'
+  and set only the first one that holds for a pair of tuples (e.g. identical tuples
+  are also equivalent, but only '=' is set). If none of them holds, the tuples are
+  not related.
+relations:
+  - iri: "="
+    description: >-
+      Identical tuples: for every argument, the source and the target tuple have
+      the same set of components (the same individuals, or individuals linked by
+      owl:sameAs).
+    symmetric: true
+    transitive: true
+    excludes: ["Close", "<", ">", "Related"]
+  - iri: Close
+    description: >-
+      Equivalent, but not identical tuples: for every argument, each component of
+      either tuple has an equivalent counterpart in the same argument of the other
+      tuple, e.g. a different individual instantiating the same most specific
+      classes.
+    # not transitive: two 'Close' steps may end in identical tuples
+    symmetric: true
+    excludes: ["=", "<", ">", "Related"]
+  - iri: "<"
+    description: >-
+      The source tuple is more specific than the target tuple, and the tuples are
+      not equivalent: for every argument, each component of the source tuple is
+      the same as, part of, or of a more specific class than some component in the
+      same argument of the target tuple. Arguments are compared set-wise, so a
+      subset is more specific (e.g. drugs {erlotinib} < {erlotinib, chemotherapy}).
+      An argument unspecified in the target tuple is unknown and can be anything;
+      an argument specified only in the target tuple prevents '<'.
+    transitive: true
+    inverse_of: ">"
+    excludes: ["=", "Close", ">", "Related"]
+  - iri: ">"
+    description: >-
+      The source tuple is more general than the target tuple, and the tuples are
+      not equivalent: the same as '<' with source and target swapped.
+    transitive: true
+    inverse_of: "<"
+    excludes: ["=", "Close", "<", "Related"]
+  - iri: Related
+    description: >-
+      The tuples specify the same arguments and every argument is comparable, but
+      in mixed directions: some arguments of the source tuple are more specific and
+      others more general than those of the target tuple, so none of the other
+      relations holds.
+    symmetric: true
+    excludes: ["=", "Close", "<", ">"]

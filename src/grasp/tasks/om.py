@@ -1,9 +1,12 @@
+import json
 import random
 from collections import deque
 from itertools import combinations
+from pathlib import Path
 from typing import Any, Literal
 
 import requests
+import yaml
 from pydantic import BaseModel, model_validator
 from universal_ml_utils.table import generate_table
 
@@ -19,7 +22,7 @@ from grasp.sparql.types import AskResult, SelectResult
 from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import FeedbackTask, GraspTask
 from grasp.tasks.entities import Entity, prepare_entity
-from grasp.utils import FunctionCallException, format_list, format_notes
+from grasp.utils import FunctionCallException, format_list, format_notes, format_section
 from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
 
 
@@ -82,6 +85,14 @@ class RelationProfile(BaseModel):
     # alignment-level cardinality in Alignment API notation (11, 1?, ??, **);
     # informational for now, not enforced
     cardinality: str = "**"
+    # whether an ontology may contain duplicate entities, so that several
+    # entities related by a symmetric and transitive relation to the same
+    # entity of the other ontology can all be correct
+    duplicates_within: bool = False
+    # optional explanation of how to decide between the relations, shown to
+    # the LLM right after the relation descriptions (e.g. an order in which
+    # the relations are to be checked)
+    description: str | None = None
 
     @model_validator(mode="after")
     def check_references(self) -> "RelationProfile":
@@ -171,13 +182,30 @@ def allows_many(profile: RelationProfile) -> bool:
     return any(c in profile.cardinality for c in "*+")
 
 
-def get_relation_profile(config: GraspConfig) -> RelationProfile:
-    name = config.task_kwargs.get("om", {}).get("relation_profile", "equivalence")
-    if name not in RELATION_PROFILES:
+def load_relation_profile(spec: str | dict) -> RelationProfile:
+    """
+    `spec` is the name of a built-in profile, the path to a YAML or JSON
+    file with a profile, or a profile given inline as a mapping.
+    """
+    if isinstance(spec, dict):
+        return RelationProfile(**spec)
+    if spec in RELATION_PROFILES:
+        return RELATION_PROFILES[spec]
+    path = Path(spec).expanduser()
+    if path.suffix not in (".yaml", ".yml", ".json"):
         raise ValueError(
-            f"Unknown relation profile {name}, available: {list(RELATION_PROFILES)}"
+            f"Unknown relation profile {spec}, must be one of "
+            f"{list(RELATION_PROFILES)} or a .yaml/.yml/.json file"
         )
-    return RELATION_PROFILES[name]
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f) if path.suffix == ".json" else yaml.safe_load(f)
+    return RelationProfile(**data)
+
+
+def get_relation_profile(config: GraspConfig) -> RelationProfile:
+    return load_relation_profile(
+        config.task_kwargs.get("om", {}).get("relation_profile", "equivalence")
+    )
 
 
 Side = Literal["source", "target"]
@@ -236,6 +264,8 @@ class AlignmentState:
         # correspondence -> keys of the existing correspondences the warning
         # was about. Per conversation, unlike the shared correspondences.
         self.pending_warnings: dict[tuple[str, str, str], frozenset[tuple[str, str, str]]] = {}
+        # results of the scope checks: (side, IRI) -> whether it is in scope
+        self.scope_cache: dict[tuple[Side, str], bool] = {}
 
     @classmethod
     def clear_global(cls):
@@ -471,13 +501,32 @@ def functions(managers: list[KgManager], profile: RelationProfile) -> list[dict]
     return fns
 
 
-def system_information(profile: RelationProfile) -> str:
+def load_task_instructions(om_kwargs: dict) -> str | None:
+    """
+    Free-text instructions specific to the alignment task at hand (e.g. domain
+    knowledge needed to decide on the relations), given inline or as the path
+    to a .md/.txt file in the `task_instructions` om task kwargs.
+    """
+    spec = om_kwargs.get("task_instructions")
+    if not spec:
+        return None
+    if "\n" not in spec and Path(spec).suffix in (".md", ".txt"):
+        spec = Path(spec).expanduser().read_text(encoding="utf-8")
+    return spec.strip() or None
+
+
+def system_information(
+    profile: RelationProfile,
+    task_instructions: str | None = None,
+) -> str:
     relations = "\n".join(f"- '{r.iri}': {r.description}" for r in profile.relations)
+    if profile.description:
+        relations += f"\n\n{profile.description.strip()}"
     if len(profile.relations) == 1:
         relation_intro = "Each correspondence relates them by the following relation:"
     else:
         relation_intro = "You can relate them by the following relations:"
-    return f"""\
+    info = f"""\
 You are an expert ontology alignment assistant. Your mission is to establish \
 correspondences between the entities (e.g. classes, properties and instances) of a source \
 and a target ontology. A correspondence <source entity> <relation> <target entity> \
@@ -507,9 +556,16 @@ between the source entity and each candidate, and set the corresponding \
 correspondences. If no relation holds, leave the source entity unmatched.
 3. Once all given source entities have been processed, use the stop function \
 to finalize the alignment."""
+    if task_instructions:
+        info += "\n\n" + format_section("Task-specific instructions", task_instructions)
+    return info
 
 
-def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
+def rules(
+    profile: RelationProfile,
+    alignment_form: str = "raw",
+    scope_description: str | None = None,
+) -> list[str]:
     """
     Only rules needed to understand the task. Rules derived from relation
     properties explain the consistency checks the system performs.
@@ -541,7 +597,16 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
         )
 
     for r in profile.relations:
-        if r.symmetric and r.transitive:
+        if r.symmetric and r.transitive and profile.duplicates_within:
+            rules.append(
+                f"Transitivity of '{r.iri}': If several source entities are related by "
+                f"'{r.iri}' to the same target entity (or one source entity to several "
+                f"target entities), they are implied to be pairwise '{r.iri}' to each "
+                "other within their own ontology. The ontologies may contain duplicate "
+                "entities, so this can be correct: set all of these correspondences if "
+                "the implied relations within the ontologies hold as well."
+            )
+        elif r.symmetric and r.transitive:
             rules.append(
                 f"Transitivity and near-injectivity of '{r.iri}': If several source entities "
                 f"are related by '{r.iri}' to the same target entity (or one source entity to "
@@ -589,6 +654,9 @@ def rules(profile: RelationProfile, alignment_form: str = "raw") -> list[str]:
         f" If an entity truly {no_match}, explain briefly why, but do not simply skip it."
     )
     rules.append(completeness)
+
+    if scope_description:
+        rules.append(f"Scope: {scope_description}")
     return rules
 
 
@@ -625,6 +693,51 @@ def ensure_known(manager: KgManager, iri: str, known: set[str]) -> None:
         f"The entity {iri} does not seem to exist in the knowledge graph. "
         "Double check the IRI."
     )
+
+
+def scope_sparql(scope: dict, side: Side) -> str | None:
+    """
+    The ASK query template with an {IRI} placeholder that restricts the
+    entities of `side` which may take part in correspondences, given inline or
+    as the path to a .sparql/.rq file in the `scope` om task kwargs. None if
+    the side is not restricted.
+    """
+    spec = scope.get(side)
+    if spec is None:
+        return None
+    if "\n" not in spec and Path(spec).suffix in (".sparql", ".rq"):
+        spec = Path(spec).expanduser().read_text(encoding="utf-8")
+    if "{IRI}" not in spec:
+        raise ValueError(f"Scope SPARQL for the {side} side must contain an {{IRI}} placeholder")
+    return spec
+
+
+def ensure_in_scope(
+    manager: KgManager,
+    iri: str,
+    side: Side,
+    scope: dict,
+    state: "AlignmentState",
+) -> None:
+    sparql = scope_sparql(scope, side)
+    if sparql is None:
+        return
+
+    key = (side, iri)
+    if key not in state.scope_cache:
+        wrapped = prepare_identifier_for_sparql(iri, manager.iri_literal_parser)
+        result = manager.execute_sparql(sparql.replace("{IRI}", wrapped))
+        assert isinstance(result, AskResult), "Scope SPARQL must be an ASK query"
+        state.scope_cache[key] = result.boolean
+
+    if not state.scope_cache[key]:
+        message = (
+            f"The entity {iri} is not among the entities to be aligned in the "
+            f"{side} ontology {manager.kg}."
+        )
+        if scope.get("description"):
+            message += f" {scope['description']}"
+        raise FunctionCallException(message)
 
 
 def get_entity_shape_text(
@@ -790,6 +903,7 @@ def add_correspondence(
         state: AlignmentState,
         known: set[str],
         know_before_use: bool = True,
+        scope: dict | None = None,
         ) -> str:
 
     try:
@@ -803,6 +917,10 @@ def add_correspondence(
         if know_before_use:
             ensure_known(manager_source, full_iri_source, known)
             ensure_known(manager_target, full_iri_target, known)
+
+        if scope:
+            ensure_in_scope(manager_source, full_iri_source, "source", scope, state)
+            ensure_in_scope(manager_target, full_iri_target, "target", scope, state)
 
         if state.get_correspondence(full_iri_source, full_iri_target, relation.iri) is not None:
             return (
@@ -906,7 +1024,7 @@ def call_function(
 
         return add_correspondence(
             managers, kg1, kg2, ent1, ent2, relation, state, known,
-            know_before_use,
+            know_before_use, om_kwargs.get("scope"),
         )
 
     elif fn_name == "delete_correspondence":
@@ -1153,7 +1271,20 @@ def feedback_system_message(
     notes: list[str],
     profile: RelationProfile,
     alignment_form: str = "raw",
+    scope_description: str | None = None,
+    task_instructions: str | None = None,
 ) -> str:
+    task_info = ""
+    if profile.description:
+        task_info += (
+            "The system was provided the following explanation of the relations:\n"
+            f"{profile.description.strip()}\n\n"
+        )
+    if task_instructions:
+        task_info += (
+            "The system was provided the following task-specific instructions:\n"
+            f"{task_instructions}\n\n"
+        )
     return f"""\
 You are an expert ontology matching judge. Your task is to evaluate if the assistant has correctly identified and set correspondences between the entities.
 
@@ -1163,8 +1294,8 @@ The system has access to the following knowledge graphs:
 The system was provided the following notes across all knowledge graphs:
 {format_notes(notes)}
 
-The system was provided the following rules to follow:
-{format_list(rules(profile, alignment_form))}
+{task_info}The system was provided the following rules to follow:
+{format_list(rules(profile, alignment_form, scope_description))}
 
 Provide your feedback with the give_feedback function.\
 """
@@ -1199,12 +1330,17 @@ class OmTask(GraspTask, FeedbackTask):
         return instructions
 
     def system_information(self) -> str:
-        return system_information(get_relation_profile(self.config))
+        return system_information(
+            get_relation_profile(self.config),
+            load_task_instructions(self.config.task_kwargs.get("om", {})),
+        )
 
     def rules(self) -> list[str]:
+        om_kwargs = self.config.task_kwargs.get("om", {})
         return rules(
             get_relation_profile(self.config),
-            self.config.task_kwargs.get("om", {}).get("alignment_form", "raw"),
+            om_kwargs.get("alignment_form", "raw"),
+            om_kwargs.get("scope", {}).get("description"),
         )
 
     def function_definitions(self) -> list[dict]:
@@ -1250,9 +1386,12 @@ class OmTask(GraspTask, FeedbackTask):
     def feedback_system_message(
         self, kg_notes: dict[str, list[str]], notes: list[str]
     ) -> str:
+        om_kwargs = self.config.task_kwargs.get("om", {})
         return feedback_system_message(
             self.managers, kg_notes, notes, get_relation_profile(self.config),
-            self.config.task_kwargs.get("om", {}).get("alignment_form", "raw"),
+            om_kwargs.get("alignment_form", "raw"),
+            om_kwargs.get("scope", {}).get("description"),
+            load_task_instructions(om_kwargs),
         )
 
     def feedback_instructions(self, inputs: list[str], output: dict) -> str:
