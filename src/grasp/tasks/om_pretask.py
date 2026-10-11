@@ -36,12 +36,16 @@ def _entities_from_ids(
     result: dict[str, Entity] = {}
     for iri in ids:
         entry = info.get(iri, {})
-        label = entry.get("label") or derive_label_from_iri(iri, kg_manager.prefixes)
+        label = entry.get("label")
+        label_derived = not label
+        if label_derived:
+            label = derive_label_from_iri(iri, kg_manager.prefixes)
 
         result[iri] = Entity(
             identifier=iri,
             entity=kg_manager.format_iri(iri),
             label=label,
+            label_derived=label_derived,
             aliases=entry.get("alias", []),
             infos=entry.get("other", []),
         )

@@ -13,12 +13,13 @@ from universal_ml_utils.table import generate_table
 from grasp.configs import GraspConfig, ShapeConfig
 from grasp.functions import (
     find_manager,
+    list_triples,
     update_known_from_shape_iris,
     SHAPE_CAVEAT,
 )
 from grasp.manager import KgManager, format_kgs
 from grasp.model import Message
-from grasp.sparql.types import AskResult, SelectResult
+from grasp.sparql.types import AskResult, ObjType, SelectResult
 from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import FeedbackTask, GraspTask
 from grasp.tasks.entities import Entity, prepare_entity
@@ -30,7 +31,9 @@ def format_entity(entity: Entity) -> str:
     output = f"Full IRI: {entity.identifier}"
     if entity.entity != entity.identifier:
         output += f", shortened IRI: {entity.entity}"
-    if entity.label is not None:
+    if entity.label is not None and entity.label_derived:
+        output += f", label (derived from IRI): {entity.label}"
+    elif entity.label is not None:
         output += f", label: {entity.label}"
     if entity.aliases and entity.aliases != [entity.label]:
         output += f", aliases: {entity.aliases}"
@@ -537,20 +540,25 @@ Whether a correspondence holds is ultimately a functional question: ontology \
 alignments are used to support cross-ontology queries and interoperability \
 between different systems, one using each ontology. Ask yourself what a query \
 for an entity in one system should return in the other one - the relation \
-descriptions above state this for each relation. Lexical and structural \
-information are your evidence for answering this question.
+descriptions above state this for each relation. Lexical information is your \
+primary evidence for answering this question; logical signals support or \
+relativize it.
 
 Follow this step-by-step approach:
 1. Analyze the source and target ontology to understand their core domain and \
 conceptual scope. Consider how concepts in the source ontology might be \
 represented, structured or labeled differently in the target ontology.
 2. For each given source entity:
-a. Search the target ontology for entities that are lexically related to it, \
-based on labels, synonyms and other lexical information of the entity and of \
-its neighboring entities.
-b. Check the structural context of the source entity and of the candidates in \
-both ontologies, e.g. their hierarchies and relations to other entities, for \
-support or contradiction.
+a. Search the target ontology for entities that are lexically related to it. \
+The lexical information of an entity comprises its own labels, synonyms and \
+other lexical information as well as those of its neighboring entities (e.g. \
+related entities and the classes it instantiates). If an entity has no \
+meaningful label of its own (e.g. only a label derived from an identifier-like \
+IRI), the labels of its neighbors are its lexical description.
+b. Check logical signals for support or contradiction: the hierarchies of both \
+ontologies, and the logical consequences a correspondence would have, e.g. \
+which relations it would imply between their sub- and superclasses or between \
+entities within the same ontology.
 c. Decide from the functional point of view which relation, if any, holds \
 between the source entity and each candidate, and set the corresponding \
 correspondences. If no relation holds, leave the source entity unmatched.
@@ -782,6 +790,112 @@ def get_entity_shape_text(
         )
 
     return emit_pseudo_shex(profile, manager, shape_config)
+
+
+class EntityContextConfig(BaseModel):
+    """
+    Triples around an entity shown to the LLM together with the entity, as
+    returned by the list function, e.g. for entities without meaningful labels.
+    """
+    # list(subject=<entity>) and list(object=<entity>)
+    outgoing: bool = True
+    incoming: bool = False
+    # rows per list call, defaults to the list_k of the config
+    k: int | None = None
+    # predicates along which neighbors without a label are described, e.g.
+    # the type predicate of the knowledge graph; empty means not at all
+    expand_unlabeled: list[str] = []
+    # maximum number of neighbors without a label to describe
+    max_expanded: int = 5
+    # no context for entities whose shape is shown (off by default, since
+    # shapes computed for instances may be empty)
+    skip_if_shape: bool = False
+
+
+def get_entity_context_config(om_kwargs: dict) -> EntityContextConfig | None:
+    cfg = om_kwargs.get("entity_context")
+    if cfg is None:
+        return None
+    return EntityContextConfig(**cfg)
+
+
+def unlabeled_neighbors(
+    manager: KgManager,
+    iri: str,
+    cfg: EntityContextConfig,
+) -> list[str]:
+    """
+    IRIs of the neighbors of `iri` (in the directions set in `cfg`) that have
+    no label in the entities index, in deterministic order.
+    """
+    wrapped = prepare_identifier_for_sparql(iri, manager.iri_literal_parser)
+    patterns = []
+    if cfg.outgoing:
+        patterns.append(f"{{ {wrapped} ?p ?n }}")
+    if cfg.incoming:
+        patterns.append(f"{{ ?n ?p {wrapped} }}")
+    if not patterns:
+        return []
+    sparql = (
+        f"SELECT DISTINCT ?n WHERE {{ {' UNION '.join(patterns)} "
+        f"FILTER(isIRI(?n) && ?n != {wrapped}) }} ORDER BY ?n LIMIT 1000"
+    )
+    result = manager.execute_sparql(sparql)
+    assert isinstance(result, SelectResult)
+    neighbors = [row["n"].identifier() for row in result.rows() if "n" in row]
+    info = manager.get_info_for_identifiers_from_index(
+        neighbors, ObjType.ENTITY.index_name
+    )
+    unlabeled = [n for n in neighbors if not info.get(n, {}).get("label")]
+    return unlabeled[:cfg.max_expanded]
+
+
+def get_entity_context_text(
+    manager: KgManager,
+    entity: Entity,
+    cfg: EntityContextConfig,
+    config: GraspConfig,
+    known: set[str],
+) -> str | None:
+    """
+    The context of `entity` as returned by list calls, each preceded by the
+    call itself so that the LLM can continue from there (e.g. with the next
+    page). None if no call returned anything.
+    """
+    k = cfg.k or config.list_k
+    timeouts = (config.sparql_request_timeout, config.sparql_read_timeout)
+    calls: list[tuple[str, dict]] = []
+    if cfg.outgoing:
+        calls.append((f'subject="{entity.entity}"', dict(subject=entity.identifier)))
+    if cfg.incoming:
+        calls.append((f'object="{entity.entity}"', dict(obj=entity.identifier)))
+    if cfg.expand_unlabeled:
+        for neighbor in unlabeled_neighbors(manager, entity.identifier, cfg):
+            for pred in cfg.expand_unlabeled:
+                calls.append((
+                    f'subject="{manager.format_iri(neighbor)}", property="{pred}"',
+                    dict(subject=neighbor, property=pred),
+                ))
+
+    blocks = []
+    for call, args in calls:
+        result = list_triples(
+            [manager],
+            manager.kg,
+            args.get("subject"),
+            args.get("property"),
+            args.get("obj"),
+            1,
+            False,
+            k,
+            known,
+            *timeouts,
+        )
+        if result.startswith("No triples"):
+            continue
+        blocks.append(f'list(kg="{manager.kg}", {call}):\n{result}')
+
+    return "\n\n".join(blocks) or None
 
 
 def pair_inconsistencies(
@@ -1061,12 +1175,17 @@ def input_instructions(
     state: AlignmentState,
     managers: list[KgManager],
     known: set[str],
+    config: GraspConfig | None = None,
 ) -> str:
     instructions = ""
     source_manager, _ = find_manager(managers, task_input.source_kg)
     target_manager, _ = find_manager(managers, task_input.target_kg)
     shape_shown = False
     block_num = 0
+    context_cfg = (
+        get_entity_context_config(config.task_kwargs.get("om", {}))
+        if config is not None else None
+    )
 
     def entity_block(entity: Entity, manager: KgManager, label: str) -> str:
         # fenced code block for the shape: self-delimiting regardless of
@@ -1075,9 +1194,24 @@ def input_instructions(
         nonlocal shape_shown
         block = f"**{label}**: {format_entity(entity)}\n"
         shape_text = get_entity_shape_text(manager, entity.identifier, known)
-        if shape_text is not None:
+        show_shape = shape_text is not None and "no properties found" not in shape_text
+        if show_shape:
             shape_shown = True
             block += f"\n```shape: \n{shape_text}\n```\n"
+        if context_cfg is not None and not (show_shape and context_cfg.skip_if_shape):
+            assert config is not None
+            try:
+                context = get_entity_context_text(
+                    manager, entity, context_cfg, config, known
+                )
+            except Exception as e:
+                # never lose a run because of the context
+                context = None
+                manager.logger.warning(
+                    f"Failed to get the context of {entity.identifier}: {e}"
+                )
+            if context is not None:
+                block += f"\nContext:\n{context}\n"
         return block
 
     # source entities with candidates from string matching (om_pretask)
@@ -1163,7 +1297,7 @@ def input_and_state(
             state.discard_correspondences_of(correspondence.key[1], "target", relation.iri)
         state.add_correspondence(correspondence)
 
-    instructions = input_instructions(task_input, state, managers, known)
+    instructions = input_instructions(task_input, state, managers, known, config)
     return instructions, state
 
 
