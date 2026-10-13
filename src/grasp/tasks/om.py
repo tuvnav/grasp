@@ -1214,16 +1214,19 @@ def input_instructions(
                 block += f"\nContext:\n{context}\n"
         return block
 
-    # source entities with candidates from string matching (om_pretask)
+    # source entities with candidates, by default from string matching (om_pretask);
+    # other candidate generators describe themselves via om.candidates_description
     len_pc = len(task_input.potential_correspondences)
     if len_pc > 0:
         filler = "entities" if len_pc > 1 else "entity"
+        found_by = "simple string matching found entities with the same normalized name"
+        if config is not None:
+            found_by = config.task_kwargs.get("om", {}).get("candidates_description", found_by)
         instructions += f"""\
-For the following {filler} from the source ontology {task_input.source_kg}, simple \
-string matching found entities with the same normalized name in the target ontology \
-{task_input.target_kg}. They are only candidates: decide which relation, if any, \
-holds for each of them, and search for further correspondences as for any other \
-source entity:
+For the following {filler} from the source ontology {task_input.source_kg}, \
+{found_by} in the target ontology {task_input.target_kg}. They are only \
+candidates: decide which relation, if any, holds for each of them, and search for \
+further correspondences as for any other source entity:
 """
         for corr in task_input.potential_correspondences:
             block_num += 1
