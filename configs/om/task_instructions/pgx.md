@@ -33,3 +33,13 @@ more specific than another one:
 - obo:RO_0002502 ("depends on") links complex phenotypes to the phenotypes and
   drugs they refer to (e.g. warfarin-induced bleeding depends on warfarin and
   bleeding). It is not used to compare components.
+
+Only the relations stated in the ontologies (owl:sameAs, the part-of relations,
+rdfs:subClassOf between the classes the components instantiate) and the predicate
+hierarchy above make a component the same as, equivalent to, more specific or more
+general than another one. Do not infer this from the meaning of labels or from
+background knowledge: e.g. a genetic factor labeled "genetic variants" is not more
+general than a specific variant, and a drug labeled "egfr tyrosine kinase
+inhibitors" is not more general than gefitinib, unless the ontologies state it.
+Components that cannot be compared this way are not related, so tuples with such
+components are not related either.

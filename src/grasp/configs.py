@@ -99,6 +99,7 @@ class ModelConfig(BaseModel):
     model: str = "gpt-5.4-mini"
     model_provider: Literal[
         "openai/completions",
+        "openai/completions-stream",  # STREAM-PATCH, see model/openai_stream.py
         "openai/responses",
         "anthropic",
     ] = "openai/responses"

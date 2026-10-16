@@ -8,6 +8,12 @@ def get_model(config: ModelConfig) -> Model:
     if config.model_provider == "openai/completions":
         return OpenAICompletionsModel(config)
 
+    # STREAM-PATCH, see model/openai_stream.py
+    elif config.model_provider == "openai/completions-stream":
+        from grasp.model.openai_stream import OpenAICompletionsStreamModel
+
+        return OpenAICompletionsStreamModel(config)
+
     elif config.model_provider == "openai/responses":
         return OpenAIResponsesModel(config)
 
