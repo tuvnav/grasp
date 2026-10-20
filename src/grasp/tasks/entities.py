@@ -9,6 +9,8 @@ class Entity(BaseModel):
     identifier: str
     entity: str
     label: str | None = None
+    # whether the label was derived from the IRI, since the entity has none
+    label_derived: bool = False
     aliases: list[str] | None = None
     infos: list[str] | None = None
 

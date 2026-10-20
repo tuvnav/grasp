@@ -18,7 +18,8 @@ from grasp.tasks.shapes_setup import ShapesSetupTask
 from grasp.tasks.sparql_qa import SparqlQaTask
 from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
-from grasp.tasks.om import OmTask
+from grasp.tasks.om.agentic_search_verify import OmTask
+from grasp.tasks.om.anchor_task import OMAnchorTask
 
 
 # official tasks supported by GRASP, excluding exploration
@@ -49,6 +50,7 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         NotesFromSamplesTask,
         AutoSetupTask,
         OmTask,
+        OMAnchorTask,
         ShapesSetupTask,
     ]
 }
