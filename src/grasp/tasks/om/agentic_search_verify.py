@@ -521,6 +521,18 @@ def ensure_in_scope(
     scope: dict,
     state: "AlignmentState",
 ) -> None:
+    # set-based restriction by IRI prefixes (e.g. the entity space of the anchor
+    # stage), checked before the per-IRI ASK query
+    namespaces = scope.get("namespaces", {}).get(side)
+    if namespaces and not iri.startswith(tuple(namespaces)):
+        message = (
+            f"The entity {iri} is not among the entities to be aligned in the "
+            f"{side} ontology {manager.kg}: its IRI starts with none of {namespaces}."
+        )
+        if scope.get("description"):
+            message += f" {scope['description']}"
+        raise FunctionCallException(message)
+
     sparql = scope_sparql(scope, side)
     if sparql is None:
         return

@@ -308,6 +308,8 @@ def key_anchors(
 
     anchors: list[KeyAnchor] = []
     stats: dict[PartitionGroup, GroupStats] = {}
+    compared_src: set[str] = set()
+    compared_tgt: set[str] = set()
     for group in groups:
         # union of the group's partitions; an entity in several of them (punning)
         # has duplicate rows, which the anchor rule counts as one entity
@@ -317,6 +319,8 @@ def key_anchors(
             continue
         group_anchors, stats[group] = anchors_for_group(group, src, tgt, extended)
         anchors.extend(group_anchors)
+        compared_src.update(r.entity for r in src)
+        compared_tgt.update(r.entity for r in tgt)
 
     grouped_src = set().union(*(g.source for g in groups))
     grouped_tgt = set().union(*(g.target for g in groups))
@@ -327,4 +331,6 @@ def key_anchors(
         unpaired_target=sorted(tgt_parts.keys() - grouped_tgt),
         missing_source=sorted(grouped_src - src_parts.keys()),
         missing_target=sorted(grouped_tgt - tgt_parts.keys()),
+        source_entities=frozenset(compared_src),
+        target_entities=frozenset(compared_tgt),
     )

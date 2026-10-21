@@ -53,7 +53,7 @@ from grasp.search_params import (
 from grasp.server import serve
 from grasp.shapes import ShapeIndex, ShapeSample
 from grasp.tasks import Task, get_task
-from grasp.tasks.om_pretask import om_pretask
+from grasp.tasks.om.retrieve_entities import om_pretask
 from grasp.utils import (
     format_trace,
     get_available_knowledge_graphs,

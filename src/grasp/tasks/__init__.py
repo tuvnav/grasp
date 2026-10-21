@@ -32,6 +32,7 @@ class Task(StrEnum):
     S2Q = "sparql-to-question"
     ENTITY_LINKING = "entity-linking"
     OM = "om"
+    OM_ANCHORS = "om-anchors"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {

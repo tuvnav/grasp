@@ -10,9 +10,13 @@ from grasp.manager.utils import merge_prefixes
 from grasp.sparql.types import Binding
 from grasp.tasks.entities import Entity
 from grasp.utils import derive_label_from_iri
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 from rdflib import Literal
 import yaml
+
+
+PROMPT_DIR = Path(__file__).parent / "prompts"
+SIDES = ("source", "target")
 
 
 @dataclass
@@ -140,6 +144,19 @@ SELECT DISTINCT ?entity ?partition ?evidence WHERE {
     FILTER(isIRI(?t) && !STRSTARTS(STR(?t), STR(owl:)) && !STRSTARTS(STR(?t), STR(rdfs:))
            && !STRSTARTS(STR(?t), STR(rdf:)) && !STRSTARTS(STR(?t), STR(skos:)))
     BIND("instance" AS ?partition) BIND("used" AS ?evidence)
+  } UNION {
+    # untyped individuals (e.g. wiki articles): subjects with data beyond names and
+    # without a schema role; helper nodes that only carry a label stay uncategorized
+    { SELECT DISTINCT ?entity WHERE {
+        ?entity ?p ?o .
+        FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:comment, skos:prefLabel, skos:altLabel))
+    } }
+    FILTER NOT EXISTS { ?entity rdf:type ?anyType }
+    FILTER NOT EXISTS { ?anyInstance rdf:type ?entity }
+    FILTER NOT EXISTS { ?entity rdfs:subClassOf ?anySuper }
+    FILTER NOT EXISTS { ?anySub rdfs:subClassOf ?entity }
+    FILTER NOT EXISTS { ?anySubject ?entity ?anyObject }
+    BIND("instance" AS ?partition) BIND("untyped" AS ?evidence)
   }
   FILTER(isIRI(?entity))
   FILTER(!STRSTARTS(STR(?entity), STR(rdf:)) && !STRSTARTS(STR(?entity), STR(rdfs:))
@@ -198,6 +215,7 @@ class PartitionGroup:
         return f"{'+'.join(sorted(self.source))} <-> {'+'.join(sorted(self.target))}"
 
 
+# TODO: analog Pydantic class for communication with LLM
 @dataclass(frozen=True)
 class KeyAnchor:
     source_iri: str
@@ -246,10 +264,15 @@ class KeyAnchorResult:
     # partitions named in the pairing that do not occur in the data
     missing_source: list[str]
     missing_target: list[str]
+    # entities of each side that took part in a compared partition group
+    source_entities: frozenset[str] = frozenset()
+    target_entities: frozenset[str] = frozenset()
 
 
 class SideQueries(BaseModel):
     """Queries of one side, joined on ?entity (see the contracts above)."""
+    # unknown fields are errors, e.g. typos in LLM arguments
+    model_config = ConfigDict(extra="forbid")
     key: str = NAME_ANCHORS_SPARQL
     scope: str | None = None
     partition: str | None = KIND_PARTITION_SPARQL
@@ -258,11 +281,13 @@ class SideQueries(BaseModel):
 class PairingGroup(BaseModel):
     """Source partitions compared with target partitions, e.g. OWL classes with
     SKOS concepts: source ["class"], target ["class", "concept"]."""
+    model_config = ConfigDict(extra="forbid")
     source: list[str]
     target: list[str]
 
 
 class KeyAnchorParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     source: SideQueries = SideQueries()
     target: SideQueries = SideQueries()
     # also run the extended normalization levels (word order, plural, inflection)
@@ -285,29 +310,6 @@ class KeyAnchorParams(BaseModel):
         if isinstance(target, BaseModel):
             target = target.model_dump(exclude_unset=True)
         return {**data, "target": {**source, **target}}
-
-
-type AnchorStrategyParams = KeyAnchorParams  # add other param classes
-
-
-class AnchorStrategyConfig(BaseModel):
-    type: AnchorStrategyType
-    params: AnchorStrategyParams
-
-
-@dataclass
-class AnchorStats:
-    n_source: int
-    n_target: int
-    per_stratum: dict[str, int]
-    details: dict[str, int | float]
-
-
-@dataclass
-class AnchorResult:
-    config: AnchorStrategyConfig
-    stats: AnchorStats
-    anchors: list[KeyAnchor]
 
 
 def format_entity(entity: Entity) -> str:
