@@ -64,20 +64,20 @@ class AskResult:
 
 @dataclass
 class Binding:
-    typ: str
+    type: str
     value: str
     datatype: str | None = None
     lang: str | None = None
 
     def __hash__(self) -> int:
-        return hash((self.typ, self.value, self.datatype, self.lang))
+        return hash((self.type, self.value, self.datatype, self.lang))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Binding):
             return False
 
         return (
-            self.typ == other.typ
+            self.type == other.type
             and self.value == other.value
             and self.datatype == other.datatype
             and self.lang == other.lang
@@ -91,15 +91,15 @@ class Binding:
             typ = "literal"
 
         return Binding(
-            typ=typ,
+            type=typ,
             value=data["value"],
             datatype=data.get("datatype"),
             lang=data.get("xml:lang"),
         )
 
     def identifier(self) -> str:
-        assert self.typ in ["uri", "literal", "bnode"]
-        match self.typ:
+        assert self.type in ["uri", "literal", "bnode"]
+        match self.type:
             case "uri":
                 return self.value
             case "literal":
@@ -112,12 +112,12 @@ class Binding:
             case "bnode":
                 return f"_:{self.value}"
             case _:
-                raise ValueError(f"Unknown binding type: {self.typ}")
+                raise ValueError(f"Unknown binding type: {self.type}")
 
     def sparql(self) -> str:
         identifier = self.identifier()
 
-        if self.typ == "uri":
+        if self.type == "uri":
             identifier = f"<{identifier}>"
 
         return identifier

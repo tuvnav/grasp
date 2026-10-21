@@ -118,7 +118,7 @@ def get_item(
     if binding is None:
         return None
 
-    if binding.typ == "literal":
+    if binding.type == "literal":
         if binding.datatype is not None:
             info = manager.format_iri(binding.datatype)
         elif binding.lang is not None:

@@ -26,11 +26,12 @@ from grasp.tasks.entities import Entity, prepare_entity
 from grasp.utils import FunctionCallException, format_list, format_notes, format_section
 from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
 from grasp.tasks.om.model import (
-    allows_many, format_entity, PotentialCorrespondences,
+    allows_many, PotentialCorrespondences,
     Correspondence, RelationProfile,
     RELATION_PROFILES, CorrespondenceSide,
     RelationSpec, get_relation_profile
     )
+from grasp.tasks.om.render import format_entity
 
 
 class AlignmentTaskInput(BaseModel):
@@ -598,6 +599,7 @@ def get_entity_shape_text(
     return emit_pseudo_shex(profile, manager, shape_config)
 
 
+# TODO: legacy / deprecated
 class EntityContextConfig(BaseModel):
     """
     Triples around an entity shown to the LLM together with the entity, as

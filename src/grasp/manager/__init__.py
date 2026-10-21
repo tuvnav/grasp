@@ -251,10 +251,10 @@ class KgManager:
                     formatted_row.append("")
                     continue
 
-                if val.typ == "bnode":
+                if val.type == "bnode":
                     formatted_row.append(val.identifier())
 
-                elif val.typ == "literal":
+                elif val.type == "literal":
                     if clip_literals:
                         # replace to modify value
                         # without messing up original result
@@ -263,7 +263,7 @@ class KgManager:
                     formatted_row.append(self.format_literal(val.identifier()))
 
                 else:
-                    assert val.typ == "uri"
+                    assert val.type == "uri"
                     identifier = val.identifier()
                     formatted = self.format_iri(identifier)
 
@@ -753,9 +753,9 @@ class KgManager:
             type_var = result.variables[2]
             for row in result.rows():
                 assert id_var in row, "Identifier column not found in result row"
-                assert row[id_var].typ in ("uri", "literal")
-                assert row[text_var].typ == "literal"
-                assert row[type_var].typ == "literal"
+                assert row[id_var].type in ("uri", "literal")
+                assert row[text_var].type == "literal"
+                assert row[type_var].type == "literal"
 
                 identifier = row[id_var].identifier()
                 if identifier not in info:

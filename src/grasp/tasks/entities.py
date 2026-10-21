@@ -28,7 +28,7 @@ def prepare_entity(manager: KgManager, identifier: str) -> Entity:
     binding = parse_iri_or_literal(
         identifier, manager.iri_literal_parser, manager.prefixes
     )
-    if binding is None or binding.typ != "uri":
+    if binding is None or binding.type != "uri":
         raise ValueError(f"{identifier} is not a valid IRI")
 
     identifier = binding.identifier()

@@ -5,8 +5,15 @@ from urllib.parse import urlsplit
 
 from grasp.build.data import stream_json
 from grasp.manager import KgManager
-from grasp.sparql.types import Binding
-from grasp.tasks.om.model import ALL, KeyEntityRow, QueryPart, SideQueries, compose
+from grasp.sparql.types import Binding, SelectResult
+from grasp.sparql.utils import prepare_identifier_for_sparql
+from grasp.tasks.om.model import (
+    IRI, ALL, BindingType, BlankNodeTree, KeyEntityRow, QueryPart, SideQueries, SparqlTerm,
+    compose, namespace_of,
+)
+
+# IRIs per VALUES block in batch queries
+BATCH_SIZE = 200
 
 KEY_ROW_PROJECTION = ["?entity", "?key", "?role", "?partition"]
 
@@ -55,17 +62,72 @@ def retrieve_key_rows(
     return rows
 
 
-def namespace_of(iri: str) -> str:
-    """Scheme and host of an IRI (e.g. http://mouse.owl), or the part up to the
-    last # or / for IRIs without a host (e.g. URNs). Host rather than namespace,
-    because some ontologies use a path per entity."""
-    parts = urlsplit(iri)
-    if parts.netloc:
-        return f"{parts.scheme}://{parts.netloc}"
-    cut = max(iri.rfind("#"), iri.rfind("/"))
-    return iri[:cut + 1] if cut >= 0 else iri
-
-
 def namespace_counts(rows: Iterable[KeyEntityRow]) -> Counter[str]:
     """Number of distinct entities per namespace."""
     return Counter(namespace_of(e) for e in {row.entity for row in rows})
+
+
+def to_sparql_term(manager: KgManager, iri: IRI) -> SparqlTerm:
+    """IRI prepared for insertion into SPARQL text (e.g. <...>, escaped)."""
+    return SparqlTerm(prepare_identifier_for_sparql(iri, manager.iri_literal_parser))
+
+
+def retrieve_outgoing_edges(manager: KgManager, entity: IRI) -> list[tuple[Binding, Binding]]:
+    """(predicate, object) of all triples with the entity as subject."""
+    result = manager.execute_sparql(
+        f"SELECT ?p ?o WHERE {{ {to_sparql_term(manager, entity)} ?p ?o }}",
+        force_select_result=True,
+    )
+    if not isinstance(result, SelectResult):
+        return []
+    # bindings() drops unbound variables; for ?p ?o of a triple pattern both are always bound
+    return [row for row in result.bindings() if len(row) == 2]  # type: ignore[misc]
+
+
+def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
+    """Rows of a SELECT query as variable -> binding (unbound variables are missing)."""
+    result = manager.execute_sparql(sparql, force_select_result=True)
+    if not isinstance(result, SelectResult):
+        return []
+    return [dict(row) for row in result.rows()]
+
+
+def select_iris(manager: KgManager, sparql: str) -> set[IRI]:
+    """IRIs bound to ?o in the result of a SELECT query."""
+    return {
+        IRI(row["o"].value) for row in select_rows(manager, sparql)
+        if "o" in row and row["o"].type == BindingType.URI
+    }
+
+
+def values_blocks(iris: Iterable[IRI]) -> Iterable[str]:
+    """The IRIs as VALUES contents (<a> <b> ...) in blocks of BATCH_SIZE."""
+    iris = sorted(set(iris))
+    for start in range(0, len(iris), BATCH_SIZE):
+        yield " ".join(f"<{iri}>" for iri in iris[start:start + BATCH_SIZE])
+
+
+def retrieve_blank_nodes(manager: KgManager, entity: IRI, max_depth: int) -> BlankNodeTree:
+    """
+    The blank nodes below the entity with their edges, level by level: the query
+    for depth d is a chain from the entity whose every link is a blank node.
+    A property path would also walk through named entities into their blank nodes.
+    """
+    tree: BlankNodeTree = {}
+    start = to_sparql_term(manager, entity)
+    for depth in range(1, max_depth + 1):
+        chain = f"{start} ?p0 ?b0 . FILTER(isBlank(?b0)) " + " ".join(
+            f"?b{i - 1} ?p{i} ?b{i} . FILTER(isBlank(?b{i}))" for i in range(1, depth)
+        )
+        last = f"b{depth - 1}"
+        rows = select_rows(manager, f"SELECT DISTINCT ?{last} ?p ?o WHERE {{ {chain} ?{last} ?p ?o }}")
+        new_edges = False
+        for row in rows:
+            edge = (IRI(row["p"].value), row["o"])
+            edges = tree.setdefault(row[last].value, [])
+            if edge not in edges:
+                edges.append(edge)
+                new_edges = True
+        if not new_edges or not any(row["o"].type == BindingType.BNODE for row in rows):
+            break
+    return tree

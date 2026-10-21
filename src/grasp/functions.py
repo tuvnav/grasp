@@ -882,7 +882,7 @@ def call_shape_function(
         )
         expanded_iri = (
             binding.identifier()
-            if binding is not None and binding.typ == "uri"
+            if binding is not None and binding.type == "uri"
             else iri_arg
         )
         sample = (
@@ -912,7 +912,7 @@ def call_shape_function(
 
         # computing a shape builds SPARQL around the class term, so a non-IRI
         # argument would only fail later as an opaque parse error
-        if binding is None or binding.typ != "uri":
+        if binding is None or binding.type != "uri":
             return format_iri_or_literal_error(iri_arg)
 
         from grasp.build.shapes import (
@@ -1061,7 +1061,7 @@ def check_known(manager: KgManager, sparql: str, known: set[str]):
             manager.prefixes,
         )
         assert binding is not None, f"Failed to parse binding from {iri['value']}"
-        assert binding.typ == "uri", f"Expected IRI, got {binding.typ}"
+        assert binding.type == "uri", f"Expected IRI, got {binding.type}"
 
         identifier = binding.identifier()
 
@@ -1137,7 +1137,7 @@ def update_known_from_rows(
             binding.identifier()
             for row in rows
             for binding in row.values()
-            if binding.typ == "uri"
+            if binding.type == "uri"
         ),
         normalizer,
     )
@@ -1330,9 +1330,9 @@ def list_triples(
             manager.iri_literal_parser,
             manager.prefixes,
         )
-        if ver_const is not None and ver_const.typ == "bnode":
+        if ver_const is not None and ver_const.type == "bnode":
             raise FunctionCallException(format_bnode_error(const))
-        if ver_const is None or (pos != Position.OBJECT and ver_const.typ != "uri"):
+        if ver_const is None or (pos != Position.OBJECT and ver_const.type != "uri"):
             raise FunctionCallException(format_iri_or_literal_error(const, pos))
 
         bindings.append(f"BIND({ver_const.sparql()} AS ?{pos.value[0]})")
@@ -1524,9 +1524,9 @@ def search_with_constraints(
                 manager.iri_literal_parser,
                 manager.prefixes,
             )
-            if ver_const is not None and ver_const.typ == "bnode":
+            if ver_const is not None and ver_const.type == "bnode":
                 raise FunctionCallException(format_bnode_error(const))
-            if ver_const is None or (pos != Position.OBJECT and ver_const.typ != "uri"):
+            if ver_const is None or (pos != Position.OBJECT and ver_const.type != "uri"):
                 raise FunctionCallException(format_iri_or_literal_error(const, pos))
 
             pos_values[pos] = ver_const.sparql()

@@ -3,20 +3,101 @@ from enum import StrEnum
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable
+from typing import Any, Callable, NewType
+from urllib.parse import urlsplit
 from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.manager.utils import merge_prefixes
 from grasp.sparql.types import Binding
 from grasp.tasks.entities import Entity
 from grasp.utils import derive_label_from_iri
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rdflib import Literal
 import yaml
 
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
 SIDES = ("source", "target")
+
+# an IRI as such, e.g. http://human.owl#NCI_C12432
+IRI = NewType("IRI", str)
+# an IRI or literal prepared for insertion into SPARQL text, e.g. <http://human.owl#NCI_C12432>
+SparqlTerm = NewType("SparqlTerm", str)
+
+
+class BindingType(StrEnum):
+    """Values of Binding.type (SPARQL JSON results); equal to the plain strings
+    GRASP uses, so it works with GRASP's unchanged Binding objects."""
+    URI = "uri"
+    LITERAL = "literal"
+    BNODE = "bnode"
+
+
+# default predicate canon, shared by the anchor key query and the entity context
+RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+LABEL_PREDICATES = [
+    IRI("http://www.w3.org/2000/01/rdf-schema#label"),
+    IRI("http://www.w3.org/2004/02/skos/core#prefLabel"),
+]
+SYNONYM_PREDICATES = [
+    IRI("http://www.w3.org/2004/02/skos/core#altLabel"),
+    IRI("http://www.geneontology.org/formats/oboInOwl#hasExactSynonym"),
+    IRI("http://www.geneontology.org/formats/oboInOwl#hasRelatedSynonym"),
+    IRI("http://www.geneontology.org/formats/oboInOwl#hasSynonym"),
+]
+TYPE_PREDICATES = [RDF_TYPE]
+
+
+# vocabulary namespaces, shown by their prefixed name (owl:Class) instead of a label
+VOCABULARY_PREFIXES = {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
+    "http://www.w3.org/2000/01/rdf-schema#": "rdfs",
+    "http://www.w3.org/2002/07/owl#": "owl",
+    "http://www.w3.org/2004/02/skos/core#": "skos",
+    "http://www.w3.org/2001/XMLSchema#": "xsd",
+}
+VOCABULARY = tuple(VOCABULARY_PREFIXES)
+RDF_FIRST = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#first")
+RDF_REST = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest")
+OWL_ON_PROPERTY = IRI("http://www.w3.org/2002/07/owl#onProperty")
+
+# blank node -> its (predicate, object) edges
+type BlankNodeTree = dict[str, list[tuple[IRI, Binding]]]
+
+
+def local_name(iri: str) -> str:
+    """The part of an IRI after the last # or /."""
+    return re.split(r"[#/]", iri.rstrip("/#"))[-1]
+
+
+def namespace_of(iri: str) -> str:
+    """Scheme and host of an IRI (e.g. http://mouse.owl), or the part up to the
+    last # or / for IRIs without a host (e.g. URNs). Host rather than namespace,
+    because some ontologies use a path per entity."""
+    parts = urlsplit(iri)
+    if parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    cut = max(iri.rfind("#"), iri.rfind("/"))
+    return iri[:cut + 1] if cut >= 0 else iri
+
+
+def sparql_path(predicates: list[IRI]) -> str:
+    """Alternative property path over the given predicates, e.g. <a>|<b>."""
+    return "|".join(f"<{p}>" for p in predicates)
+
+
+class EntityContextConfig(BaseModel):
+    """How the context of an entity is built (entity_context.py); not to be
+    confused with the list-based EntityContextConfig of agentic_search_verify."""
+    model_config = ConfigDict(extra="forbid")
+    name_predicates: list[IRI] = Field(default_factory=lambda: list(LABEL_PREDICATES))
+    synonym_predicates: list[IRI] = Field(default_factory=lambda: list(SYNONYM_PREDICATES))
+    type_predicates: list[IRI] = Field(default_factory=lambda: list(TYPE_PREDICATES))
+    k_values: int = 5
+    max_chars_per_literal: int = 300
+    bn_resolution_max_depth: int = 6
+    max_incoming_predicates: int = 8
+    max_chars: int = 2000
 
 
 @dataclass
@@ -69,7 +150,7 @@ def compose(manager: KgManager, parts: list[str | QueryPart], projection: list[s
 # Key contract: ?entity ?key, optional ?role = "secondary" (key only blocks
 # ambiguous anchors; default primary). Labels are primary, synonyms secondary;
 # entities without a label get the local name of their IRI as primary key.
-NAME_ANCHORS_SPARQL = """PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+_NAME_ANCHORS_TEMPLATE = """PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX owl: <http://www.w3.org/2002/07/owl#>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -85,25 +166,30 @@ SELECT ?entity ?key ?role WHERE {
   }
   {
     # labels: primary keys (?role unbound)
-    ?entity rdfs:label|skos:prefLabel ?name .
+    ?entity __LABELS__ ?name .
   } UNION {
     # synonyms: secondary keys, only block ambiguous anchors
-    ?entity skos:altLabel|oboInOwl:hasExactSynonym|oboInOwl:hasRelatedSynonym|oboInOwl:hasSynonym ?name .
+    ?entity __SYNONYMS__ ?name .
     FILTER(isLiteral(?name))
     BIND("secondary" AS ?role)
   } UNION {
     # synonym as a resource with its own label
-    ?entity skos:altLabel|oboInOwl:hasExactSynonym|oboInOwl:hasRelatedSynonym|oboInOwl:hasSynonym ?synonym .
-    ?synonym rdfs:label ?name .
+    ?entity __SYNONYMS__ ?synonym .
+    ?synonym __LABELS__ ?name .
     BIND("secondary" AS ?role)
   } UNION {
     # fallback for entities without a label (?name unbound)
     BIND(true AS ?fallback)
   }
-  FILTER(!BOUND(?fallback) || NOT EXISTS { ?entity rdfs:label|skos:prefLabel ?label })
+  FILTER(!BOUND(?fallback) || NOT EXISTS { ?entity __LABELS__ ?label })
   # outside the UNION, where ?entity is bound: local name of the IRI as primary key
   BIND(COALESCE(?name, REPLACE(STR(?entity), "^.*[/#]", "")) AS ?key)
 }"""
+NAME_ANCHORS_SPARQL = (
+    _NAME_ANCHORS_TEMPLATE
+    .replace("__LABELS__", sparql_path(LABEL_PREDICATES))
+    .replace("__SYNONYMS__", sparql_path(SYNONYM_PREDICATES))
+)
 
 
 # Scope contract: ?entity. Restricts the entities of the key query; no scope
@@ -310,19 +396,6 @@ class KeyAnchorParams(BaseModel):
         if isinstance(target, BaseModel):
             target = target.model_dump(exclude_unset=True)
         return {**data, "target": {**source, **target}}
-
-
-def format_entity(entity: Entity) -> str:
-    output = f"Full IRI: {entity.identifier}"
-    if entity.entity != entity.identifier:
-        output += f", shortened IRI: {entity.entity}"
-    if entity.label is not None:
-        output += f", label: {entity.label}"
-    if entity.aliases and entity.aliases != [entity.label]:
-        output += f", aliases: {entity.aliases}"
-    if entity.infos is not None and entity.infos != []:
-        output += f", infos: {entity.infos}"
-    return output
 
 
 class RelationSpec(BaseModel):

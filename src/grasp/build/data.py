@@ -242,7 +242,7 @@ def stream_json_file(path: str) -> Iterator[dict]:
 
 
 def get_value_from_id_binding(obj_id: Binding, prefixes: dict[str, str]) -> str:
-    if obj_id.typ != "uri":
+    if obj_id.type != "uri":
         return obj_id.value
 
     obj_name = get_local_name_from_iri(obj_id.identifier(), prefixes)
@@ -260,7 +260,7 @@ def parse_binding(
     if tag_binding is not None:
         # via Binding so endpoint-specific literal types are normalized
         tags_binding = Binding.from_dict(tag_binding)
-        assert tags_binding.typ == "literal", "Expected tags to be a literal"
+        assert tags_binding.type == "literal", "Expected tags to be a literal"
         tags = tags_binding.value.lower().split(",")
     else:
         tags = []
@@ -269,7 +269,7 @@ def parse_binding(
         return id, None, tags
 
     value_binding = Binding.from_dict(binding["value"])
-    if value_binding.typ == "literal" and has_scheme(value_binding.value):
+    if value_binding.type == "literal" and has_scheme(value_binding.value):
         # may be an uri converted to literal, double check
         value_binding = parse_iri_or_literal(value_binding.value, parser)
 
@@ -336,7 +336,7 @@ def prepare_items(
         last_id_binding = id_binding
         if value_binding is None:
             continue
-        elif value_binding.typ == "uri":
+        elif value_binding.type == "uri":
             value = get_value_from_id_binding(value_binding, prefixes)
         else:
             value = value_binding.value
