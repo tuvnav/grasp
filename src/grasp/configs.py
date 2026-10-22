@@ -171,6 +171,9 @@ class GraspConfig(ModelConfig):
     # how many times the model is allowed to repeat the same response
     # (loop) before we give up; each repetition counts as one loop
     max_loops: int = 1
+    # step budget: during the last fraction of max_steps (e.g. 0.3) the model
+    # is told before each step how many steps are left; None = never
+    budget_warning_fraction: float | None = None
 
     # example parameters
     num_examples: int = 3
