@@ -4,7 +4,7 @@ from typing import Callable, Iterable
 import unicodedata
 
 from grasp.tasks.om.model import (
-    UNCATEGORIZED, GroupStats, KeyAnchor, KeyAnchorResult, KeyEntityRow, NormalizationLevelStats, PairingGroup, PartitionGroup)
+    UNCATEGORIZED, GroupStats, KeyAnchor, TryKeyAnchorResult, KeyEntityRow, NormalizationLevelStats, PairingGroup, PartitionGroup)
 from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
 import re
@@ -190,9 +190,9 @@ def resolve_pairing(
     otherwise an entity could get anchors in several groups."""
     if pairing is None:
         common = sorted((set(src_partitions) & set(tgt_partitions)) - {UNCATEGORIZED})
-        return [PartitionGroup(frozenset([p]), frozenset([p])) for p in common]
+        return [PartitionGroup(source=frozenset([p]), target=frozenset([p])) for p in common]
 
-    groups = [PartitionGroup(frozenset(g.source), frozenset(g.target)) for g in pairing]
+    groups = [PartitionGroup(source=frozenset(g.source), target=frozenset(g.target)) for g in pairing]
     for side in ("source", "target"):
         seen: set[str] = set()
         for group in groups:
@@ -301,7 +301,7 @@ def key_anchors(
     tgt_rows: Iterable[KeyEntityRow],
     extended: bool = False,
     pairing: list[PairingGroup] | None = None,
-) -> KeyAnchorResult:
+) -> TryKeyAnchorResult:
     src_parts = by_partition(src_rows)
     tgt_parts = by_partition(tgt_rows)
     groups = resolve_pairing(src_parts, tgt_parts, pairing)
@@ -324,7 +324,7 @@ def key_anchors(
 
     grouped_src = set().union(*(g.source for g in groups))
     grouped_tgt = set().union(*(g.target for g in groups))
-    return KeyAnchorResult(
+    return TryKeyAnchorResult(
         anchors=anchors,
         group_statistics=stats,
         unpaired_source=sorted(src_parts.keys() - grouped_src),

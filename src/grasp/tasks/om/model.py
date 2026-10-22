@@ -250,16 +250,6 @@ SELECT DISTINCT ?entity ?partition ?evidence WHERE {
 }"""
 
 
-# class KeyRole(StrEnum):
-#     LOCAL = "local"
-#     LABEL = "label"
-#     SYNONYM = "synonym"
-#     UNKNOWN = "unknown"
-
-#     @classmethod
-#     def _missing_(cls, value: Any) -> "KeyRole":
-#         return cls.UNKNOWN
-
 class AnchorStrategyType(StrEnum):
     KEY_ANCHORS = "key_anchors"
     NO_ANCHORS = "no_anchors"
@@ -289,10 +279,10 @@ class KeyEntityRow:
         return KeyEntityRow(entity.value, key.value, partition, primary)
 
 
-@dataclass(frozen=True)
-class PartitionGroup:
+class PartitionGroup(BaseModel):
     """Source partitions compared with target partitions in one run of the anchor
     rule; uniqueness holds within the union of the partitions of each side."""
+    model_config = ConfigDict(frozen=True)
     source: frozenset[str]
     target: frozenset[str]
 
@@ -301,9 +291,8 @@ class PartitionGroup:
         return f"{'+'.join(sorted(self.source))} <-> {'+'.join(sorted(self.target))}"
 
 
-# TODO: analog Pydantic class for communication with LLM
-@dataclass(frozen=True)
-class KeyAnchor:
+class KeyAnchor(BaseModel):
+    model_config = ConfigDict(frozen=True)
     source_iri: str
     target_iri: str
     group: PartitionGroup
@@ -341,7 +330,7 @@ class GroupStats:
 
 
 @dataclass
-class KeyAnchorResult:
+class TryKeyAnchorResult:
     anchors: list[KeyAnchor]
     group_statistics: dict[PartitionGroup, GroupStats]
     # partitions that occur in the data but in no group
@@ -396,6 +385,38 @@ class KeyAnchorParams(BaseModel):
         if isinstance(target, BaseModel):
             target = target.model_dump(exclude_unset=True)
         return {**data, "target": {**source, **target}}
+
+
+class SelectedRun(BaseModel):
+    run_id: str
+    groups: list[str]
+    params: KeyAnchorParams
+    statistics: dict[str, dict[str, int | float]]   # Group -> stats
+
+
+class AnchorRecord(KeyAnchor):
+    stratum: str
+    run_id: str
+
+
+class AnchorConflict(BaseModel):
+    source_iri: IRI
+    target_iri: IRI
+    runs: list[str]
+
+
+class AnchorStageResult(BaseModel):
+    source_kg: str
+    target_kg: str
+    entity_space: dict[str, list[str]]
+    finished: bool
+    fallback: str | None
+    rationale: str | None
+    runs_tried: int
+    selected: list[SelectedRun]
+    strata: dict[str, int]
+    anchors: list[AnchorRecord]
+    conflicts: list[AnchorConflict]
 
 
 class RelationSpec(BaseModel):

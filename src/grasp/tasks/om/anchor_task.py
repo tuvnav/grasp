@@ -11,9 +11,9 @@ from grasp.functions import find_manager
 from grasp.tasks.om.agentic_search_verify import load_task_instructions
 from grasp.tasks.om.compare import key_anchors, stratum
 from grasp.tasks.om.model import (
-    PROMPT_DIR, UNCATEGORIZED, AnchorStrategyType, 
+    IRI, PROMPT_DIR, UNCATEGORIZED, AnchorConflict, AnchorRecord, AnchorStageResult, AnchorStrategyType, 
     CandidateStrategyType, FunctionRegistry, KeyAnchor,
-    KeyAnchorParams, KeyAnchorResult, SIDES)
+    KeyAnchorParams, SelectedRun, TryKeyAnchorResult, SIDES)
 from grasp.tasks.om.retrieve import namespace_counts, retrieve_key_rows
 from grasp.utils import FunctionCallException, format_section
 from pydantic import BaseModel, ValidationError
@@ -31,7 +31,7 @@ class AnchorTaskState:
     source: KgManager
     target: KgManager
     # run id -> parameters and result of a tried strategy; "run-0" is the default
-    runs: dict[str, tuple[KeyAnchorParams, KeyAnchorResult]] = field(default_factory=dict)
+    runs: dict[str, tuple[KeyAnchorParams, TryKeyAnchorResult]] = field(default_factory=dict)
     # set by finish: [(run id, selected group labels)]
     selection: list[tuple[str, list[str]]] | None = None
     rationale: str | None = None
@@ -42,7 +42,7 @@ class AnchorTaskState:
     # set by finish: the selected anchors merged into Venn cells, and conflicts
     merged: "MergedSelection | None" = None
 
-    def add_run(self, params: KeyAnchorParams, result: KeyAnchorResult) -> str:
+    def add_run(self, params: KeyAnchorParams, result: TryKeyAnchorResult) -> str:
         run_id = f"run-{len(self.runs)}"
         self.runs[run_id] = (params, result)
         return run_id
@@ -54,7 +54,7 @@ def run_key_anchors(
         params: KeyAnchorParams,
         source_space: tuple[str, ...] | None = None,
         target_space: tuple[str, ...] | None = None,
-        ) -> KeyAnchorResult:
+        ) -> TryKeyAnchorResult:
     """Computes the key anchors; used directly by the pipeline (default run)."""
     source_rows = retrieve_key_rows(manager_source, params.source, source_space)
     target_rows = retrieve_key_rows(manager_target, params.target, target_space)
@@ -84,8 +84,8 @@ def format_entity_space(state: AnchorTaskState) -> str:
 
 
 def diff_results(
-        reference: KeyAnchorResult,
-        result: KeyAnchorResult,
+        reference: TryKeyAnchorResult,
+        result: TryKeyAnchorResult,
         ) -> tuple[list, list, list, list, list]:
     """Pairs kept, new, with a changed partner, lost with an entity no longer
     compared, and lost although both entities are still compared."""
@@ -113,7 +113,7 @@ def diff_results(
     return kept, added, changed, lost_gone, lost_present
 
 
-def format_diff(ref_id: str, reference: KeyAnchorResult, result: KeyAnchorResult, state: AnchorTaskState) -> str:
+def format_diff(ref_id: str, reference: TryKeyAnchorResult, result: TryKeyAnchorResult, state: AnchorTaskState) -> str:
     kept, added, changed, lost_gone, lost_present = diff_results(reference, result)
     lines = [
         f"Compared to {ref_id}: {len(kept)} anchors kept, {len(added)} new, {len(changed)} with "
@@ -150,7 +150,7 @@ def format_anchor(anchor: KeyAnchor, state: AnchorTaskState) -> str:
     return text
 
 
-def format_key_anchor_result(run_id: str, result: KeyAnchorResult, state: AnchorTaskState) -> str:
+def format_key_anchor_result(run_id: str, result: TryKeyAnchorResult, state: AnchorTaskState) -> str:
     """LLM view of a result: statistics per partition group and a few example
     anchors per stratum; the full anchor lists stay in the task state."""
     lines = [f"Result {run_id}:"]
@@ -360,19 +360,6 @@ def system_information(task_instructions: str | None) -> str:
     if task_instructions:
         info += "\n\n" + format_section("Task-specific instructions", task_instructions)
     return info
-
-
-# TODO: Maybe turn this class into a pydantic model
-def anchor_to_dict(anchor: KeyAnchor) -> dict:
-    return {
-        "source": anchor.source_iri,
-        "target": anchor.target_iri,
-        "group": anchor.group.label,
-        "stratum_type": stratum(anchor)[1],
-        "level": anchor.string_normalization_level,
-        "evidence": anchor.evidence,
-        "information_content": round(anchor.information_content, 3),
-    }
 
 
 SIDE_QUERIES_SCHEMA = {
@@ -622,37 +609,37 @@ class OMAnchorTask(GraspTask):
         selected = []
         for run_id, groups in state.selection or []:
             params, result = state.runs[run_id]
-            selected.append({
-                "run_id": run_id,
-                "groups": groups,
-                "params": params.model_dump(),
-                "statistics": {
+            selected.append(
+                SelectedRun(
+                    run_id=run_id,
+                    groups=groups,
+                    params=params,
+                    statistics={
                     g.label: {k: v for k, v in vars(s).items() if k != "levels"}
                     for g, s in result.group_statistics.items() if g.label in groups
-                },
-            })
+                }
+                )
+                )
         merged = state.merged or MergedSelection([], [])
         anchors = [
-            {"stratum": cell.label, "run_id": run_id, **anchor_to_dict(a)}
+            AnchorRecord(**a.model_dump(), stratum=cell.label, run_id=run_id)
             for cell in merged.cells for run_id, a in cell.anchors
         ]
-        return {
-            "source_kg": state.source.kg,
-            "target_kg": state.target.kg,
-            # for the later stages (om scope kwarg "namespaces")
-            "entity_space": {side: list(state.entity_space.get(side, ())) for side in SIDES},
-            "finished": finished,
-            # "default" if the LLM did not call finish and run-0 was used instead
-            "fallback": None if finished else "default",
-            "rationale": state.rationale,
-            "runs_tried": len(state.runs) - 1,
-            "selected": selected,
-            "strata": {cell.label: len(cell.anchors) for cell in merged.cells},
-            "anchors": anchors,
-            "conflicts": [
-                {"source": s, "target": t, "runs": runs} for (s, t), runs in merged.conflicts
-            ],
-        }
+        return AnchorStageResult(
+            source_kg=state.source.kg,
+            target_kg=state.target.kg,
+            entity_space={side: list(state.entity_space.get(side, ())) for side in SIDES},
+            finished=finished,
+            fallback=None if finished else "default",
+            rationale=state.rationale,
+            runs_tried=len(state.runs) - 1,
+            selected=selected,
+            strata={cell.label: len(cell.anchors) for cell in merged.cells},
+            anchors=anchors,
+            conflicts=[
+                AnchorConflict(source_iri=IRI(s), target_iri=IRI(t), runs=runs) for (s, t), runs in merged.conflicts
+            ]
+        ).model_dump(mode="json")
 
     def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
         fn: Callable | None = func_reg.Registry.get(fn_name)
