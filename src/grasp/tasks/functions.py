@@ -101,7 +101,7 @@ def find_frequent(
             manager.iri_literal_parser,
             manager.prefixes,
         )
-        if ver_const is None or (pos != Position.OBJECT and ver_const.type != "uri"):
+        if ver_const is None or (pos != Position.OBJECT and ver_const.typ != "uri"):
             raise FunctionCallException(format_iri_or_literal_error(const, pos))
 
         pos_values.append(ver_const.sparql())
@@ -156,7 +156,7 @@ LIMIT {MAX_RESULTS + 1}"""
         identifier = val.identifier()
         formatted = manager.format_identifier(identifier)
 
-        if val.type == "uri":
+        if val.typ == "uri":
             label = manager.get_label(
                 identifier,
                 "entities",

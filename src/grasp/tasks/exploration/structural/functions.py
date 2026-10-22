@@ -76,9 +76,9 @@ def mark_explored(
 
     manager, _ = find_manager(managers, kg)
     ver_iri = parse_iri_or_literal(iri, manager.iri_literal_parser, manager.prefixes)
-    if ver_iri is not None and ver_iri.type == "bnode":
+    if ver_iri is not None and ver_iri.typ == "bnode":
         raise FunctionCallException(format_bnode_error(iri))
-    if ver_iri is None or ver_iri.type != "uri":
+    if ver_iri is None or ver_iri.typ != "uri":
         raise FunctionCallException(format_iri_or_literal_error(iri))
 
     kg_explored = explored.setdefault(kg, [])

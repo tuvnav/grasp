@@ -118,14 +118,14 @@ def parse_into_binding(
     match parse["name"]:
         case "BLANK_NODE_LABEL":
             return Binding(
-                type="bnode",
+                typ="bnode",
                 # strip leading "_:" from blank node label
                 value=input[2:],
             )
 
         case "IRIREF":
             return Binding(
-                type="uri",
+                typ="uri",
                 value=input[1:-1],
             )
 
@@ -138,21 +138,21 @@ def parse_into_binding(
 
             # prefixed IRI
             return Binding(
-                type="uri",
+                typ="uri",
                 value=uri,
             )
 
         case lit if lit.startswith("STRING_LITERAL"):
             # string literal -> strip quotes
             return Binding(
-                type="literal",
+                typ="literal",
                 value=strip_literal(parse["value"]),
             )
 
         case lit if lit.startswith("INTEGER"):
             # integer literal
             return Binding(
-                type="literal",
+                typ="literal",
                 value=parse["value"],
                 datatype="http://www.w3.org/2001/XMLSchema#int",
             )
@@ -160,7 +160,7 @@ def parse_into_binding(
         case lit if lit.startswith("DECIMAL"):
             # decimal literal
             return Binding(
-                type="literal",
+                typ="literal",
                 value=parse["value"],
                 datatype="http://www.w3.org/2001/XMLSchema#decimal",
             )
@@ -168,7 +168,7 @@ def parse_into_binding(
         case lit if lit.startswith("DOUBLE"):
             # double literal
             return Binding(
-                type="literal",
+                typ="literal",
                 value=parse["value"],
                 datatype="http://www.w3.org/2001/XMLSchema#double",
             )
@@ -176,7 +176,7 @@ def parse_into_binding(
         case lit if lit in ("true", "false"):
             # boolean literal
             return Binding(
-                type="literal",
+                typ="literal",
                 value=parse["value"],
                 datatype="http://www.w3.org/2001/XMLSchema#boolean",
             )
@@ -187,7 +187,7 @@ def parse_into_binding(
                 lit, langtag = parse["children"]
 
                 return Binding(
-                    type="literal",
+                    typ="literal",
                     value=strip_literal(lit["value"]),
                     lang=langtag["value"][1:],
                 )
@@ -205,7 +205,7 @@ def parse_into_binding(
                     datatype = prefixes[pfx] + name
 
                 return Binding(
-                    type="literal",
+                    typ="literal",
                     value=strip_literal(lit["value"]),
                     datatype=datatype,
                 )
@@ -1207,7 +1207,7 @@ def format_literal(
     if binding is None:
         return literal
 
-    if binding.type == "literal" and binding.datatype is not None:
+    if binding.typ == "literal" and binding.datatype is not None:
         formatted_dt = format_iri(
             binding.datatype,
             parser,
@@ -1235,10 +1235,10 @@ def format_identifier(
     if binding is None:
         return identifier
 
-    if binding.type == "uri":
+    if binding.typ == "uri":
         return format_iri(identifier, parser, prefixes, base_uri, wrap)
 
-    elif binding.type == "literal":
+    elif binding.typ == "literal":
         return format_literal(identifier, parser, prefixes, base_uri)
 
     return binding.identifier()
