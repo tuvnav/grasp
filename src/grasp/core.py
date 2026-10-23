@@ -106,8 +106,22 @@ def system_instructions(
 
 @dataclass
 class StepBudget:
-    """Steps (model calls) of a generate run: max_steps in total; during the
-    last warning_fraction of them the model is told how many are left."""
+    """Step budget of a generate run.
+
+    A step is one model call. At most max_steps calls are made; messages that
+    generate injects itself (loop notices, feedback, budget messages) do not
+    use up steps, nor do the tool results, which belong to the assistant
+    message of their call.
+
+    warning_fraction: during the last ceil(warning_fraction * max_steps)
+    steps the model is told before each step how many steps are left (None:
+    never). The step with left == 1 is the final one; tasks can restrict it
+    to a set of functions that must be called (see
+    GraspTask.final_step_functions).
+
+    Example with max_steps=8, warning_fraction=0.3: steps 1-5 run as usual,
+    before steps 6, 7 and 8 the model is told that 3, 2 and 1 steps are left.
+    """
     max_steps: int
     warning_fraction: float | None = None
     used: int = 0
@@ -119,12 +133,14 @@ class StepBudget:
 
     @property
     def warn(self) -> bool:
+        """Whether the model is told the remaining steps before the next one."""
         if self.warning_fraction is None:
             return False
         return self.left <= math.ceil(self.warning_fraction * self.max_steps)
 
     @property
     def final(self) -> bool:
+        """Whether the next step is the last one."""
         return self.left == 1
 
 
@@ -294,8 +310,9 @@ def generate(
         logger.debug(format_message(msg))
 
     error: dict | None = None
-    # max_steps counts model calls; injected messages (loop, budget, feedback)
-    # do not use up steps
+    # max_steps counts model calls (see StepBudget); before, it counted the
+    # messages appended after the input, so loop and feedback messages used
+    # up steps as well
     budget = StepBudget(config.max_steps, config.budget_warning_fraction)
 
     # keep track of last serialized message to detect loops
@@ -319,7 +336,8 @@ def generate(
             }
             logger.debug(f"Step budget: {budget.left} steps left")
         if final_fns:
-            # last step: only the task's final functions, one of which must be called
+            # last step: only the task's final functions, one of which must be
+            # called; the per-call config leaves the run's config untouched
             step_fns = final_fns
             step_config = config.model_copy(update={"tool_choice": "required"})
         budget.used += 1
