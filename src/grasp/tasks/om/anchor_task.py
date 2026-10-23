@@ -8,12 +8,12 @@ from grasp.manager import KgManager
 from grasp.model.base import Message
 from grasp.tasks.base import GraspTask
 from grasp.functions import find_manager
-from grasp.tasks.om.agentic_search_verify import load_task_instructions
 from grasp.tasks.om.compare import key_anchors, stratum
 from grasp.tasks.om.model import (
-    IRI, PROMPT_DIR, UNCATEGORIZED, AnchorConflict, AnchorRecord, AnchorStageResult, AnchorStrategyType, 
-    CandidateStrategyType, FunctionRegistry, KeyAnchor,
-    KeyAnchorParams, SelectedRun, TryKeyAnchorResult, SIDES)
+    IRI, PROMPT_DIR, UNCATEGORIZED, AnchorConflict,
+    AnchorRecord, AnchorStageResult, FunctionRegistry,
+    KeyAnchor, KeyAnchorParams, SelectedRun, 
+    TryKeyAnchorResult, SIDES, load_prompt, load_task_instructions, resolve_managers)
 from grasp.tasks.om.retrieve import namespace_counts, retrieve_key_rows
 from grasp.utils import FunctionCallException, format_section
 from pydantic import BaseModel, ValidationError
@@ -349,12 +349,8 @@ def finish(state: AnchorTaskState, fn_args: dict) -> str:
     return "\n".join(lines)
 
 
-def load_prompt(name: str) -> str:
-    return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
-
-
 def system_information(task_instructions: str | None) -> str:
-    info = load_prompt("anchor_strategies.txt").replace(
+    info = load_prompt("anchor_task.txt").replace(
         "__EQUIVALENCE_CONDITION__", load_prompt("equivalence_condition.txt")
     )
     if task_instructions:
@@ -530,10 +526,11 @@ class OMAnchorTask(GraspTask):
     with source_kg and target_kg (names of the configured knowledge graphs); by
     default the first configured KG is the source, the second the target."""
     name = "om-anchors"
+    state: AnchorTaskState
 
     def setup(self, input: Any) -> str:
-        source, target = self.resolve_managers(input)
-        self.state = state = AnchorTaskState(source, target)
+        source, target = resolve_managers(self, input)
+        self.state = state = AnchorTaskState(source=source, target=target)
         params = KeyAnchorParams()
         # default run: retrieve unrestricted once, to determine the entity space
         rows = {
@@ -561,17 +558,6 @@ class OMAnchorTask(GraspTask):
             + "\n\nThe default strategy (name keys, partitions by kind) has already been run:\n\n"
             + format_key_anchor_result(run_id, result, state)
         )
-
-    def resolve_managers(self, input: Any) -> tuple[KgManager, KgManager]:
-        if isinstance(input, dict) and "source_kg" in input and "target_kg" in input:
-            source, _ = find_manager(self.managers, input["source_kg"])
-            target, _ = find_manager(self.managers, input["target_kg"])
-            return source, target
-        if len(self.managers) != 2:
-            raise ValueError(
-                "Input must name source_kg and target_kg unless exactly two KGs are configured"
-            )
-        return self.managers[0], self.managers[1]
 
     def system_information(self) -> str:
         return system_information(
@@ -615,9 +601,9 @@ class OMAnchorTask(GraspTask):
                     groups=groups,
                     params=params,
                     statistics={
-                    g.label: {k: v for k, v in vars(s).items() if k != "levels"}
-                    for g, s in result.group_statistics.items() if g.label in groups
-                }
+                        g.label: {k: v for k, v in vars(s).items() if k != "levels"}
+                        for g, s in result.group_statistics.items() if g.label in groups
+                        }
                 )
                 )
         merged = state.merged or MergedSelection([], [])

@@ -13,6 +13,7 @@ from grasp.tasks.entity_linking import EntityLinkingTask
 from grasp.tasks.general_qa import GeneralQaTask
 from grasp.tasks.notes_from_samples import NotesFromSamplesTask
 from grasp.tasks.notes_from_traces import NotesFromTracesTask
+from grasp.tasks.om.verify_task import OMVerifyTask
 from grasp.tasks.question_generation import QuestionGenerationTask
 from grasp.tasks.shapes_setup import ShapesSetupTask
 from grasp.tasks.sparql_qa import SparqlQaTask
@@ -33,6 +34,7 @@ class Task(StrEnum):
     ENTITY_LINKING = "entity-linking"
     OM = "om"
     OM_ANCHORS = "om-anchors"
+    OM_VERIFY = "om-verify"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {
@@ -52,6 +54,7 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         AutoSetupTask,
         OmTask,
         OMAnchorTask,
+        OMVerifyTask,
         ShapesSetupTask,
     ]
 }

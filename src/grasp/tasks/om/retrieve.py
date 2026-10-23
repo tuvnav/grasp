@@ -96,7 +96,7 @@ def select_iris(manager: KgManager, sparql: str) -> set[IRI]:
     """IRIs bound to ?o in the result of a SELECT query."""
     return {
         IRI(row["o"].value) for row in select_rows(manager, sparql)
-        if "o" in row and row["o"].type == BindingType.URI
+        if "o" in row and row["o"].typ == BindingType.URI
     }
 
 
@@ -128,6 +128,6 @@ def retrieve_blank_nodes(manager: KgManager, entity: IRI, max_depth: int) -> Bla
             if edge not in edges:
                 edges.append(edge)
                 new_edges = True
-        if not new_edges or not any(row["o"].type == BindingType.BNODE for row in rows):
+        if not new_edges or not any(row["o"].typ == BindingType.BNODE for row in rows):
             break
     return tree

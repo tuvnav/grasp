@@ -50,9 +50,9 @@ def render_blank_node(
         by_pred.setdefault(pred, []).append(obj)
 
     def render(obj: Binding) -> str:
-        if obj.type == BindingType.BNODE:
+        if obj.typ == BindingType.BNODE:
             return render_blank_node(obj.value, tree, labels, seen)
-        if obj.type == BindingType.URI:
+        if obj.typ == BindingType.URI:
             return display_iri(obj.value, labels)
         return f'"{obj.value}"'
 
@@ -68,7 +68,7 @@ def render_blank_node(
                 break
             items.append(render(first))
             rest = current_edges.get(RDF_REST)
-            current = rest.value if rest is not None and rest.type == BindingType.BNODE else None
+            current = rest.value if rest is not None and rest.typ == BindingType.BNODE else None
         return "[" + ", ".join(items) + "]"
     if OWL_ON_PROPERTY in by_pred:
         prop = render(by_pred[OWL_ON_PROPERTY][0])

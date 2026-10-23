@@ -6,11 +6,14 @@ import re
 from typing import Any, Callable, NewType
 from urllib.parse import urlsplit
 from grasp.configs import GraspConfig
+from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.manager.utils import merge_prefixes
-from grasp.sparql.types import Binding
+from grasp.sparql.types import AskResult, Binding
+from grasp.sparql.utils import prepare_identifier_for_sparql
+from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import Entity
-from grasp.utils import derive_label_from_iri
+from grasp.utils import FunctionCallException, derive_label_from_iri
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rdflib import Literal
 import yaml
@@ -23,6 +26,24 @@ SIDES = ("source", "target")
 IRI = NewType("IRI", str)
 # an IRI or literal prepared for insertion into SPARQL text, e.g. <http://human.owl#NCI_C12432>
 SparqlTerm = NewType("SparqlTerm", str)
+
+
+def load_prompt(name: str) -> str:
+    return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
+
+
+def load_task_instructions(om_kwargs: dict) -> str | None:
+    """
+    Free-text instructions specific to the alignment task at hand (e.g. domain
+    knowledge needed to decide on the relations), given inline or as the path
+    to a .md/.txt file in the `task_instructions` om task kwargs.
+    """
+    spec = om_kwargs.get("task_instructions")
+    if not spec:
+        return None
+    if "\n" not in spec and Path(spec).suffix in (".md", ".txt"):
+        spec = Path(spec).expanduser().read_text(encoding="utf-8")
+    return spec.strip() or None
 
 
 class BindingType(StrEnum):
@@ -293,8 +314,8 @@ class PartitionGroup(BaseModel):
 
 class KeyAnchor(BaseModel):
     model_config = ConfigDict(frozen=True)
-    source_iri: str
-    target_iri: str
+    source_iri: IRI
+    target_iri: IRI
     group: PartitionGroup
     string_normalization_level: str  # finest normalization level on which the pair is unique
     evidence: str  # shared normalized key on that level
@@ -417,6 +438,96 @@ class AnchorStageResult(BaseModel):
     strata: dict[str, int]
     anchors: list[AnchorRecord]
     conflicts: list[AnchorConflict]
+
+
+class VerdictOption(StrEnum):
+    ACCEPT = "accept"
+    REJECT = "reject"
+    UNSURE = "unsure"
+
+
+class Verdict(AnchorRecord):
+    verdict: VerdictOption
+    rationale: str
+
+
+class VerifyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_kg: str
+    target_kg: str
+    anchor: AnchorRecord
+
+
+class JudgeMode(StrEnum):
+    ONE_SHOT = "one_shot"  # A1: no KG functions, decision from the given context
+    AGENTIC = "agentic"  # A2: KG functions within a small step budget
+    ESCALATING = "escalating"  # A3: one-shot, agentic only if not accepted
+
+
+class JudgeVariant(BaseModel):
+    """How an anchor is judged (A1-A3, each optionally with competitors = A4)."""
+    model_config = ConfigDict(extra="forbid")
+    mode: JudgeMode = JudgeMode.ONE_SHOT
+    competitors: bool = False
+    # step budget of the agentic mode
+    max_steps: int = 8
+
+    @property
+    def name(self) -> str:
+        return self.mode.value + ("+competitors" if self.competitors else "")
+
+
+class Judgment(Verdict):
+    """A verdict with how it came about, one per judged anchor."""
+    variant: str
+    model: str
+    steps: int  # LLM responses, summed over an escalation
+    elapsed: float  # seconds, summed over an escalation
+    error: str | None = None  # the run failed; the verdict is then unsure
+    # escalating mode: verdict of the one-shot run if the agentic run followed
+    first_verdict: VerdictOption | None = None
+
+
+class CertificationParams(BaseModel):
+    """Two-point sampling plan per stratum (hypergeometric): the smallest c, and
+    for it the smallest n, with P(<= c rejects | p_max) <= alpha and
+    P(<= c rejects | p_good) >= 1 - beta. Provisional values, to be revisited."""
+    model_config = ConfigDict(extra="forbid")
+    p_good: float = 0.01
+    p_max: float = 0.05
+    alpha: float = 0.05
+    beta: float = 0.10
+    # how unsure verdicts count: as rejects (conservative) or not at all (the
+    # judged anchor is then replaced by the next one of the sample order)
+    unsure_as_reject: bool = True
+    seed: int = 0
+
+
+class StratumDecisionType(StrEnum):
+    ACCEPTED = "accepted"  # sample passed: all anchors of the stratum are certified
+    REJECTED = "rejected"  # more than c rejects: only accepted judged anchors are kept
+    INSPECTED = "inspected"  # no plan with n < N: every anchor judged individually
+
+
+class StratumDecision(BaseModel):
+    stratum: str
+    size: int
+    plan: tuple[int, int] | None  # (n, c); None for complete inspection
+    decision: StratumDecisionType
+    judged: int
+    rejects: int  # including unsure verdicts if they count as rejects
+    unsure: int
+
+
+class CertificationResult(BaseModel):
+    source_kg: str
+    target_kg: str
+    variant: str
+    params: CertificationParams
+    strata: list[StratumDecision]
+    judgments: list[Judgment]
+    # anchors certified: those of accepted strata and those accepted individually
+    certified: list[AnchorRecord]
 
 
 class RelationSpec(BaseModel):
@@ -616,3 +727,50 @@ class Correspondence(BaseModel):
 class PotentialCorrespondences(BaseModel):
     source_entity: Entity
     candidates: list[Entity]
+
+
+def entity_exists_in_kg(manager: KgManager, iri: str) -> bool:
+    # subject and object position cover classes/instances; predicate position
+    # is needed too since a property may appear only there (e.g. used in
+    # triples without a separate rdf:type owl:ObjectProperty/DatatypeProperty
+    # declaration triple of its own)
+    wrapped = prepare_identifier_for_sparql(iri, manager.iri_literal_parser)
+    sparql = (
+        f"ASK {{ {{ {wrapped} ?p ?o }} UNION {{ ?s ?p {wrapped} }} "
+        f"UNION {{ ?s {wrapped} ?o }} }}"
+    )
+    result = manager.execute_sparql(sparql)
+    assert isinstance(result, AskResult)
+    return result.boolean
+
+
+def ensure_known(manager: KgManager, iri: str, known: set[str]) -> None:
+    """
+    Fast path: skip the SPARQL round-trip if the IRI was already surfaced by
+    an earlier function call result during this conversation. Otherwise fall
+    back to an actual live existence check against the KG, and only report
+    the IRI as invalid to the LLM once that check has genuinely failed.
+    """
+    if iri in known:
+        return
+
+    if entity_exists_in_kg(manager, iri):
+        known.add(iri)
+        return
+
+    raise FunctionCallException(
+        f"The entity {iri} does not seem to exist in the knowledge graph. "
+        "Double check the IRI."
+    )
+
+
+def resolve_managers(task: GraspTask, input: Any) -> tuple[KgManager, KgManager]:
+    if isinstance(input, dict) and "source_kg" in input and "target_kg" in input:
+        source, _ = find_manager(task.managers, input["source_kg"])
+        target, _ = find_manager(task.managers, input["target_kg"])
+        return source, target
+    if len(task.managers) != 2:
+        raise ValueError(
+            "Input must name source_kg and target_kg unless exactly two KGs are configured"
+        )
+    return task.managers[0], task.managers[1]

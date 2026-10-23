@@ -29,7 +29,7 @@ from grasp.tasks.om.model import (
     allows_many, PotentialCorrespondences,
     Correspondence, RelationProfile,
     RELATION_PROFILES, CorrespondenceSide,
-    RelationSpec, get_relation_profile
+    RelationSpec, ensure_known, get_relation_profile, load_task_instructions
     )
 from grasp.tasks.om.render import format_entity
 
@@ -299,20 +299,6 @@ def functions(managers: list[KgManager], profile: RelationProfile) -> list[dict]
     return fns
 
 
-def load_task_instructions(om_kwargs: dict) -> str | None:
-    """
-    Free-text instructions specific to the alignment task at hand (e.g. domain
-    knowledge needed to decide on the relations), given inline or as the path
-    to a .md/.txt file in the `task_instructions` om task kwargs.
-    """
-    spec = om_kwargs.get("task_instructions")
-    if not spec:
-        return None
-    if "\n" not in spec and Path(spec).suffix in (".md", ".txt"):
-        spec = Path(spec).expanduser().read_text(encoding="utf-8")
-    return spec.strip() or None
-
-
 def system_information(
     profile: RelationProfile,
     task_instructions: str | None = None,
@@ -461,41 +447,6 @@ def rules(
     if scope_description:
         rules.append(f"Scope: {scope_description}")
     return rules
-
-
-def entity_exists_in_kg(manager: KgManager, iri: str) -> bool:
-    # subject and object position cover classes/instances; predicate position
-    # is needed too since a property may appear only there (e.g. used in
-    # triples without a separate rdf:type owl:ObjectProperty/DatatypeProperty
-    # declaration triple of its own)
-    wrapped = prepare_identifier_for_sparql(iri, manager.iri_literal_parser)
-    sparql = (
-        f"ASK {{ {{ {wrapped} ?p ?o }} UNION {{ ?s ?p {wrapped} }} "
-        f"UNION {{ ?s {wrapped} ?o }} }}"
-    )
-    result = manager.execute_sparql(sparql)
-    assert isinstance(result, AskResult)
-    return result.boolean
-
-
-def ensure_known(manager: KgManager, iri: str, known: set[str]) -> None:
-    """
-    Fast path: skip the SPARQL round-trip if the IRI was already surfaced by
-    an earlier function call result during this conversation. Otherwise fall
-    back to an actual live existence check against the KG, and only report
-    the IRI as invalid to the LLM once that check has genuinely failed.
-    """
-    if iri in known:
-        return
-
-    if entity_exists_in_kg(manager, iri):
-        known.add(iri)
-        return
-
-    raise FunctionCallException(
-        f"The entity {iri} does not seem to exist in the knowledge graph. "
-        "Double check the IRI."
-    )
 
 
 def scope_sparql(scope: dict, side: CorrespondenceSide) -> str | None:

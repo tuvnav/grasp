@@ -117,11 +117,11 @@ def categorize_outgoing_edge(
     elif predicate in cfg.type_predicates:
         edge_type = EdgeType.TYPE
     # 4-7: by object
-    elif obj.type == BindingType.URI and IRI(obj.value) in helper_nodes:
+    elif obj.typ == BindingType.URI and IRI(obj.value) in helper_nodes:
         edge_type = EdgeType.ANNOTATION
-    elif obj.type == BindingType.LITERAL:
+    elif obj.typ == BindingType.LITERAL:
         edge_type = EdgeType.ANNOTATION
-    elif obj.type == BindingType.BNODE:
+    elif obj.typ == BindingType.BNODE:
         edge_type = EdgeType.CLASS_EXPRESSION
     else:
         edge_type = EdgeType.OTHER_RELATION
@@ -140,7 +140,7 @@ def categorize_outgoing_edges(
     sorted_by_predicate = {*cfg.name_predicates, *cfg.synonym_predicates, *cfg.type_predicates}
     candidates = {
         IRI(obj.value) for pred, obj in edges
-        if obj.type == BindingType.URI and pred.value not in sorted_by_predicate
+        if obj.typ == BindingType.URI and pred.value not in sorted_by_predicate
     }
     helper_nodes = find_helper_nodes(manager, candidates, cfg)
     return [categorize_outgoing_edge(edge, cfg, helper_nodes) for edge in edges]
@@ -156,7 +156,7 @@ def order_by_rarity(manager: KgManager, edges: list[Edge], cfg: EntityContextCon
     """
     by_pred: dict[IRI, list[Edge]] = {}
     for edge in edges:
-        if edge.type == EdgeType.OTHER_RELATION and edge.obj.type == BindingType.URI:
+        if edge.type == EdgeType.OTHER_RELATION and edge.obj.typ == BindingType.URI:
             by_pred.setdefault(edge.predicate, []).append(edge)
     rank: dict[tuple[IRI, str], int] = {}
     for pred, pred_edges in by_pred.items():
@@ -248,11 +248,11 @@ def retrieve_labels(manager: KgManager, iris: Iterable[IRI], cfg: EntityContextC
 
 def shown_iris(ctx: EntityContext) -> set[IRI]:
     """All IRIs whose label may be shown."""
-    iris = {IRI(e.obj.value) for e in ctx.outgoing_edges if e.obj.type == BindingType.URI}
+    iris = {IRI(e.obj.value) for e in ctx.outgoing_edges if e.obj.typ == BindingType.URI}
     for edges in ctx.blank_nodes.values():
         for pred, obj in edges:
             iris.add(pred)
-            if obj.type == BindingType.URI:
+            if obj.typ == BindingType.URI:
                 iris.add(IRI(obj.value))
     for summary in ctx.incoming_edges:
         iris.update(summary.sample)
@@ -260,7 +260,7 @@ def shown_iris(ctx: EntityContext) -> set[IRI]:
         usage = ctx.used_as_predicate
         iris.update(t for t, _ in usage.subject_types + usage.object_types)
         for s, o in usage.examples:
-            iris.update(IRI(b.value) for b in (s, o) if b.type == BindingType.URI)
+            iris.update(IRI(b.value) for b in (s, o) if b.typ == BindingType.URI)
     return iris
 
 
@@ -284,7 +284,7 @@ def build_entity_context(manager: KgManager, entity: IRI, cfg: EntityContextConf
 
 def value_text(obj: Binding, ctx: EntityContext, cfg: EntityContextConfig) -> str:
     """Text of a name or annotation value: a literal, or the label of a helper node."""
-    if obj.type == BindingType.URI:
+    if obj.typ == BindingType.URI:
         return ctx.labels.get(IRI(obj.value)) or display_iri(obj.value, ctx.labels)
     text = clip(obj.value, cfg.max_chars_per_literal)
     return f"{text}@{obj.lang}" if obj.lang else text
@@ -383,9 +383,9 @@ def render_entity_context(
             return ", ".join(f"{display_iri(t, ctx.labels)} {n}" for t, n in types) or "untyped"
 
         def example(b: Binding) -> str:
-            if b.type == BindingType.URI:
+            if b.typ == BindingType.URI:
                 return display_iri(b.value, ctx.labels)
-            return "_" if b.type == BindingType.BNODE else f'"{clip(b.value, cfg.max_chars_per_literal)[:60]}"'
+            return "_" if b.typ == BindingType.BNODE else f'"{clip(b.value, cfg.max_chars_per_literal)[:60]}"'
 
         examples = "; ".join(f"{example(s)} -> {example(o)}" for s, o in usage.examples)
         lines.append(
