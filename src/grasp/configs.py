@@ -127,7 +127,6 @@ class JudgeConfig(ModelConfig):
 class GraspConfig(ModelConfig):
     # function set, notes, and knowledge graphs
     fn_set: Literal[
-        "none",
         "base",
         "search",
         "search_extended",

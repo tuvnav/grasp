@@ -54,7 +54,6 @@ def kg_functions(
     search_max_pages: int,
 ) -> list[dict]:
     assert fn_set in [
-        "none",
         "base",
         "search",
         "search_extended",
@@ -78,9 +77,6 @@ def kg_functions(
         f"Unknown modality in {known_modalities}"
     )
     index_names = sorted(known_indices)
-
-    if fn_set == "none":
-        return []
 
     fns = [
         {

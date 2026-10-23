@@ -9,8 +9,9 @@ GRASP is used as a library: the managers are loaded once by the caller, and
 every judgment is a fresh conversation (independent verdicts). The agentic
 mode runs through grasp.core.generate (the GRASP loop with KG functions); the
 one-shot mode is a single model call outside of it, since it uses neither the
-loop nor the KG functions, and its prompt is only what the om-verify task
-itself provides (no GRASP instructions about indices, notes or rules).
+loop nor the KG functions: its prompt is what the om-verify task provides plus
+a short description and the structural notes of the two KGs (no GRASP
+instructions about indices, endpoints, prefixes or rules).
 """
 import math
 import random
@@ -24,8 +25,10 @@ from universal_ml_utils.ops import consume_generator
 from grasp.configs import GraspConfig
 from grasp.core import generate
 from grasp.manager import KgManager
+from grasp.functions import find_manager
 from grasp.model import Message, get_model
 from grasp.tasks import get_task
+from grasp.utils import format_enumerate, format_section
 from grasp.tasks.om.model import (
     AnchorRecord, AnchorStageResult, CertificationParams, CertificationResult, JudgeMode,
     JudgeVariant, Judgment, StratumDecision, StratumDecisionType, Verdict, VerdictOption,
@@ -94,19 +97,42 @@ def variant_config(base: GraspConfig, variant: JudgeVariant, mode: JudgeMode) ->
 type RunResult = tuple[Verdict | None, int, float, str | None]
 
 
+def format_judged_kgs(
+        verify_input: VerifyInput,
+        managers: list[KgManager],
+        kg_notes: dict[str, list[str]] | None,
+        ) -> str:
+    """Source and target KG for the one-shot prompt: name, description and the
+    KG's notes (structural notes), without endpoint, indices or prefixes."""
+    parts = []
+    for role, kg in (("source", verify_input.source_kg), ("target", verify_input.target_kg)):
+        manager, _ = find_manager(managers, kg)
+        part = f"### {kg} ({role})"
+        if manager.description:
+            part += f"\n{manager.description}"
+        notes = (kg_notes or {}).get(kg)
+        if notes:
+            part += "\n\n**Notes**\n" + format_enumerate(notes)
+        parts.append(part)
+    return format_section("Knowledge graphs", "\n\n".join(parts))
+
+
 def run_one_shot(
         verify_input: VerifyInput,
         config: GraspConfig,
         managers: list[KgManager],
+        kg_notes: dict[str, list[str]] | None = None,
         on_trace: Callable[[list[dict]], None] | None = None,
         ) -> RunResult:
     """One-shot om-verify run without the GRASP loop: the task's system
-    information and input, its verdict functions, one model call; the called
-    verdict function is executed like in generate."""
+    information, the two KGs with their structural notes, the task's input, its
+    verdict functions, one model call; the called verdict function is executed
+    like in generate."""
     start = time.monotonic()
     task = get_task(VERIFY_TASK, managers, config)
+    system = task.system_information() + "\n\n" + format_judged_kgs(verify_input, managers, kg_notes)
     messages = [
-        Message.system(task.system_information()),
+        Message.system(system),
         Message.user(task.setup(verify_input.model_dump(mode="json"))),
     ]
     error = None
@@ -178,7 +204,7 @@ def judge(
     def run(mode: JudgeMode) -> RunResult:
         config = variant_config(base_config, variant, mode)
         if mode == JudgeMode.ONE_SHOT:
-            return run_one_shot(verify_input, config, managers, trace_of(mode))
+            return run_one_shot(verify_input, config, managers, kg_notes, trace_of(mode))
         return run_agentic(verify_input, config, managers, kg_notes, notes, trace_of(mode))
 
     first_mode = JudgeMode.AGENTIC if variant.mode == JudgeMode.AGENTIC else JudgeMode.ONE_SHOT
