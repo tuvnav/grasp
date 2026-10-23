@@ -6,10 +6,16 @@ om-verify task, which judges a single anchor per run.
 - certify: all strata of an anchor stage result
 
 GRASP is used as a library: the managers are loaded once by the caller, and
-every judgment is a fresh conversation (independent verdicts).
+every judgment is a fresh conversation (independent verdicts). The agentic
+mode runs through grasp.core.generate (the GRASP loop with KG functions); the
+one-shot mode is a single model call outside of it, since it uses neither the
+loop nor the KG functions, and its prompt is only what the om-verify task
+itself provides (no GRASP instructions about indices, notes or rules).
 """
 import math
 import random
+import time
+import traceback
 from typing import Callable, Iterator
 
 from scipy.stats import hypergeom
@@ -18,6 +24,8 @@ from universal_ml_utils.ops import consume_generator
 from grasp.configs import GraspConfig
 from grasp.core import generate
 from grasp.manager import KgManager
+from grasp.model import Message, get_model
+from grasp.tasks import get_task
 from grasp.tasks.om.model import (
     AnchorRecord, AnchorStageResult, CertificationParams, CertificationResult, JudgeMode,
     JudgeVariant, Judgment, StratumDecision, StratumDecisionType, Verdict, VerdictOption,
@@ -72,8 +80,8 @@ def variant_config(base: GraspConfig, variant: JudgeVariant, mode: JudgeMode) ->
     }
     update: dict = {"task_kwargs": {**base.task_kwargs, OM_KWARGS: om_kwargs}}
     if mode == JudgeMode.ONE_SHOT:
-        # no KG functions, and the verdict function must be called
-        update |= {"fn_set": "none", "tool_choice": "required", "max_steps": 2}
+        # a single model call (run_one_shot) that must call a verdict function
+        update |= {"tool_choice": "required"}
     else:
         update |= {"max_steps": variant.max_steps}
         if base.budget_warning_fraction is None:
@@ -82,15 +90,61 @@ def variant_config(base: GraspConfig, variant: JudgeVariant, mode: JudgeMode) ->
     return base.model_copy(update=update, deep=True)
 
 
-def run_verify(
+# result of one om-verify run: (verdict or None, LLM responses, seconds, error)
+type RunResult = tuple[Verdict | None, int, float, str | None]
+
+
+def run_one_shot(
+        verify_input: VerifyInput,
+        config: GraspConfig,
+        managers: list[KgManager],
+        on_trace: Callable[[list[dict]], None] | None = None,
+        ) -> RunResult:
+    """One-shot om-verify run without the GRASP loop: the task's system
+    information and input, its verdict functions, one model call; the called
+    verdict function is executed like in generate."""
+    start = time.monotonic()
+    task = get_task(VERIFY_TASK, managers, config)
+    messages = [
+        Message.system(task.system_information()),
+        Message.user(task.setup(verify_input.model_dump(mode="json"))),
+    ]
+    error = None
+    try:
+        response = get_model(config)(messages, task.function_definitions())
+    except Exception as e:
+        response = None
+        error = f"Failed to generate response:\n{e}\n\n{traceback.format_exc()}"
+    if response is not None:
+        messages.append(Message.assistant(response))
+        if not response.tool_calls:
+            error = "no verdict function called"
+        for tool_call in response.tool_calls:
+            try:
+                tool_call.result = task.call_function(tool_call.name, tool_call.args, task.known, None)
+            except Exception as e:
+                tool_call.error = str(e)
+                tool_call.result = f"Call to function {tool_call.name} returned an error:\n{e}"
+                error = tool_call.result
+    if on_trace is not None:
+        on_trace([message.model_dump() for message in messages])
+
+    elapsed = time.monotonic() - start
+    output = task.output(messages)
+    if output is None:
+        return None, 1, elapsed, error or "no verdict submitted"
+    return Verdict.model_validate(output), 1, elapsed, None
+
+
+def run_agentic(
         verify_input: VerifyInput,
         config: GraspConfig,
         managers: list[KgManager],
         kg_notes: dict[str, list[str]] | None = None,
         notes: list[str] | None = None,
         on_trace: Callable[[list[dict]], None] | None = None,
-        ) -> tuple[Verdict | None, int, float, str | None]:
-    """One om-verify run: (verdict or None, LLM responses, seconds, error)."""
+        ) -> RunResult:
+    """Agentic om-verify run in the GRASP loop (generate)."""
     result = consume_generator(generate(
         VERIFY_TASK, verify_input.model_dump(mode="json"), config, managers, kg_notes, notes,
     ))
@@ -121,18 +175,18 @@ def judge(
             return None
         return lambda messages: on_trace(verify_input, mode, messages)
 
+    def run(mode: JudgeMode) -> RunResult:
+        config = variant_config(base_config, variant, mode)
+        if mode == JudgeMode.ONE_SHOT:
+            return run_one_shot(verify_input, config, managers, trace_of(mode))
+        return run_agentic(verify_input, config, managers, kg_notes, notes, trace_of(mode))
+
     first_mode = JudgeMode.AGENTIC if variant.mode == JudgeMode.AGENTIC else JudgeMode.ONE_SHOT
-    verdict, steps, elapsed, error = run_verify(
-        verify_input, variant_config(base_config, variant, first_mode), managers, kg_notes, notes,
-        trace_of(first_mode),
-    )
+    verdict, steps, elapsed, error = run(first_mode)
     first_verdict = None
     if variant.mode == JudgeMode.ESCALATING and (verdict is None or verdict.verdict != VerdictOption.ACCEPT):
         first_verdict = verdict.verdict if verdict else VerdictOption.UNSURE
-        verdict, more_steps, more_elapsed, error = run_verify(
-            verify_input, variant_config(base_config, variant, JudgeMode.AGENTIC), managers, kg_notes, notes,
-            trace_of(JudgeMode.AGENTIC),
-        )
+        verdict, more_steps, more_elapsed, error = run(JudgeMode.AGENTIC)
         steps += more_steps
         elapsed += more_elapsed
 
