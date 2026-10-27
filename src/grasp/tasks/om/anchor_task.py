@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable
+from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model.base import Message
 from grasp.tasks.base import GraspTask
@@ -13,8 +14,8 @@ from grasp.tasks.om.model import (
     IRI, PROMPT_DIR, UNCATEGORIZED, AnchorConflict,
     AnchorRecord, AnchorStageResult, FunctionRegistry,
     KeyAnchor, KeyAnchorParams, SelectedRun, 
-    TryKeyAnchorResult, SIDES, load_prompt, load_task_instructions, resolve_managers)
-from grasp.tasks.om.retrieve import namespace_counts, retrieve_key_rows
+    TryKeyAnchorResult, SIDES, add_equivalence_condition, configured_namespaces, load_prompt, load_task_instructions, resolve_managers)
+from grasp.tasks.om.retrieve import determine_entity_space, namespace_counts, retrieve_key_rows
 from grasp.utils import FunctionCallException, format_section
 from pydantic import BaseModel, ValidationError
 
@@ -38,7 +39,7 @@ class AnchorTaskState:
     # per side: IRI prefixes of the entities to align; all runs are restricted to them
     entity_space: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # per side: entities per namespace in the default run, before the restriction
-    namespaces: dict[str, Counter[str]] = field(default_factory=dict)
+    namespace_count: dict[str, Counter[str]] = field(default_factory=dict)
     # set by finish: the selected anchors merged into Venn cells, and conflicts
     merged: "MergedSelection | None" = None
 
@@ -61,15 +62,6 @@ def run_key_anchors(
     return key_anchors(source_rows, target_rows, params.extended, params.pairing)
 
 
-def determine_entity_space(counts: Counter[str], configured: list[str] | None) -> tuple[str, ...]:
-    """Configured IRI prefixes, otherwise the namespace with the most entities."""
-    if configured:
-        return tuple(configured)
-    if not counts:
-        return ()
-    return (counts.most_common(1)[0][0],)
-
-
 def format_entity_space(state: AnchorTaskState) -> str:
     lines = ["Entity space (only these entities are aligned, in all strategies):"]
     for side in SIDES:
@@ -77,7 +69,7 @@ def format_entity_space(state: AnchorTaskState) -> str:
         space = state.entity_space[side]
         counts = ", ".join(
             f"{ns}: {n}" + (" (included)" if ns.startswith(space) or any(p.startswith(ns) for p in space) else " (excluded)")
-            for ns, n in state.namespaces[side].most_common()
+            for ns, n in state.namespace_count[side].most_common()
         )
         lines.append(f"  {side} {manager.kg}: {', '.join(space)}; entities per namespace: {counts}")
     return "\n".join(lines)
@@ -349,10 +341,10 @@ def finish(state: AnchorTaskState, fn_args: dict) -> str:
     return "\n".join(lines)
 
 
-def system_information(task_instructions: str | None) -> str:
-    info = load_prompt("anchor_task.txt").replace(
-        "__EQUIVALENCE_CONDITION__", load_prompt("equivalence_condition.txt")
-    )
+def system_information(config: GraspConfig) -> str:
+    info = load_prompt("anchor_task.txt")
+    info = add_equivalence_condition(info, config)
+    task_instructions = load_task_instructions(config.task_kwargs.get("om", {}))
     if task_instructions:
         info += "\n\n" + format_section("Task-specific instructions", task_instructions)
     return info
@@ -537,14 +529,14 @@ class OMAnchorTask(GraspTask):
             "source": list(retrieve_key_rows(source, params.source)),
             "target": list(retrieve_key_rows(target, params.target)),
         }
-        configured = self.config.task_kwargs.get("om", {}).get("scope", {}).get("namespaces", {})
         for side in SIDES:
             # helper nodes the partition query does not cover would distort the counts
-            state.namespaces[side] = namespace_counts(
+            state.namespace_count[side] = namespace_counts(
                 r for r in rows[side] if r.partition != UNCATEGORIZED
             )
             state.entity_space[side] = determine_entity_space(
-                state.namespaces[side], configured.get(side)
+                state.namespace_count[side],
+                configured_namespaces(self.config, getattr(state, side).kg, side),
             )
             rows[side] = [r for r in rows[side] if r.entity.startswith(state.entity_space[side])]
         result = key_anchors(rows["source"], rows["target"], params.extended, params.pairing)
@@ -561,7 +553,7 @@ class OMAnchorTask(GraspTask):
 
     def system_information(self) -> str:
         return system_information(
-            load_task_instructions(self.config.task_kwargs.get("om", {}))
+            self.config
         )
 
     def rules(self) -> list[str]:

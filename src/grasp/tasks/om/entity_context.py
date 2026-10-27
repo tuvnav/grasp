@@ -9,7 +9,7 @@ from grasp.tasks.om.model import (
 )
 from grasp.tasks.om.render import clip, display_iri, render_blank_node
 from grasp.tasks.om.retrieve import (
-    retrieve_blank_nodes, retrieve_outgoing_edges, select_iris, select_rows, to_sparql_term,
+    retrieve_blank_nodes, retrieve_outgoing_edges, select_object_iris, select_rows, to_sparql_term,
     values_blocks,
 )
 
@@ -84,12 +84,12 @@ def find_helper_nodes(
     named: set[IRI] = set()
     with_other_edges: set[IRI] = set()
     for values in values_blocks(iris):
-        named |= select_iris(
+        named |= select_object_iris(
             manager,
             f"SELECT DISTINCT ?o WHERE {{ VALUES ?o {{ {values} }} "
             f"?o {sparql_path(cfg.name_predicates)} ?name }}",
         )
-        with_other_edges |= select_iris(
+        with_other_edges |= select_object_iris(
             manager,
             f"SELECT DISTINCT ?o WHERE {{ VALUES ?o {{ {values} }} "
             f"?o ?p ?x FILTER(?p NOT IN ({not_plain})) }}",

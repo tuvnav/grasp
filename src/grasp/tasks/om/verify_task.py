@@ -10,9 +10,9 @@ from grasp.tasks.base import GraspTask
 from grasp.tasks.om.entity_context import entity_context
 from grasp.tasks.om.model import (
     IRI, AnchorRecord, EntityContextConfig, Verdict, VerdictOption, VerifyInput,
-    load_prompt, load_task_instructions, local_name, namespace_of, FunctionRegistry, resolve_managers
+    add_equivalence_condition, get_om_task_config, load_task_instructions, local_name, namespace_of, FunctionRegistry, resolve_managers
 )
-from grasp.utils import FunctionCallException
+from grasp.utils import FunctionCallException, format_section
 
 
 @dataclass
@@ -377,12 +377,8 @@ def retrieve_competitors(
     ][:k]
 
 
-def get_om_task_config(config: GraspConfig) -> dict[str, Any]:
-    return config.task_kwargs.get("om", {})
-
-
 def get_verify_task_config(config: GraspConfig) -> dict[str, Any]:
-    return config.task_kwargs.get("om", {}).get("om_verify", {})
+    return get_om_task_config(config).get("om_verify", {})
 
 
 class OMVerifyTask(GraspTask):
@@ -403,11 +399,11 @@ class OMVerifyTask(GraspTask):
             system_prompt_completion(competitors, agentic, self.config)
             )
 
-        prompt += "\n\n" + load_prompt("equivalence_condition.txt")
+        prompt = add_equivalence_condition(prompt, self.config)
 
         task_instructions = load_task_instructions(get_om_task_config(self.config))
         if task_instructions:
-            prompt += "\n\n" + task_instructions
+            prompt += "\n\n" + format_section("Task-specific instructions", task_instructions)
 
         return prompt
 

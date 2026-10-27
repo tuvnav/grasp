@@ -21,6 +21,7 @@ from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
 from grasp.tasks.om.agentic_search_verify import OmTask
 from grasp.tasks.om.anchor_task import OMAnchorTask
+from grasp.tasks.om.profile_task import OMProfileTask
 
 
 # official tasks supported by GRASP, excluding exploration
@@ -35,6 +36,7 @@ class Task(StrEnum):
     OM = "om"
     OM_ANCHORS = "om-anchors"
     OM_VERIFY = "om-verify"
+    OM_PROFILE = "om-profile"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {
@@ -55,6 +57,7 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         OmTask,
         OMAnchorTask,
         OMVerifyTask,
+        OMProfileTask,
         ShapesSetupTask,
     ]
 }

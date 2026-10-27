@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import StrEnum, auto
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable, NewType
+from typing import Any, Callable, NewType, Optional
 from urllib.parse import urlsplit
 from grasp.configs import GraspConfig
 from grasp.functions import find_manager
@@ -13,9 +13,9 @@ from grasp.sparql.types import AskResult, Binding
 from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import Entity
-from grasp.utils import FunctionCallException, derive_label_from_iri
+from grasp.utils import FunctionCallException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from rdflib import Literal
+from typing import Literal
 import yaml
 
 
@@ -28,8 +28,42 @@ IRI = NewType("IRI", str)
 SparqlTerm = NewType("SparqlTerm", str)
 
 
-def load_prompt(name: str) -> str:
-    return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
+def load_prompt(filename: str) -> str:
+    return (PROMPT_DIR / filename).read_text(encoding="utf-8").strip()
+
+
+EQUIVALENCE_PLACEHOLDER = "__EQUIVALENCE_CONDITION__"
+
+
+def add_equivalence_condition(text: str, config: GraspConfig) -> str:
+    """
+    Puts the equivalence condition at the placeholder in text, or appends it.
+    The default heuristic (equivalence_condition.txt: should a query for the
+    source entity return the target entity?) is only added without
+    task-specific instructions, since it can contradict their goal (e.g. only
+    one direction counts, or the ontologies are merged into one).
+    """
+    injection = (
+        "Whether entities across ontologies are truly "
+        "equivalent is ultimately a functional question. "
+        "When deciding about entities being equivalent across "
+        "ontologies, think primarily about how these entities "
+        "are used in real world scenarios and if these entities "
+        "are treated as equivalent in the context of "
+        "their usage."
+    )
+    if load_task_instructions(config.task_kwargs.get("om", {})) is not None:
+        injection += (
+            " For more information about the usage of the ontologies "
+            "and the alignment you assist with, see the section "
+            "'Task-specific instructions'."
+        )
+    else:
+        injection += " " + load_prompt("equivalence_condition.txt")
+
+    if EQUIVALENCE_PLACEHOLDER in text:
+        return text.replace(EQUIVALENCE_PLACEHOLDER, injection)
+    return text + "\n\n" + injection
 
 
 def load_task_instructions(om_kwargs: dict) -> str | None:
@@ -67,6 +101,27 @@ SYNONYM_PREDICATES = [
     IRI("http://www.geneontology.org/formats/oboInOwl#hasSynonym"),
 ]
 TYPE_PREDICATES = [RDF_TYPE]
+# strong definitions first; rdfs:comment is often a definition, but may be any note
+DEFINITION_PREDICATES = [
+    IRI("http://www.w3.org/2004/02/skos/core#definition"),
+    IRI("http://purl.obolibrary.org/obo/IAO_0000115"),
+    IRI("http://purl.org/dc/terms/description"),
+    IRI("http://www.w3.org/2000/01/rdf-schema#comment"),
+]
+# codes of the entity itself within its own system
+CODE_PREDICATES = [
+    IRI("http://www.w3.org/2004/02/skos/core#notation"),
+    IRI("http://www.geneontology.org/formats/oboInOwl#id"),
+    IRI("http://purl.org/dc/elements/1.1/identifier"),
+    IRI("http://purl.org/dc/terms/identifier"),
+]
+# codes or IRIs of the entity in other systems; two entities referring to
+# the same external entity are anchor candidates
+CROSS_REFERENCE_PREDICATES = [
+    IRI("http://www.geneontology.org/formats/oboInOwl#hasDbXref"),
+    IRI("http://www.w3.org/2004/02/skos/core#exactMatch"),
+    IRI("http://www.w3.org/2004/02/skos/core#closeMatch"),
+]
 
 
 # vocabulary namespaces, shown by their prefixed name (owl:Class) instead of a label
@@ -81,6 +136,7 @@ VOCABULARY = tuple(VOCABULARY_PREFIXES)
 RDF_FIRST = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#first")
 RDF_REST = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest")
 OWL_ON_PROPERTY = IRI("http://www.w3.org/2002/07/owl#onProperty")
+
 
 # blank node -> its (predicate, object) edges
 type BlankNodeTree = dict[str, list[tuple[IRI, Binding]]]
@@ -105,6 +161,132 @@ def namespace_of(iri: str) -> str:
 def sparql_path(predicates: list[IRI]) -> str:
     """Alternative property path over the given predicates, e.g. <a>|<b>."""
     return "|".join(f"<{p}>" for p in predicates)
+
+
+class RelationAlgebra(BaseModel):
+    symmetric: bool = False
+    transitive: bool = False
+    inverse_of: Optional[str] = None
+
+
+class PredicatePattern(BaseModel):
+    # unknown fields (e.g. a misspelled "pattern") are errors, not silently dropped
+    model_config = ConfigDict(extra="forbid")
+    patterns: list[str] = []  # SPARQL patterns over ?s and ?o
+    predicates: list[IRI] = []
+
+    @model_validator(mode='after')
+    def not_empty(self) -> "PredicatePattern":
+        if not self.patterns and not self.predicates:
+            raise ValueError("SPARQL pattern or predicates required")
+        return self
+
+    def predicates_to_sparql(self) -> str:
+        parts = []
+        if self.patterns:
+            parts.extend(self.patterns)
+        if self.predicates:
+            parts.append(f"?s {sparql_path(self.predicates)} ?o")
+        return " UNION ".join(f"{{ {p} }}" for p in parts)
+
+
+class StructureRelationKind(StrEnum):
+    SUBSUMPTION = auto()
+    MEMBERSHIP = auto()
+    PARTONOMY = auto()
+    IDENTITY = auto()
+    DISJOINTNESS = auto()
+    ASSOCIATION = auto()
+    OTHER = auto()
+
+
+DEFAULT_KIND_ALGEBRA = {
+    StructureRelationKind.SUBSUMPTION: {"transitive": True},
+    StructureRelationKind.IDENTITY: {"transitive": True, "symmetric": True},
+    StructureRelationKind.DISJOINTNESS: {"symmetric": True},
+}
+
+
+class StructureRelation(RelationAlgebra):
+    name: str
+    kind: StructureRelationKind
+    predicate_pattern: PredicatePattern
+    corresponds_to: str | None = None
+    source: Literal["default", "declared", "llm"] = "default"
+
+    @model_validator(mode="after")
+    def kind_defaults(self) -> "StructureRelation":
+        manual_args = self.model_fields_set
+        for name, value in DEFAULT_KIND_ALGEBRA.get(self.kind, {}).items():
+            if name not in manual_args:
+                setattr(self, name, value)
+        return self
+
+
+def _structure(name: str, kind: StructureRelationKind, predicates: list[str] = [],
+               patterns: list[str] = [], **algebra) -> StructureRelation:
+    return StructureRelation(
+        name=name, kind=kind,
+        predicate_pattern=PredicatePattern(predicates=[IRI(p) for p in predicates], patterns=patterns),
+        **algebra,
+    )
+
+
+_RDFS = "http://www.w3.org/2000/01/rdf-schema#"
+_OWL = "http://www.w3.org/2002/07/owl#"
+_SKOS = "http://www.w3.org/2004/02/skos/core#"
+_PART_OF = "http://purl.obolibrary.org/obo/BFO_0000050"
+_NOT_VOCABULARY = " && ".join(f'!STRSTARTS(STR(?o), "{ns}")' for ns in VOCABULARY)
+
+# default structure relations, read from ?s (specific) to ?o (general); the
+# default profile keeps those used in a partition
+DEFAULT_STRUCTURE_RELATIONS = [
+    _structure("subclass_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subClassOf"]),
+    _structure("subproperty_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subPropertyOf"]),
+    # skos:broader is not transitive by the SKOS specification, only skos:broaderTransitive
+    _structure("broader", StructureRelationKind.SUBSUMPTION, [_SKOS + "broader"], transitive=False),
+    _structure("broader_transitive", StructureRelationKind.SUBSUMPTION, [_SKOS + "broaderTransitive"]),
+    # types from the vocabulary (owl:Class, owl:NamedIndividual) declare the kind, not a membership
+    _structure("instance_of", StructureRelationKind.MEMBERSHIP,
+               patterns=[f"?s <{RDF_TYPE}> ?o . FILTER(isIRI(?o) && {_NOT_VOCABULARY})"]),
+    _structure("in_scheme", StructureRelationKind.MEMBERSHIP, [_SKOS + "inScheme"]),
+    _structure("part_of", StructureRelationKind.PARTONOMY, [_PART_OF],
+               patterns=[f"?s <{_RDFS}subClassOf> [ <{_OWL}onProperty> <{_PART_OF}> ; <{_OWL}someValuesFrom> ?o ]"]),
+    # any existential restriction; often a partonomy under a KG-specific property
+    # (e.g. UNDEFINED_part_of in the OAEI Anatomy track), which the profile task can tell
+    _structure("existential_restriction", StructureRelationKind.ASSOCIATION,
+               patterns=[f"?s <{_RDFS}subClassOf> [ <{_OWL}onProperty> ?r ; <{_OWL}someValuesFrom> ?o ] . FILTER(isIRI(?o))"]),
+    _structure("same_as", StructureRelationKind.IDENTITY,
+               [_OWL + "sameAs", _OWL + "equivalentClass", _OWL + "equivalentProperty"]),
+    _structure("disjoint_with", StructureRelationKind.DISJOINTNESS,
+               [_OWL + "disjointWith", _OWL + "propertyDisjointWith"]),
+]
+
+
+class NameType(StrEnum):
+    LABEL = "label"
+    CODE = "code"
+    OTHER = "other"
+
+
+class KgProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kg_name: str
+    alignment_namespaces: list[str]
+    partitions: dict[str, "KgPartitionProfile"]
+
+
+class KgPartitionProfile(BaseModel):
+    local_name_type: NameType
+    name_predicates: list[IRI] = []
+    synonym_predicates: list[IRI] = []
+    code_predicates: list[IRI] = []
+    code_sparql: Optional[str] = None
+    definition_predicates: list[IRI] = []
+    definition_sparql: Optional[str] = None
+    cross_references: list[IRI] = []
+    structure_predicates: list[StructureRelation] = []
+    noise_predicates: list[IRI] = []    
 
 
 class EntityContextConfig(BaseModel):
@@ -530,7 +712,7 @@ class CertificationResult(BaseModel):
     certified: list[AnchorRecord]
 
 
-class RelationSpec(BaseModel):
+class RelationSpec(RelationAlgebra):
     """
     A relation that may hold between a source and a target entity, together
     with the mathematical properties the system uses for consistency checks.
@@ -542,9 +724,6 @@ class RelationSpec(BaseModel):
     """
     iri: str
     description: str
-    symmetric: bool = False
-    transitive: bool = False
-    inverse_of: str | None = None
     # relations that cannot hold for the same entity pair simultaneously
     excludes: list[str] = []
     # weaker relations that hold for an entity pair whenever this one holds
@@ -774,3 +953,13 @@ def resolve_managers(task: GraspTask, input: Any) -> tuple[KgManager, KgManager]
             "Input must name source_kg and target_kg unless exactly two KGs are configured"
         )
     return task.managers[0], task.managers[1]
+
+
+def get_om_task_config(config: GraspConfig) -> dict[str, Any]:
+    return config.task_kwargs.get("om", {})
+
+def configured_namespaces(config: GraspConfig, kg: str, side: str | None = None) -> list[str] | None:
+    """Entity space configured in om.scope.namespaces, keyed by KG name
+    (e.g. mouse: [http://mouse.owl#]) or, for older configs, by side."""
+    configured = get_om_task_config(config).get("scope", {}).get("namespaces", {})
+    return configured.get(kg) or (configured.get(side) if side else None)

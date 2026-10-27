@@ -35,7 +35,7 @@ def retrieve_entities_by_key(
         yield KeyEntityRow.from_raw_row(row, manager.prefixes)
 
 
-def compose_side(manager: KgManager, queries: SideQueries) -> str:
+def compose_query(manager: KgManager, queries: SideQueries) -> str:
     """Key query joined with the optional scope query and left-joined with the
     optional partition query."""
     parts: list[str | QueryPart] = [queries.key]
@@ -53,7 +53,7 @@ def retrieve_key_rows(
         ) -> Iterator[KeyEntityRow]:
     """Key rows of one side; with an entity space (IRI prefixes) only rows of
     entities within it, whatever the queries select."""
-    rows = retrieve_entities_by_key(manager, compose_side(manager, queries))
+    rows = retrieve_entities_by_key(manager, compose_query(manager, queries))
     if entity_space is not None:
         rows = (row for row in rows if row.entity.startswith(entity_space))
     if queries.partition is None:
@@ -65,6 +65,15 @@ def retrieve_key_rows(
 def namespace_counts(rows: Iterable[KeyEntityRow]) -> Counter[str]:
     """Number of distinct entities per namespace."""
     return Counter(namespace_of(e) for e in {row.entity for row in rows})
+
+
+def determine_entity_space(counts: Counter[str], configured: list[str] | None) -> tuple[str, ...]:
+    """Configured IRI prefixes, otherwise the namespace with the most entities."""
+    if configured:
+        return tuple(configured)
+    if not counts:
+        return ()
+    return (counts.most_common(1)[0][0],)
 
 
 def to_sparql_term(manager: KgManager, iri: IRI) -> SparqlTerm:
@@ -92,7 +101,7 @@ def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
     return [dict(row) for row in result.rows()]
 
 
-def select_iris(manager: KgManager, sparql: str) -> set[IRI]:
+def select_object_iris(manager: KgManager, sparql: str) -> set[IRI]:
     """IRIs bound to ?o in the result of a SELECT query."""
     return {
         IRI(row["o"].value) for row in select_rows(manager, sparql)

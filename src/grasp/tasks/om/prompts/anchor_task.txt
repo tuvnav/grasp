@@ -8,5 +8,4 @@ Steps:
 3. Try the strategies that could do better than the default, and compare their results. To check whether a key works, call try_key_strategy instead of counting with SPARQL: it computes the anchors, shows examples and compares them with the default result.
 4. Call finish with the results and partition groups to use in addition to the default result run-0, which is always used with all its groups, and a short rationale: which keys and partitions, why, and which anchors you expect to be risky. Select nothing else if no other anchor set is plausibly mostly correct.
 
-
 __EQUIVALENCE_CONDITION__
