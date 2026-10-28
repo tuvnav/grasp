@@ -1,12 +1,14 @@
 from collections import Counter
 from dataclasses import replace
+import hashlib
+import re
 from typing import Iterable, Iterator
 from urllib.parse import urlsplit
 
 from grasp.build.data import stream_json
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding, SelectResult
-from grasp.sparql.utils import prepare_identifier_for_sparql
+from grasp.sparql.utils import READ_TIMEOUT, execute, prepare_identifier_for_sparql
 from grasp.tasks.om.model import (
     IRI, ALL, BindingType, BlankNodeTree, KeyEntityRow, QueryPart, SideQueries, SparqlTerm,
     compose, namespace_of,
@@ -18,11 +20,43 @@ BATCH_SIZE = 200
 KEY_ROW_PROJECTION = ["?entity", "?key", "?role", "?partition"]
 
 
+# statistics queries of the profile may take longer than a query of the model
+STATS_TIMEOUT = (6, 120)
+# VALUES blocks with more IRIs are put into a query after its prefixes are fixed
+MAX_INLINE_VALUES = 100
+_PLACEHOLDER = "urn:grasp-values:"
+_VALUES_BLOCKS: dict[str, str] = {}
+
+
+def values_clause(var: str, iris: Iterable[str]) -> str:
+    """VALUES ?var { <iri> ... }; a large one as a placeholder IRI that
+    prepare_query replaces by the IRIs."""
+    terms = " ".join(f"<{iri}>" for iri in iris)
+    if terms.count("<") <= MAX_INLINE_VALUES:
+        return f"VALUES ?{var} {{ {terms} }}"
+    key = f"{_PLACEHOLDER}{hashlib.sha1(terms.encode()).hexdigest()}"
+    _VALUES_BLOCKS[key] = terms
+    return f"VALUES ?{var} {{ <{key}> }}"
+
+
+def expand_values_blocks(sparql: str) -> str:
+    if _PLACEHOLDER not in sparql:
+        return sparql
+    return re.sub(rf"<({re.escape(_PLACEHOLDER)}[0-9a-f]+)>", lambda m: _VALUES_BLOCKS[m.group(1)], sparql)
+
+
+def prepare_query(manager: KgManager, sparql: str) -> str:
+    """The query with fixed prefixes. Large VALUES blocks (kg_sample) are put in
+    only afterwards: the prefix fixing parses the query, and a parse of
+    thousands of VALUES entries exceeds Python's recursion limit."""
+    return expand_values_blocks(manager.fix_prefixes(sparql))
+
+
 def stream_rows(manager: KgManager, sparql: str) -> Iterator[dict]:
     """Layed out to handle big KGs later without the need to fundamentally
     refactor the whole code."""
     return stream_json(
-        manager.endpoint, manager.fix_prefixes(sparql),
+        manager.endpoint, prepare_query(manager, sparql),
         manager.params, manager.headers, manager.auth
         )
 
@@ -95,7 +129,8 @@ def retrieve_outgoing_edges(manager: KgManager, entity: IRI) -> list[tuple[Bindi
 
 def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
     """Rows of a SELECT query as variable -> binding (unbound variables are missing)."""
-    result = manager.execute_sparql(sparql, force_select_result=True)
+    result = execute(prepare_query(manager, sparql), manager.endpoint, STATS_TIMEOUT, READ_TIMEOUT, 0,
+                     manager.headers, manager.params, None, manager.auth)
     if not isinstance(result, SelectResult):
         return []
     return [dict(row) for row in result.rows()]

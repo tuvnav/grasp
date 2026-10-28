@@ -181,13 +181,20 @@ class PredicatePattern(BaseModel):
             raise ValueError("SPARQL pattern or predicates required")
         return self
 
-    def predicates_to_sparql(self) -> str:
-        parts = []
-        if self.patterns:
-            parts.extend(self.patterns)
+    def parts(self) -> list[str]:
+        """The alternatives: each pattern, and the predicates as one path."""
+        parts = list(self.patterns)
         if self.predicates:
             parts.append(f"?s {sparql_path(self.predicates)} ?o")
-        return " UNION ".join(f"{{ {p} }}" for p in parts)
+        return parts
+
+    def alternatives(self) -> list[str]:
+        """The alternatives for querying: each pattern, and each predicate on
+        its own (a path <a>|<b> may be evaluated on the whole KG first)."""
+        return list(self.patterns) + [f"?s <{p}> ?o" for p in self.predicates]
+
+    def predicates_to_sparql(self) -> str:
+        return " UNION ".join(f"{{ {p} }}" for p in self.parts())
 
 
 class StructureRelationKind(StrEnum):

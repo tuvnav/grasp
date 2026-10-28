@@ -16,6 +16,7 @@ from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.kg_profile import Partitions, Sides, element_usage, partition_query
+from grasp.tasks.om.kg_sample import KgSample, use_sample
 from grasp.tasks.om.model import (
     LABEL_PREDICATES, PredicatePattern, StructureRelation, get_om_task_config, load_prompt,
     load_task_instructions, sparql_path,
@@ -30,6 +31,13 @@ from grasp.utils import FunctionCallException, format_enumerate, format_section
 from pydantic import BaseModel, ValidationError
 
 FINISH = "finish"
+LARGE_KG_NOTE = (
+    "This knowledge graph is very large. Partition sizes are estimates (~); all other statistics "
+    "(coverage, value kinds, examples, local names, try_pattern) are computed on samples of the "
+    "partitions (up to 200 entities per membership pattern), so shares are estimates too. In your own "
+    "SPARQL queries, always restrict the entities, e.g. to a class or to a few IRIs, and use LIMIT: "
+    "queries that scan the whole graph time out."
+)
 # findings per finish: only the most useful ones end up in prompts of later stages
 MAX_FINDINGS = 5
 NUM_EXAMPLES = 8
@@ -126,10 +134,16 @@ class ProfileStageTask(GraspTask):
         if self.input_profile.kg_name != self.manager.kg:
             raise ValueError(f"Profile of {self.input_profile.kg_name} given for {self.manager.kg}")
         self.finished, self.rationale, self.stats = False, None, {}
+        # a large KG is profiled on samples of the partitions (kg_sample); the
+        # space stage decides whether the KG is large
+        large = self.input_profile.large and self.stage != Stage.SPACE
+        use_sample(self.manager, KgSample(self.manager, tuple(self.input_profile.entity_space)) if large else None)
         body = self.prepare(input)
         self.profile = self.default.model_copy(deep=True)
         head = f"Knowledge graph: {self.manager.kg}" + (
             f" ({self.manager.description})" if self.manager.description else "")
+        if large:
+            head += "\n\n" + LARGE_KG_NOTE
         return "\n\n".join(part for part in (head, self.format_earlier_results(), body) if part)
 
     def format_earlier_results(self) -> str:
@@ -418,12 +432,11 @@ class RoleEditingTask(ProfileStageTask):
         if partition is not None and partition not in self.scope:
             raise FunctionCallException(f"Unknown partition {partition}; partitions: {', '.join(self.scope)}")
         sparql = pattern.predicates_to_sparql()
-        where = f"BIND(?entity AS ?s)\n{sparql}"
         rows = run_rows(self.manager, partition_query(
             self.manager, self.partitions, self.space,
             "?partition (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
             "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
-            where, "GROUP BY ?partition",
+            "", "GROUP BY ?partition", pattern.alternatives(),
         ))
         counts = {row["partition"].value: row for row in rows if "partition" in row}
         value = lambda row, key: int(row[key].value) if key in row else 0
@@ -438,18 +451,18 @@ class RoleEditingTask(ProfileStageTask):
             partition = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
         if partition is not None and value(counts.get(partition, {}), "subjects"):
             lines.append(f"Examples in {partition} (?s -> ?o, with names in quotes):")
-            lines += self.format_examples(partition, where)
+            lines += self.format_examples(partition, pattern.alternatives())
         return "\n".join(lines)
 
-    def format_examples(self, partition: str, where: str) -> list[str]:
+    def format_examples(self, partition: str, parts: list[str]) -> list[str]:
         """Example matches with a name of ?s and of ?o (codes alone say little)."""
         names = self.roles.names.predicates if self.roles.names else []
         names_path = sparql_path(list(dict.fromkeys(names + LABEL_PREDICATES)))
         rows = run_rows(self.manager, partition_query(
             self.manager, self.partitions, self.space, "?s ?o ?s_name ?o_name",
-            f'FILTER(?partition = "{partition}")\n{where}\n'
+            f'FILTER(?partition = "{partition}")\n'
             f"OPTIONAL {{ ?s {names_path} ?s_name }}\nOPTIONAL {{ ?o {names_path} ?o_name }}",
-            f"LIMIT {NUM_EXAMPLES * 4}",
+            f"LIMIT {NUM_EXAMPLES * 4}", parts,
         ))
         seen, lines = set(), []
         for row in rows:

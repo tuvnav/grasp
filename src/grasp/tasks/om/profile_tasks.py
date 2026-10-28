@@ -5,6 +5,7 @@ The four stages of the KG profile (profile_model.py), each a GRASP task on one K
     om-profile-roles       c. KG-wide roles and structure relations
     om-profile-partition   d. one partition: local names and deviations from the KG-wide roles
 """
+from collections import Counter
 from enum import StrEnum
 import re
 from typing import Callable
@@ -13,11 +14,17 @@ from grasp.manager import KgManager
 from grasp.tasks.om.kg_profile import (
     KINDS, Coverage, LocalNameStats, Partitions, Sides, canon_roles, complement, default_entity_space,
     default_roles, distinguishing_features, element_sparql, element_usage, kind_partitions, local_name_stats,
-    local_name_type, member_coverage, membership_overlap, prefix_counts, prefix_totals,
+    estimated_sizes, local_name_type, member_coverage, members_query, membership_overlap, prefix_counts,
+    prefix_totals,
     partition_query, partition_sizes, predicate_coverage, sample_entities, type_coverage,
 )
+from grasp.tasks.om.kg_sample import (
+    class_counts, count_triples, current_sample, default_class_partitions, is_large, large_prefix_counts,
+    type_membership, values_block,
+)
 from grasp.tasks.om.model import (
-    LABEL_PREDICATES, RDF_TYPE, UNCATEGORIZED, VOCABULARY, NameType, namespace_of, sparql_path,
+    LABEL_PREDICATES, RDF_TYPE, UNCATEGORIZED, VOCABULARY, NameType, configured_namespaces, namespace_of,
+    sparql_path,
 )
 from grasp.tasks.om.profile_model import (
     ROLE_FIELDS, KgProfile, PartitionDefinition, PartitionOrigin, PartitionProfile, Roles, Stage, Usage,
@@ -27,9 +34,12 @@ from grasp.tasks.om.profile_stage import (
     RoleEditingTask, ProfileStageTask, run_rows, share,
 )
 from grasp.tasks.om.render import clip
+from grasp.tasks.om.retrieve import select_rows
 from grasp.utils import FunctionCallException, format_section
 
 NUM_NAMESPACES = 15
+# kinds or classes listed per prefix
+NUM_KINDS = 8
 NUM_FEATURES = 10
 NUM_PREDICATES = 25
 PARTITION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -66,6 +76,11 @@ def ensure_space(task: ProfileStageTask) -> list[str]:
 def ensure_partitions(task: ProfileStageTask, space: list[str]) -> Partitions:
     if task.input_profile.partitions:
         return {name: p.definition for name, p in task.input_profile.partitions.items()}
+    if task.input_profile.large:
+        # kinds cannot be computed: one partition per large class
+        # default partitions of a large KG, like the kinds of a small one (origin default)
+        return {name: PartitionDefinition(membership=type_membership(type_iri), features=f"typed {short_iri(type_iri)}")
+                for name, type_iri, _ in default_class_partitions(task.manager, tuple(space), class_counts(task.manager))}
     sizes = partition_sizes(task.manager, None, space)
     return kind_partitions(k for k in KINDS if sizes.get(k))
 
@@ -78,28 +93,50 @@ class SpaceTask(ProfileStageTask):
     prompt_file = "profile_space.txt"
 
     def prepare(self, input: dict) -> str:
+        self.triples = count_triples(self.manager)
+        self.large = is_large(self.triples)
+        if self.large:
+            # a full count per prefix does not finish: estimate it from class samples
+            self.classes = class_counts(self.manager)
+            prefix_counts_ = large_prefix_counts(self.manager, self.classes)
+            all_counts, named = prefix_counts_.counts, prefix_counts_.named
+            named_totals, totals = prefix_counts_.named_totals, prefix_counts_.totals
+            self.prefix_examples = prefix_counts_.examples
+            self.class_prefix_counts = all_counts
+        else:
+            named, all_counts = prefix_counts(self.manager, True), prefix_counts(self.manager, False)
+            named_totals, totals = prefix_totals(named), prefix_totals(all_counts)
+        configured = configured_namespaces(self.config, self.manager.kg)
         if self.input_profile.entity_space:
             space, source = list(self.input_profile.entity_space), "given in the input profile"
+        elif configured:
+            space, source = list(configured), "configured"
+        elif named_totals:
+            space, source = [named_totals.most_common(1)[0][0]], "prefix with the most named entities"
+        elif totals:
+            space, source = [totals.most_common(1)[0][0]], "prefix with the most entities"
         else:
-            space, source = default_entity_space(self.manager, self.config)
-        named, all_counts = prefix_counts(self.manager, True), prefix_counts(self.manager, False)
-        named_totals, totals = prefix_totals(named), prefix_totals(all_counts)
-        self.stats = {"prefixes": dict(totals.most_common()), "named": dict(named_totals.most_common())}
-        self.default = self.input_profile.model_copy(update={"entity_space": space}, deep=True)
+            space, source = [], "no entities found"
+        self.stats = {"triples": self.triples, "large": self.large, "prefixes": dict(totals.most_common()),
+                      "named": dict(named_totals.most_common())}
+        self.default = self.input_profile.model_copy(
+            update={"entity_space": space, "triples": self.triples, "large": self.large}, deep=True)
         hosts: dict[str, list[str]] = {}
         for prefix, _ in totals.most_common():
             hosts.setdefault(namespace_of(prefix), []).append(prefix)
+        approx = "~" if self.large else ""
         lines = []
         for host, prefixes in sorted(hosts.items(), key=lambda x: -sum(totals[p] for p in x[1]))[:NUM_NAMESPACES]:
             if prefixes != [host]:
-                lines.append(f"  {host}: {sum(totals[p] for p in prefixes)} entities, "
-                             f"{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name")
+                lines.append(f"  {host}: {approx}{sum(totals[p] for p in prefixes)} entities, "
+                             f"{approx}{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name")
             for prefix in prefixes[:NUM_NAMESPACES]:
-                kinds = ", ".join(f"{k} {n}" for (other, k), n in sorted(all_counts.items(), key=lambda x: -x[1])
-                                  if other == prefix)
+                kinds = sorted(((k, n) for (other, k), n in all_counts.items() if other == prefix), key=lambda x: -x[1])
+                more = f", ... {len(kinds) - NUM_KINDS} more" if len(kinds) > NUM_KINDS else ""
+                kinds_text = ", ".join(f"{k} {approx}{n}" for k, n in kinds[:NUM_KINDS]) + more
                 indent = "    " if prefixes != [host] else "  "
-                lines.append(f"{indent}{prefix}: {totals[prefix]} entities ({kinds}), "
-                             f"{named_totals.get(prefix, 0)} with a canon name")
+                lines.append(f"{indent}{prefix}: {approx}{totals[prefix]} entities ({kinds_text}), "
+                             f"{approx}{named_totals.get(prefix, 0)} with a canon name")
             if len(prefixes) > NUM_NAMESPACES:
                 lines.append(f"    ... {len(prefixes) - NUM_NAMESPACES} more prefixes")
         if len(hosts) > NUM_NAMESPACES:
@@ -107,12 +144,35 @@ class SpaceTask(ProfileStageTask):
         examples = []
         for prefix, _ in totals.most_common(3):
             examples.append(f"{prefix}:")
-            examples += entity_examples(self, None, [prefix], "", 4)
+            examples += (self.sampled_examples(prefix, 4) if self.large
+                         else entity_examples(self, None, [prefix], "", 4))
+        size = (f"Size: {self.triples} triples." if self.triples is not None
+                else "Size: the triples cannot be counted (the query times out).")
+        if self.large:
+            size += (" This is a large knowledge graph: entities are counted per class (rdf:type) and "
+                     "estimated from samples of each class (~); untyped entities are not counted.")
+            group = "class (rdf:type)"
+        else:
+            group = "kind"
         return "\n\n".join([
+            size,
             f"Default entity space ({source}): " + (", ".join(space) or "none"),
-            "Entities per IRI prefix (host, and below it the first path segment) and kind:\n" + "\n".join(lines),
+            f"Entities per IRI prefix (host, and below it the first path segment) and {group}:\n" + "\n".join(lines),
             "Examples:\n" + "\n".join(examples),
         ])
+
+    def sampled_examples(self, prefix: str, k: int) -> list[str]:
+        """Sampled entities under a prefix (large KG) with a name and their class."""
+        pairs = [(e, c) for p, sampled in self.prefix_examples.items() if p.startswith(prefix) or prefix.startswith(p)
+                 for e, c in sampled if e.startswith(prefix)][:k]
+        if not pairs:
+            return []
+        names = {}
+        rows = run_rows(self.manager, f"SELECT ?entity ?name WHERE {{ {values_block([e for e, _ in pairs])} "
+                                      f"?entity {sparql_path(LABEL_PREDICATES)} ?name }}")
+        for row in rows:
+            names.setdefault(row["entity"].value, row["name"].value)
+        return [f"  {e}" + (f' "{clip(names[e], 50)}"' if e in names else "") + f" ({c})" for e, c in pairs]
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [({
@@ -140,6 +200,8 @@ class SpaceTask(ProfileStageTask):
         prefix = fn_args.get("prefix") or ""
         if not prefix:
             raise FunctionCallException("prefix required")
+        if self.large:
+            return self.inspect_sampled(prefix)
         sizes = run_sizes(self, None, [prefix])
         if not sizes:
             return f"No entities with IRIs starting with {prefix}."
@@ -158,15 +220,57 @@ class SpaceTask(ProfileStageTask):
             "Examples:", *entity_examples(self, None, [prefix], "", 8),
         ])
 
+    def inspect_sampled(self, prefix: str) -> str:
+        """inspect_namespace of a large KG, from the class samples."""
+        classes = Counter()
+        for (p, c), n in self.class_prefix_counts.items():
+            if p.startswith(prefix) or prefix.startswith(p):
+                classes[c] += n
+        examples = self.sampled_examples(prefix, 8)
+        if not examples:
+            return (f"No sampled entity has an IRI starting with {prefix}. (In this large knowledge graph, "
+                    "entities are only sampled per class; untyped entities are not seen.)")
+        return "\n".join([
+            f"{prefix}: classes of the sampled entities under this prefix or its namespace (estimated members): "
+            + ", ".join(f"{c} ~{n}" for c, n in classes.most_common(NUM_NAMESPACES)),
+            "Examples:", *examples,
+        ])
+
+    def has_entities(self, prefix: str) -> bool:
+        if not self.large:
+            return bool(run_sizes(self, None, [prefix]))
+        if any(e.startswith(prefix) for sampled in self.prefix_examples.values() for e, _ in sampled):
+            return True
+        try:
+            return bool(select_rows(self.manager, f'SELECT ?s WHERE {{ ?s ?p ?o FILTER(STRSTARTS(STR(?s), "{prefix}")) }} LIMIT 1'))
+        except Exception:
+            return True  # cannot tell in time; trust the model
+
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         space = [ns for ns in fn_args.get("entity_space") or [] if ns]
         if not space:
             raise FunctionCallException("entity_space must name at least one IRI prefix")
-        empty = [ns for ns in space if not run_sizes(self, None, [ns])]
+        empty = [ns for ns in space if not self.has_entities(ns)]
         if empty:
             raise FunctionCallException(f"No entities under {empty}")
-        profile = self.input_profile.model_copy(update={"entity_space": space}, deep=True)
+        profile = self.input_profile.model_copy(
+            update={"entity_space": space, "triples": self.triples, "large": self.large}, deep=True)
         return profile, f"Entity space: {', '.join(space)}"
+
+
+def size_text(task, name: str) -> str:
+    """Size of a partition: counted, or in a large KG estimated with the size of its sample."""
+    if current_sample(task.manager) is None:
+        return f"{task.sizes.get(name, 0)} entities"
+    estimate = task.estimates.get(name)
+    return f"{'~' + str(estimate) if estimate is not None else 'unknown number of'} entities, sample {task.sizes.get(name, 0)}"
+
+
+def size_stats(task) -> dict:
+    """Partition sizes for the output: estimates in a large KG, with the sample sizes."""
+    if current_sample(task.manager) is None:
+        return {"sizes": task.sizes}
+    return {"sizes": task.estimates, "sample_sizes": task.sizes}
 
 
 def run_sizes(task: ProfileStageTask, partitions: Partitions | None, space: list[str]) -> dict[str, int]:
@@ -194,17 +298,19 @@ class PartitionsTask(ProfileStageTask):
         self.definitions: Partitions = ensure_partitions(self, self.space)
         self.tested: set[str] = set()
         self.sizes = partition_sizes(self.manager, self.definitions, self.space)
+        self.estimates = estimated_sizes(self.manager, self.definitions, self.space)
         self.predicates = {p: {k: c.entities for k, c in counts.items()}
                            for p, counts in predicate_coverage(self.manager, self.definitions, self.space).items()}
         self.types = type_coverage(self.manager, self.definitions, self.space)
-        self.stats = {"sizes": self.sizes}
-        self.default = self.with_partitions(self.definitions)
+        self.stats = size_stats(self)
+        # without finish: the partitions with entities
+        self.default = self.with_partitions({n: d for n, d in self.definitions.items() if self.sizes.get(n)})
         sections = [self.format_sizes()]
         for name in self.definitions:
             size = self.sizes.get(name, 0)
             if not size:
                 continue
-            lines = [f"Partition {name} ({size} entities). Examples:",
+            lines = [f"Partition {name} ({size_text(self, name)}). Examples:",
                      *entity_examples(self, self.definitions, self.space, f'FILTER(?partition = "{name}")', 3)]
             outside, size_outside = complement(self.predicates, self.sizes, name)
             lines.append("Predicates (share of entities with the predicate):")
@@ -223,7 +329,7 @@ class PartitionsTask(ProfileStageTask):
                    else f"{definition.origin.value}{' from ' + definition.parent if definition.parent else ''}: "
                         f"{{ {definition.membership} }}")
             excluded = " [excluded]" if definition.excluded else ""
-            lines.append(f"  {name}: {self.sizes.get(name, 0)} entities ({how}){excluded}")
+            lines.append(f"  {name}: {size_text(self, name)} ({how}){excluded}")
         if self.sizes.get(UNCATEGORIZED):
             lines.append(f"  {UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} entities (no partition matches)")
         return "Partitions in order (an entity belongs to the first that matches):\n" + "\n".join(lines)
@@ -318,12 +424,20 @@ class PartitionsTask(ProfileStageTask):
         self.tested.add(membership)
         if not size:
             return "No entity of the entity space matches."
+        sample = current_sample(self.manager)
+        if sample is not None:
+            matches = sample.sample(membership)
+            estimate = (f"~{round(matches.count * matches.space_share)}" if matches.count is not None
+                        else "an unknown number of")
+            size_line = f"{estimate} entities of the entity space match (statistics on a sample of {size}); "
+        else:
+            size_line = f"{size} entities match; "
         compare = fn_args.get("compare_with")
         if compare is not None:
             self.known_partition(compare)
         else:
             compare = max((p for p in overlap if p in self.sizes), key=overlap.get, default=None)
-        lines = [f"{size} entities match; by current partition: "
+        lines = [size_line + "by current partition: "
                  + ", ".join(f"{p} {share(n, self.sizes.get(p, 0))}" for p, n in sorted(overlap.items(), key=lambda x: -x[1]))]
         if compare is not None:
             rest = self.sizes.get(compare, 0) - overlap.get(compare, 0)
@@ -334,7 +448,7 @@ class PartitionsTask(ProfileStageTask):
         lines.append("Examples:")
         names = sparql_path(LABEL_PREDICATES)
         rows = run_rows(self.manager, (
-            f"SELECT DISTINCT ?entity ?name WHERE {{ {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }} "
+            f"SELECT DISTINCT ?entity ?name WHERE {{ {members_query(membership, self.space, self.manager)} "
             f"OPTIONAL {{ ?entity {names} ?name }} }} LIMIT 6"
         ))
         lines += [f"  {r['entity'].value}" + (f' "{clip(r["name"].value, 50)}"' if "name" in r else "")
@@ -387,6 +501,7 @@ class PartitionsTask(ProfileStageTask):
     def update_definitions(self, definitions: Partitions) -> None:
         sizes = run_sizes(self, definitions, self.space)
         self.definitions, self.sizes = definitions, sizes
+        self.estimates = estimated_sizes(self.manager, definitions, self.space)
         try:
             self.predicates = {p: {k: c.entities for k, c in counts.items()}
                                for p, counts in predicate_coverage(self.manager, definitions, self.space).items()}
@@ -398,9 +513,9 @@ class PartitionsTask(ProfileStageTask):
         kept = {name: d for name, d in self.definitions.items() if self.sizes.get(name)}
         if not kept:
             raise FunctionCallException("No partition has entities")
-        self.stats = {"sizes": self.sizes}
+        self.stats = size_stats(self)
         dropped = [name for name in self.definitions if name not in kept]
-        summary = "Partitions: " + ", ".join(f"{n} {self.sizes[n]}" for n in kept)
+        summary = "Partitions: " + ", ".join(f"{n} {self.stats['sizes'].get(n, 0)}" for n in kept)
         if dropped:
             summary += f"; dropped as empty: {', '.join(dropped)}"
         return self.with_partitions(kept), summary
@@ -464,17 +579,18 @@ class RolesTask(RoleEditingTask):
         self.partitions = {name: p.definition for name, p in profile.partitions.items()}
         self.scope = active_partitions(profile)
         self.sizes = partition_sizes(self.manager, self.partitions, self.space)
+        self.estimates = estimated_sizes(self.manager, self.partitions, self.space)
         sides: dict[str, Sides] = {}
         usage = element_usage(self.manager, self.partitions, self.space, canon_roles(), sides)
         default = default_roles(usage, self.sizes, self.scope)
         self.init_roles(default, usage, sides, canon_roles())
         coverage = predicate_coverage(self.manager, self.partitions, self.space)
-        self.stats = {"sizes": self.sizes}
+        self.stats = size_stats(self)
         self.default = profile.model_copy(update={"entity_space": self.space, "roles": default}, deep=True)
         canon = ", ".join(short_iri(key[2]) if key[1] == "predicate" else key[2]
                           for key in role_elements(canon_roles()))
         return "\n\n".join([
-            "Partitions in scope: " + ", ".join(f"{p} ({self.sizes.get(p, 0)} entities)" for p in self.scope),
+            "Partitions in scope: " + ", ".join(f"{p} ({size_text(self, p)})" for p in self.scope),
             f"Default canon checked: {canon}. Canon elements below "
             "1% coverage in every partition are left out of the default.",
             "Default roles (coverage as ?s per partition):\n" + self.format_roles(default),
@@ -569,6 +685,7 @@ class PartitionTask(RoleEditingTask):
         self.partitions = {name: p.definition for name, p in profile.partitions.items()}
         self.scope = [self.partition]
         self.sizes = partition_sizes(self.manager, self.partitions, self.space)
+        self.estimates = estimated_sizes(self.manager, self.partitions, self.space)
         current = profile.partitions[self.partition]
         sides: dict[str, Sides] = {}
         kg_usage = element_usage(self.manager, self.partitions, self.space,
@@ -579,7 +696,7 @@ class PartitionTask(RoleEditingTask):
         self.init_roles(effective, kg_usage, sides, effective)
         stats = partition_name_stats(self.manager, self.partitions, self.space, self.partition, effective)
         self.name_type = local_name_type(stats)
-        self.stats = {"size": self.sizes.get(self.partition, 0), "mode": self.mode.value,
+        self.stats = {"size": size_stats(self)["sizes"].get(self.partition, 0), "mode": self.mode.value,
                       "local_names": stats.model_dump()}
         default = current.model_copy(update={"local_name_type": self.name_type})
         self.default = profile.model_copy(update={"partitions": {**profile.partitions, self.partition: default}}, deep=True)
@@ -594,7 +711,7 @@ class PartitionTask(RoleEditingTask):
         agreement = "–" if stats.agreement is None else f"{stats.agreement:.0%}"
         speaking = "–" if stats.speaking is None else f"{stats.speaking:.0%}"
         return "\n\n".join([
-            f"Partition {self.partition}: {size} entities"
+            f"Partition {self.partition}: {size_text(self, self.partition)}"
             + (f"; {definition.features}" if definition.features else "")
             + (f"; membership {{ {definition.membership} }}" if definition.membership else "; by kind"),
             f"Local names (sample of {stats.sample_size}, {stats.labelled} with a name): {agreement} agree with "

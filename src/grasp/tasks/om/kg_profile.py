@@ -24,6 +24,7 @@ from grasp.tasks.om.model import (
 from grasp.tasks.om.profile_model import (
     ElementKey, PartitionDefinition, Roles, Usage, role_elements, roles_from_elements,
 )
+from grasp.tasks.om.kg_sample import current_sample, values_block
 from grasp.tasks.om.retrieve import select_rows, stream_rows, values_blocks
 from pydantic import BaseModel
 
@@ -103,27 +104,72 @@ def partition_subquery(manager: KgManager, partitions: Partitions | None,
     several partitions."""
     prefixes, kind_query = split_prologue(manager, KIND_PARTITION_SPARQL)
     space_part = space_filter(space)
+    sample = current_sample(manager)
+    if sample is not None and partitions is not None:
+        # large KG: the sampled members of the partitions, assigned as below
+        entities = sample.entities([d.membership for d in partitions.values() if d.membership is not None])
+        return prefixes, (f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{values_block(entities)}\n"
+                          f"BIND({partition_choice(partitions)} AS ?partition)\n}} }}")
     if partitions is None:
         return prefixes, f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{kind_query}\n}} }}\n{space_part}"
     entities = [f"{{ SELECT DISTINCT ?entity (?partition AS ?kind) WHERE {{\n{kind_query}\n}} }}"]
     entities += [f"{{ SELECT DISTINCT ?entity WHERE {{ {d.membership} }} }}"
                  for d in partitions.values() if d.membership is not None]
+    body = (" UNION ".join(entities) + f"\nFILTER(isIRI(?entity))\n{space_part}\n"
+            f"BIND({partition_choice(partitions)} AS ?partition)")
+    return prefixes, f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{body}\n}} }}"
+
+
+def partition_choice(partitions: Partitions) -> str:
+    """Expression of the partition of ?entity: the first, in order, whose
+    membership matches (a pattern, or for a default partition its ?kind)."""
     choice = f'"{UNCATEGORIZED}"'
     for name, definition in reversed(partitions.items()):
         condition = (f"EXISTS {{ {definition.membership} }}" if definition.membership is not None
                      else f'COALESCE(?kind, "") = "{name}"')
         choice = f'IF({condition}, "{name}", {choice})'
-    body = (" UNION ".join(entities) + f"\nFILTER(isIRI(?entity))\n{space_part}\n"
-            f"BIND({choice} AS ?partition)")
-    return prefixes, f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{body}\n}} }}"
+    return choice
+
+
+def estimated_sizes(manager: KgManager, partitions: Partitions, space: Iterable[str]) -> dict[str, int]:
+    """Entities per partition: counted in a small KG, estimated from the
+    samples of the memberships in a large one (kg_sample)."""
+    sample = current_sample(manager)
+    if sample is None:
+        return partition_sizes(manager, partitions, space)
+    rows = select_rows(manager, partition_query(manager, partitions, space, "?entity ?partition"))
+    assigned = {(r["entity"].value, r["partition"].value) for r in rows if "entity" in r and "partition" in r}
+    sizes = {}
+    for name, definition in partitions.items():
+        if definition.membership is None:
+            continue
+        members = sample.sample(definition.membership).in_space
+        estimate = sample.estimated_size(definition.membership, sum((m, name) in assigned for m in members))
+        if estimate is not None:
+            sizes[name] = estimate
+    return sizes
+
+
+def union_with(group: str, parts: list[str], var: str | None = "s") -> str:
+    """The alternatives (UNION) of a pattern, each joined with group in its own
+    group, with ?var bound to ?entity (bind_entity). A server evaluates an
+    alternative in braces on its own, so it would scan the whole KG for it if
+    the group were outside."""
+    bound = [bind_entity(part, var) if var else part for part in parts]
+    if len(bound) == 1:
+        return f"{group}\n{bound[0]}"
+    return " UNION ".join(f"{{ {group}\n{part} }}" for part in bound)
 
 
 def partition_query(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
-                    select: str, where: str = "", tail: str = "") -> str:
+                    select: str, where: str = "", tail: str = "",
+                    parts: list[str] | None = None, var: str = "s") -> str:
     """Query over the entities of the partitions (?entity ?partition), joined
-    with the given patterns."""
+    with the given patterns; with parts, joined with the alternatives of a
+    pattern whose ?var is the entity (union_with)."""
     prefixes, subquery = partition_subquery(manager, partitions, space)
-    return f"{prologue_of(prefixes)}\nSELECT {select} WHERE {{\n{subquery}\n{where}\n}} {tail}"
+    body = union_with(subquery, parts, var) if parts is not None else subquery
+    return f"{prologue_of(prefixes)}\nSELECT {select} WHERE {{\n{body}\n{where}\n}} {tail}"
 
 
 def count_rows(rows: list[dict], *keys: str) -> dict[tuple[str, ...], int]:
@@ -131,9 +177,9 @@ def count_rows(rows: list[dict], *keys: str) -> dict[tuple[str, ...], int]:
 
 
 def counts_by_partition(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
-                        where: str) -> dict[str, int]:
+                        where: str, parts: list[str] | None = None, var: str = "s") -> dict[str, int]:
     sparql = partition_query(manager, partitions, space, "?partition (COUNT(DISTINCT ?entity) AS ?n)",
-                             where, "GROUP BY ?partition")
+                             where, "GROUP BY ?partition", parts, var)
     return {partition: n for (partition,), n in count_rows(select_rows(manager, sparql), "partition").items()}
 
 
@@ -256,17 +302,28 @@ def complement(counts: dict[str, dict[str, int]], sizes: dict[str, int], partiti
     return dict(total), sum(n for other, n in sizes.items() if other != partition)
 
 
-def members_query(membership: str, space: Iterable[str]) -> str:
+def members_query(membership: str, space: Iterable[str], manager: KgManager | None = None) -> str:
+    sample = current_sample(manager) if manager is not None else None
+    if sample is not None:
+        # large KG: the sampled members
+        return values_block(sample.sample(membership).in_space)
     return f"{{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }}\nFILTER(isIRI(?entity))\n{space_filter(space)}"
 
 
 def membership_overlap(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
                        membership: str) -> dict[str, int]:
     """Entities matching a membership pattern per current partition
-    (UNCATEGORIZED for matches outside every partition)."""
+    (UNCATEGORIZED for matches outside every partition); in a large KG for the
+    sampled matches."""
+    if current_sample(manager) is not None and partitions is not None:
+        prefixes, _ = split_prologue(manager, KIND_PARTITION_SPARQL)
+        sparql = (f"{prologue_of(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
+                  f"{members_query(membership, space, manager)}\nBIND({partition_choice(partitions)} AS ?part)\n"
+                  f"}} GROUP BY ?part")
+        return {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
     prefixes, subquery = partition_subquery(manager, partitions, space)
     sparql = (f"{prologue_of(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
-              f"{members_query(membership, space)}\nOPTIONAL {subquery}\n"
+              f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
               f'BIND(COALESCE(?partition, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part')
     return {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
 
@@ -274,7 +331,7 @@ def membership_overlap(manager: KgManager, partitions: Partitions | None, space:
 def member_coverage(manager: KgManager, space: Iterable[str], membership: str
                     ) -> tuple[dict[str, int], dict[str, int]]:
     """(predicate -> entities, rdf:type value -> entities) among the matches of a membership pattern."""
-    members = members_query(membership, space)
+    members = members_query(membership, space, manager)
     predicates = select_rows(manager, f"SELECT ?p (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n{members}\n?entity ?p ?v }} GROUP BY ?p")
     types = select_rows(manager, (f"SELECT ?t (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n{members}\n"
                                   f"?entity <{RDF_TYPE}> ?t . FILTER(isIRI(?t)) }} GROUP BY ?t"))
@@ -292,14 +349,28 @@ def canon_roles() -> Roles:
     )
 
 
-def element_sparql(key: ElementKey, value) -> str:
-    """Pattern over ?s and ?o of one element of a Roles."""
+def bind_entity(pattern: str, var: str = "s") -> str:
+    """The pattern with ?var replaced by ?entity, followed by BIND(?entity AS ?var).
+    Equivalent to binding ?var to ?entity first, but the server can then look
+    up the pattern from the entities (index scan) instead of evaluating it on the
+    whole KG and joining afterwards, which does not finish on a large KG."""
+    return re.sub(rf"\?{var}\b", "?entity", pattern) + f"\nBIND(?entity AS ?{var})"
+
+
+def element_parts(key: ElementKey, value) -> list[str]:
+    """Alternatives of the pattern over ?s and ?o of one element of a Roles."""
     _, kind, item = key
     if kind == "relation":
-        return value.predicate_pattern.predicates_to_sparql()
+        return value.predicate_pattern.alternatives()
     if kind == "predicate":
-        return f"?s <{item}> ?o"
-    return item
+        return [f"?s <{item}> ?o"]
+    return [item]
+
+
+def element_sparql(key: ElementKey, value) -> str:
+    """Pattern over ?s and ?o of one element of a Roles."""
+    parts = element_parts(key, value)
+    return parts[0] if len(parts) == 1 else " UNION ".join(f"{{ {p} }}" for p in parts)
 
 
 # relation key -> (entities as ?s, entities as ?o)
@@ -328,13 +399,12 @@ def element_usage(manager: KgManager, partitions: Partitions | None, space: Iter
                         usage[partition][key] = n
     for key, value in elements.items():
         if key[1] == "pattern":
-            where = f"BIND(?entity AS ?s)\n{element_sparql(key, value)}"
-            for partition, n in counts_by_partition(manager, partitions, space, where).items():
+            for partition, n in counts_by_partition(manager, partitions, space, "", element_parts(key, value)).items():
                 usage[partition][key] = n
         elif key[1] == "relation":
-            sparql = element_sparql(key, value)
-            as_s = counts_by_partition(manager, partitions, space, f"BIND(?entity AS ?s)\n{sparql}")
-            as_o = counts_by_partition(manager, partitions, space, f"BIND(?entity AS ?o)\n{sparql}")
+            parts = element_parts(key, value)
+            as_s = counts_by_partition(manager, partitions, space, "", parts, "s")
+            as_o = counts_by_partition(manager, partitions, space, "", parts, "o")
             for partition in set(as_s) | set(as_o):
                 n_s, n_o = as_s.get(partition, 0), as_o.get(partition, 0)
                 usage[partition][key] = max(n_s, n_o)
@@ -390,7 +460,7 @@ def retrieve_values(manager: KgManager, entities: Iterable[IRI], pattern: Predic
         return values
     literal = "FILTER(isLiteral(?o))" if literals_only else ""
     for block in values_blocks(entities):
-        sparql = f"SELECT ?s ?o WHERE {{ VALUES ?s {{ {block} }} {pattern.predicates_to_sparql()} {literal} }}"
+        sparql = f"SELECT ?s ?o WHERE {{ {union_with(f'VALUES ?s {{ {block} }}', pattern.alternatives(), None)} {literal} }}"
         for row in select_rows(manager, sparql):
             if "s" in row and "o" in row:
                 values[IRI(row["s"].value)].append(row["o"].value)

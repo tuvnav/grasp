@@ -56,7 +56,7 @@ ROLE_FIELDS = ("names", "synonyms", "definitions", "codes", "cross_references", 
 
 
 class PartitionOrigin(StrEnum):
-    DEFAULT = "default"      # a kind of the default partitioning (class, property, concept, instance)
+    DEFAULT = "default"      # a kind of the default partitioning (class, property, concept, instance), or a class of a large KG
     SPLIT = "split"          # a group carved out of another partition
     REDEFINED = "redefined"  # a partition with its own membership instead of a kind
 
@@ -100,6 +100,9 @@ class Flag(BaseModel):
 class KgProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kg_name: str
+    # triples of the KG (None: not countable); a large KG is profiled on samples (kg_sample)
+    triples: int | None = None
+    large: bool = False
     entity_space: list[str] = []
     roles: Roles = Roles()
     partitions: dict[str, PartitionProfile] = {}
