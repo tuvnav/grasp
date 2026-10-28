@@ -1,0 +1,15 @@
+Your stage: d. one partition.
+
+The roles of the partition are derived from the roles of the whole knowledge graph: elements the partition does not use are dropped. They are shown with their coverage in the partition, together with the predicates of the partition that have no role, and statistics on the local names of its IRIs.
+
+Your task:
+- Remove elements that occur in this partition but say nothing here (e.g. rdfs:comment holding only editorial notes in this partition).
+- Add elements that are specific to this partition and useful for matching (e.g. an identifier or name predicate used only by this partition).
+- Check the local name type: label if the local names of the IRIs are names (they may then serve as names of entities without one), code if they are identifiers (e.g. ABC_0001234, Q42, a UUID), other if mixed. A local name can look like a name and still only be an identifier.
+
+Your changes apply to this partition only. If an element is wrong for the whole knowledge graph, report it with a flag on the roles stage.
+
+Steps:
+1. Read the roles and the statistics; inspect a few typical entities of the partition with all their predicates.
+2. Test additions with try_pattern, then change the roles with edit_role, set_structure_relation and remove_structure_relation.
+3. Call finish, with local_name_type if the default is wrong.

@@ -1,0 +1,19 @@
+Your stage: c. roles of the whole knowledge graph.
+
+A default was computed from a standard canon of predicates (RDFS, OWL, SKOS, OBO and Dublin Core) and structure relations; it keeps the canon elements this knowledge graph uses. It is shown with the coverage of each element per partition, together with the most frequent predicates of the knowledge graph. Check the default and correct and complete it where this knowledge graph deviates from the canon: names or codes under local properties, relations encoded indirectly (e.g. in OWL restrictions, reified statements or intermediate nodes), alias or identity links, definitions that are only editorial notes.
+
+Roles are set for the whole knowledge graph; the next stage derives each partition's roles from them (elements a partition does not use are dropped there automatically) and adds what is specific to a partition. So add an element here if it has its role wherever it occurs, even if only one partition uses it.
+
+Roles:
+- names: preferred names. synonyms: alternative names.
+- definitions: textual definitions or descriptions.
+- codes: codes of the entity in its own system (notations, IDs).
+- cross_references: codes or IRIs of the entity in other systems.
+- noise: values that say nothing about the meaning of an entity (e.g. formatting, provenance, media files).
+- structure relations between entities of the knowledge graph, each with a name, a kind (subsumption, membership, partonomy, identity, disjointness, association, other), its algebra (transitive, symmetric, inverse_of) and a predicate pattern.
+
+Steps:
+1. Read the default roles and the frequent predicates. Are names, definitions and structure covered, or do many entities lack them? Which frequent predicates have no role?
+2. Inspect typical entities of each partition with all their predicates, using the SPARQL functions.
+3. Test every predicate or pattern you want to add with try_pattern, then change the roles with edit_role, set_structure_relation and remove_structure_relation.
+4. Call finish.

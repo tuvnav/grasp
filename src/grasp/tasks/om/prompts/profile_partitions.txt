@@ -1,0 +1,17 @@
+Your stage: b. partitions.
+
+Partitions are groups of entities that are recognizable by features of their own: a predicate they all have, a type, an IRI pattern. Later stages profile each partition, and matching compares entities within corresponding partitions. By default, entities are partitioned by kind (class, property, concept, instance); the partitions are shown with their sizes, examples and the predicates and types that distinguish them from the other partitions.
+
+Check whether the default fits this knowledge graph, in this order:
+1. Exclusion: does a partition, or a large group within one, contain entities that would not be matched for this task? Typical are annotation-like entities that only describe or hold values for other entities (helper nodes, reified statements, synonym or definition nodes), entities without an identity of their own (e.g. entities that only occur as objects of links and carry no name, type or description), and records of files, media or administration. What counts depends on the task: if the task-specific instructions ask to match such entities, keep them. Matching the others only costs time and adds false candidates. Exclude a whole partition with exclude_partition; for a group within one, split it off first and then exclude it.
+2. Splits: is a partition heterogeneous, i.e. does it contain groups with clearly different features (e.g. a subgroup whose entities share predicates or types that the rest of the partition lacks)? Then split the group off.
+3. Redefinition: are kinds the wrong criterion here (e.g. classes and instances in one hierarchy, all entities typed only by a custom type)? Then redefine the partition by a membership pattern.
+Only define a partition if its features are clear and it has enough entities to matter; leave the default as it is when it fits.
+
+Membership patterns are SPARQL group patterns over ?entity. Partitions are checked in order; an entity belongs to the first one that matches. A split is placed before its parent, so the parent keeps the rest.
+
+Steps:
+1. Read the partitions and their distinguishing features. Inspect examples of each partition with the SPARQL functions, including entities without names.
+2. Test candidate groups with test_partition; it shows how many entities match, where they are now, and what distinguishes them.
+3. Exclude, set or remove partitions; each change shows the new sizes.
+4. Call finish.

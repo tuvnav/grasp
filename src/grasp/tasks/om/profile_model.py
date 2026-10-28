@@ -20,10 +20,11 @@ stages read them as unverified observations and report a contradiction as a
 flag instead of changing an earlier stage's result.
 """
 from enum import StrEnum
+from typing import Iterable
 
 from pydantic import BaseModel, ConfigDict
 
-from grasp.tasks.om.model import IRI, NameType, PredicatePattern, StructureRelation
+from grasp.tasks.om.model import IRI, VOCABULARY_PREFIXES, NameType, PredicatePattern, StructureRelation
 
 
 class Stage(StrEnum):
@@ -31,6 +32,9 @@ class Stage(StrEnum):
     PARTITIONS = "partitions"
     ROLES = "roles"
     PARTITION = "partition"
+
+
+STAGES = list(Stage)  # in pipeline order
 
 
 class Roles(BaseModel):
@@ -179,3 +183,98 @@ def diff_roles(derived: Roles, final: Roles) -> tuple[Roles, Roles]:
     added = {k: v for k, v in after.items() if k not in before or not same_element(before[k], v)}
     removed = {k: v for k, v in before.items() if k not in after}
     return roles_from_elements(added), roles_from_elements(removed)
+
+
+def check_structure(relations: list[StructureRelation]) -> list[str]:
+    """Problems of a list of structure relations: duplicate names, inverse_of
+    naming no relation of the list, or inverses that do not point back."""
+    problems = []
+    by_name: dict[str, StructureRelation] = {}
+    for relation in relations:
+        if relation.name in by_name:
+            problems.append(f"duplicate structure relation name {relation.name}")
+        by_name[relation.name] = relation
+    for relation in relations:
+        if relation.inverse_of is None:
+            continue
+        inverse = by_name.get(relation.inverse_of)
+        if inverse is None:
+            problems.append(f"{relation.name}: inverse_of names no structure relation ({relation.inverse_of})")
+        elif inverse.inverse_of not in (None, relation.name):
+            problems.append(f"{relation.name} is inverse_of {inverse.name}, but {inverse.name} is inverse_of {inverse.inverse_of}")
+    return problems
+
+
+# --- description for prompts -------------------------------------------------------
+
+def short_iri(iri: str) -> str:
+    """Vocabulary IRIs by their prefixed name (rdfs:label), others as they are."""
+    for namespace, prefix in VOCABULARY_PREFIXES.items():
+        if iri.startswith(namespace):
+            return f"{prefix}:{iri[len(namespace):]}"
+    return iri
+
+
+def describe_pattern(pattern: PredicatePattern) -> str:
+    return ", ".join([short_iri(p) for p in pattern.predicates] + [f"pattern {{ {p} }}" for p in pattern.patterns])
+
+
+def describe_relation(relation: StructureRelation) -> str:
+    algebra = [a for a in ("transitive", "symmetric") if getattr(relation, a)]
+    if relation.inverse_of:
+        algebra.append(f"inverse of {relation.inverse_of}")
+    return (f"{relation.name} ({relation.kind.value}{', ' + ', '.join(algebra) if algebra else ''}): "
+            f"{describe_pattern(relation.predicate_pattern)}")
+
+
+def describe_roles(roles: Roles) -> list[str]:
+    lines = [f"{field.replace('_', ' ')}: {describe_pattern(pattern)}"
+             for field in ROLE_FIELDS if (pattern := getattr(roles, field)) is not None]
+    lines += [f"structure relation {describe_relation(r)}" for r in roles.structure]
+    return lines
+
+
+def describe_profile(profile: KgProfile, findings: bool = True, partitions: Iterable[str] | None = None) -> list[str]:
+    """The profile as short notes for prompts (in place of structural notes).
+    Patterns read from ?s, the entity, to ?o; structure relations from the
+    specific to the general entity. With partitions, only the findings about
+    the whole KG and about these partitions."""
+    notes = []
+    if profile.entity_space:
+        notes.append("Entities to align have IRIs starting with " + " or ".join(profile.entity_space) + ".")
+    if profile.partitions:
+        parts = []
+        for name, partition in profile.partitions.items():
+            definition = partition.definition
+            text = name
+            if definition.origin == PartitionOrigin.SPLIT:
+                text += f" (part of {definition.parent})"
+            if definition.features:
+                text += f": {definition.features}"
+            if definition.excluded:
+                text += " [excluded from the alignment]"
+            parts.append(text)
+        notes.append("Partitions: " + "; ".join(parts) + ".")
+    role_lines = describe_roles(profile.roles)
+    if role_lines:
+        notes.append("Roles of predicates (?s entity, ?o value): " + "; ".join(role_lines) + ".")
+    for name, partition in profile.partitions.items():
+        details = []
+        if partition.local_name_type is not None:
+            details.append(f"local names of IRIs are {partition.local_name_type.value}s"
+                           if partition.local_name_type != NameType.OTHER else "local names of IRIs are mixed")
+        added, removed = describe_roles(partition.added), describe_roles(partition.removed)
+        if added:
+            details.append("in addition " + "; ".join(added))
+        if removed:
+            details.append("not informative here: " + "; ".join(removed))
+        if details:
+            notes.append(f"Partition {name}: " + "; ".join(details) + ".")
+    if findings:
+        shown = None if partitions is None else set(partitions)
+        for finding in profile.findings:
+            if shown is not None and finding.partition is not None and finding.partition not in shown:
+                continue
+            scope = f" ({finding.partition})" if finding.partition else ""
+            notes.append(f"Observation{scope}: {finding.text}")
+    return notes

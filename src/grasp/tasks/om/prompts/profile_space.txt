@@ -1,0 +1,8 @@
+Your stage: a. entity space.
+
+The entity space is the set of IRI prefixes of the entities to align. Entities outside it are only context (e.g. imported vocabularies, external references, files). A default was chosen automatically, usually the namespace with the most named entities; it is shown with the number of entities per namespace and kind.
+
+Steps:
+1. Read the namespace counts. Which namespaces hold the entities the knowledge graph is about, and which hold imports, helper nodes, files or external references?
+2. Inspect unclear namespaces with inspect_namespace and the SPARQL functions. Several prefixes are possible (e.g. classes and properties in different namespaces); a prefix may be longer than the namespace shown (e.g. a path below a host).
+3. Call finish with the entity space.

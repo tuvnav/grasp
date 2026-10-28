@@ -241,7 +241,9 @@ _NOT_VOCABULARY = " && ".join(f'!STRSTARTS(STR(?o), "{ns}")' for ns in VOCABULAR
 # default structure relations, read from ?s (specific) to ?o (general); the
 # default profile keeps those used in a partition
 DEFAULT_STRUCTURE_RELATIONS = [
-    _structure("subclass_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subClassOf"]),
+    # without the blank nodes of OWL restrictions (part_of, existential_restriction)
+    _structure("subclass_of", StructureRelationKind.SUBSUMPTION,
+               patterns=[f"?s <{_RDFS}subClassOf> ?o . FILTER(isIRI(?o))"]),
     _structure("subproperty_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subPropertyOf"]),
     # skos:broader is not transitive by the SKOS specification, only skos:broaderTransitive
     _structure("broader", StructureRelationKind.SUBSUMPTION, [_SKOS + "broader"], transitive=False),
@@ -267,26 +269,6 @@ class NameType(StrEnum):
     LABEL = "label"
     CODE = "code"
     OTHER = "other"
-
-
-class KgProfile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    kg_name: str
-    alignment_namespaces: list[str]
-    partitions: dict[str, "KgPartitionProfile"]
-
-
-class KgPartitionProfile(BaseModel):
-    local_name_type: NameType
-    name_predicates: list[IRI] = []
-    synonym_predicates: list[IRI] = []
-    code_predicates: list[IRI] = []
-    code_sparql: Optional[str] = None
-    definition_predicates: list[IRI] = []
-    definition_sparql: Optional[str] = None
-    cross_references: list[IRI] = []
-    structure_predicates: list[StructureRelation] = []
-    noise_predicates: list[IRI] = []    
 
 
 class EntityContextConfig(BaseModel):
