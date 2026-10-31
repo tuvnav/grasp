@@ -34,15 +34,33 @@ def values_clause(var: str, iris: Iterable[str]) -> str:
     terms = " ".join(f"<{iri}>" for iri in iris)
     if terms.count("<") <= MAX_INLINE_VALUES:
         return f"VALUES ?{var} {{ {terms} }}"
+    return f"VALUES ?{var} {{ {placeholder(terms)} }}"
+
+
+def values_table(variables: list[str], rows: Iterable[tuple[str, ...]]) -> str:
+    """VALUES (?a ?b) { (term term) ... } of SPARQL terms; a large one as a
+    placeholder row that prepare_query replaces by the rows."""
+    head = "(" + " ".join(f"?{v}" for v in variables) + ")"
+    rows = list(rows)
+    terms = " ".join("(" + " ".join(row) + ")" for row in rows)
+    if len(rows) <= MAX_INLINE_VALUES:
+        return f"VALUES {head} {{ {terms} }}"
+    undef = " UNDEF" * (len(variables) - 1)
+    return f"VALUES {head} {{ ({placeholder(terms)}{undef}) }}"
+
+
+def placeholder(terms: str) -> str:
     key = f"{_PLACEHOLDER}{hashlib.sha1(terms.encode()).hexdigest()}"
     _VALUES_BLOCKS[key] = terms
-    return f"VALUES ?{var} {{ <{key}> }}"
+    return f"<{key}>"
 
 
 def expand_values_blocks(sparql: str) -> str:
     if _PLACEHOLDER not in sparql:
         return sparql
-    return re.sub(rf"<({re.escape(_PLACEHOLDER)}[0-9a-f]+)>", lambda m: _VALUES_BLOCKS[m.group(1)], sparql)
+    # a placeholder row of a table (<key> UNDEF ...), or a placeholder IRI
+    return re.sub(rf"\(\s*<({re.escape(_PLACEHOLDER)}[0-9a-f]+)>(?:\s+UNDEF)+\s*\)|<({re.escape(_PLACEHOLDER)}[0-9a-f]+)>",
+                  lambda m: _VALUES_BLOCKS[m.group(1) or m.group(2)], sparql)
 
 
 def prepare_query(manager: KgManager, sparql: str) -> str:

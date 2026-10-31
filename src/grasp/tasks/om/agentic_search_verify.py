@@ -28,7 +28,7 @@ from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
 from grasp.tasks.om.model import (
     allows_many, PotentialCorrespondences,
     Correspondence, RelationProfile,
-    RELATION_PROFILES, CorrespondenceSide,
+    RELATION_PROFILES, Side,
     RelationSpec, ensure_known, get_relation_profile, load_task_instructions
     )
 from grasp.tasks.om.render import format_entity
@@ -63,7 +63,7 @@ class AlignmentState:
         # was about. Per conversation, unlike the shared correspondences.
         self.pending_warnings: dict[tuple[str, str, str], frozenset[tuple[str, str, str]]] = {}
         # results of the scope checks: (side, IRI) -> whether it is in scope
-        self.scope_cache: dict[tuple[CorrespondenceSide, str], bool] = {}
+        self.scope_cache: dict[tuple[Side, str], bool] = {}
 
     @classmethod
     def clear_global(cls):
@@ -94,20 +94,20 @@ class AlignmentState:
     def correspondences_of(
         self,
         entity: str,
-        side: CorrespondenceSide,
+        side: Side,
         relation: str | None = None,
     ) -> list[Correspondence]:
         """
         All correspondences in which the full IRI `entity` takes part as
         source or target entity (`side`), optionally only those of `relation`.
         """
-        idx = 0 if side == CorrespondenceSide.SOURCE else 1
+        idx = 0 if side == Side.SOURCE else 1
         return [
             c for key, c in self.correspondences.items()
             if key[idx] == entity and (relation is None or c.relation == relation)
         ]
 
-    def discard_correspondences_of(self, entity: str, side: CorrespondenceSide, relation: str | None = None):
+    def discard_correspondences_of(self, entity: str, side: Side, relation: str | None = None):
         for c in self.correspondences_of(entity, side, relation):
             self.correspondences.pop(c.key, None)
 
@@ -125,7 +125,7 @@ class AlignmentState:
         related by it.
         """
         # nodes are (side, IRI), since the same IRI may occur in both ontologies
-        start: list[tuple[CorrespondenceSide, str]] = [(CorrespondenceSide.SOURCE, entity_source), (CorrespondenceSide.TARGET, entity_target)]
+        start: list[tuple[Side, str]] = [(Side.SOURCE, entity_source), (Side.TARGET, entity_target)]
         seen = set(start)
         queue = deque(start)
         found: dict[tuple[str, str, str], Correspondence] = {}
@@ -133,9 +133,9 @@ class AlignmentState:
             side, iri = queue.popleft()
             for c in self.correspondences_of(iri, side, relation):
                 found[c.key] = c
-                other: tuple[CorrespondenceSide, str] = (
-                    (CorrespondenceSide.TARGET, c.entity_target.identifier) if side == "source"
-                    else (CorrespondenceSide.SOURCE, c.entity_source.identifier)
+                other: tuple[Side, str] = (
+                    (Side.TARGET, c.entity_target.identifier) if side == "source"
+                    else (Side.SOURCE, c.entity_source.identifier)
                 )
                 if other not in seen:
                     seen.add(other)
@@ -449,7 +449,7 @@ def rules(
     return rules
 
 
-def scope_sparql(scope: dict, side: CorrespondenceSide) -> str | None:
+def scope_sparql(scope: dict, side: Side) -> str | None:
     """
     The ASK query template with an {IRI} placeholder that restricts the
     entities of `side` which may take part in correspondences, given inline or
@@ -469,7 +469,7 @@ def scope_sparql(scope: dict, side: CorrespondenceSide) -> str | None:
 def ensure_in_scope(
     manager: KgManager,
     iri: str,
-    side: CorrespondenceSide,
+    side: Side,
     scope: dict,
     state: "AlignmentState",
 ) -> None:
@@ -736,7 +736,7 @@ def format_consistency_warning(
             targets.setdefault(c.entity_target.identifier, c.entity_target.entity)
 
         implied_within = []
-        for names, kg, side in [(sources, kg_source, CorrespondenceSide.SOURCE), (targets, kg_target, CorrespondenceSide.TARGET)]:
+        for names, kg, side in [(sources, kg_source, Side.SOURCE), (targets, kg_target, Side.TARGET)]:
             displayed = list(names.values())
             for i, a in enumerate(displayed):
                 for b in displayed[i + 1:]:
@@ -792,8 +792,8 @@ def add_correspondence(
             ensure_known(manager_target, full_iri_target, known)
 
         if scope:
-            ensure_in_scope(manager_source, full_iri_source, CorrespondenceSide.SOURCE, scope, state)
-            ensure_in_scope(manager_target, full_iri_target, CorrespondenceSide.TARGET, scope, state)
+            ensure_in_scope(manager_source, full_iri_source, Side.SOURCE, scope, state)
+            ensure_in_scope(manager_target, full_iri_target, Side.TARGET, scope, state)
 
         if state.get_correspondence(full_iri_source, full_iri_target, relation.iri) is not None:
             return (
@@ -1055,8 +1055,8 @@ def input_and_state(
         # input correspondences win over conflicting ones in the shared state,
         # by replacing the conflicting ones, without asking the LLM
         if relation.symmetric and relation.transitive:
-            state.discard_correspondences_of(correspondence.key[0], CorrespondenceSide.SOURCE, relation.iri)
-            state.discard_correspondences_of(correspondence.key[1], CorrespondenceSide.TARGET, relation.iri)
+            state.discard_correspondences_of(correspondence.key[0], Side.SOURCE, relation.iri)
+            state.discard_correspondences_of(correspondence.key[1], Side.TARGET, relation.iri)
         state.add_correspondence(correspondence)
 
     instructions = input_instructions(task_input, state, managers, known, config)

@@ -15,7 +15,7 @@ from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.tasks.om.kg_profile import Partitions, Sides, element_usage, partition_query
+from grasp.tasks.om.kg_profile import Grouping, Sides, element_usage, grouping_query
 from grasp.tasks.om.kg_sample import KgSample, use_sample
 from grasp.tasks.om.model import (
     LABEL_PREDICATES, PredicatePattern, StructureRelation, get_om_task_config, load_prompt,
@@ -32,9 +32,9 @@ from pydantic import BaseModel, ValidationError
 
 FINISH = "finish"
 LARGE_KG_NOTE = (
-    "This knowledge graph is very large. Partition sizes are estimates (~); all other statistics "
-    "(coverage, value kinds, examples, local names, try_pattern) are computed on samples of the "
-    "partitions (up to 200 entities per membership pattern), so shares are estimates too. In your own "
+    "This knowledge graph is very large. Sizes of partitions and groups are estimates (~); all other "
+    "statistics (coverage, value kinds, examples, local names, try_pattern) are computed on samples "
+    "(up to 200 entities per membership pattern), so shares are estimates too. In your own "
     "SPARQL queries, always restrict the entities, e.g. to a class or to a few IRIs, and use LIMIT: "
     "queries that scan the whole graph time out."
 )
@@ -46,7 +46,9 @@ MAX_VALUE_CHARS = 80
 
 def inline_schema(model: type[BaseModel], drop: set[str] = frozenset()) -> dict:
     """JSON schema of a model with its $defs inlined (not every model API
-    resolves $ref), without titles and without the given properties."""
+    resolves $ref), without titles, without the given properties and without
+    discriminator mappings (they point into $defs; the const kind of each
+    alternative of a oneOf is enough)."""
     schema = model.model_json_schema()
     defs = schema.pop("$defs", {})
 
@@ -54,7 +56,7 @@ def inline_schema(model: type[BaseModel], drop: set[str] = frozenset()) -> dict:
         if isinstance(node, dict):
             if "$ref" in node:
                 return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
-            node = {k: resolve(v) for k, v in node.items() if k != "title"}
+            node = {k: resolve(v) for k, v in node.items() if k not in ("title", "discriminator")}
             if "properties" in node:
                 node["properties"] = {k: v for k, v in node["properties"].items() if k not in drop}
                 if "required" in node:
@@ -82,7 +84,7 @@ class ProfileStageTask(GraspTask):
     """One stage of the KG profile. Input: a dict with kg (name of a configured
     KG; may be omitted if exactly one KG is configured), profile (output
     profile of the stage before; omitted for the first stage) and, for the
-    partition stage, partition."""
+    group stage, group."""
     stage: Stage
     prompt_file: str
 
@@ -134,7 +136,7 @@ class ProfileStageTask(GraspTask):
         if self.input_profile.kg_name != self.manager.kg:
             raise ValueError(f"Profile of {self.input_profile.kg_name} given for {self.manager.kg}")
         self.finished, self.rationale, self.stats = False, None, {}
-        # a large KG is profiled on samples of the partitions (kg_sample); the
+        # a large KG is profiled on samples of the partitions and groups (kg_sample); the
         # space stage decides whether the KG is large
         large = self.input_profile.large and self.stage != Stage.SPACE
         use_sample(self.manager, KgSample(self.manager, tuple(self.input_profile.entity_space)) if large else None)
@@ -153,7 +155,7 @@ class ProfileStageTask(GraspTask):
         if notes:
             parts.append(format_section("Results of earlier stages", format_enumerate(notes)))
         if profile.findings:
-            findings = [f"[{f.stage.value}{', ' + f.partition if f.partition else ''}] {f.text}"
+            findings = [f"[{f.stage.value}{', ' + f.group if f.group else ''}] {f.text}"
                         for f in profile.findings]
             parts.append(format_section(
                 "Observations of earlier stages",
@@ -162,7 +164,7 @@ class ProfileStageTask(GraspTask):
                 + format_enumerate(findings),
             ))
         if profile.flags:
-            flags = [f"[{f.stage.value} on {f.concerns.value}{', ' + f.partition if f.partition else ''}] {f.text}"
+            flags = [f"[{f.stage.value} on {f.concerns.value}{', ' + f.group if f.group else ''}] {f.text}"
                      for f in profile.flags]
             parts.append(format_section("Flags raised so far", format_enumerate(flags)))
         return "\n\n".join(parts)
@@ -188,6 +190,9 @@ class ProfileStageTask(GraspTask):
     def earlier_stages(self) -> list[Stage]:
         return STAGES[:STAGES.index(self.stage)]
 
+    def about_description(self) -> str:
+        return "Group (or partition) it is about, if one."
+
     def finish_definition(self) -> dict:
         properties = {
             "rationale": {"type": "string",
@@ -204,7 +209,7 @@ class ProfileStageTask(GraspTask):
                     "type": "object",
                     "properties": {
                         "text": {"type": "string"},
-                        "partition": {"type": "string", "description": "Partition it is about, if one."},
+                        "group": {"type": "string", "description": self.about_description()},
                     },
                     "required": ["text"],
                     "additionalProperties": False,
@@ -220,7 +225,7 @@ class ProfileStageTask(GraspTask):
                     "properties": {
                         "concerns": {"type": "string", "enum": [s.value for s in self.earlier_stages()]},
                         "text": {"type": "string"},
-                        "partition": {"type": "string"},
+                        "group": {"type": "string", "description": self.about_description()},
                     },
                     "required": ["concerns", "text"],
                     "additionalProperties": False,
@@ -262,10 +267,11 @@ class ProfileStageTask(GraspTask):
             flags = [Flag(stage=self.stage, **f) for f in fn_args.get("flags") or []]
         except (ValidationError, TypeError) as e:
             raise FunctionCallException(f"Invalid findings or flags: {e}") from e
-        unknown = {x.partition for x in findings + flags if x.partition and x.partition not in profile.partitions}
+        known = set(profile.partitions) | set(profile.groups)
+        unknown = {x.group for x in findings + flags if x.group and x.group not in known}
         if unknown:
             raise FunctionCallException(
-                f"Unknown partitions {sorted(unknown)}; partitions: {', '.join(profile.partitions) or 'none'}")
+                f"Unknown groups or partitions {sorted(unknown)}; known: {', '.join(known) or 'none'}")
         if any(flag.concerns not in self.earlier_stages() for flag in flags):
             raise FunctionCallException("A flag must concern an earlier stage")
         profile.findings += findings
@@ -301,31 +307,32 @@ ROLE_DESCRIPTIONS = {
 
 class RoleEditingTask(ProfileStageTask):
     """Role stages: try_pattern and editing of the working roles (self.roles),
-    with coverage over the partitions in scope."""
+    with coverage over the partitions (stage c) or groups (stage d) in scope."""
+    unit: str                   # "partition" or "group", in texts for the model
     roles: Roles
     space: list[str]
-    partitions: Partitions
+    grouping: Grouping
     sizes: dict[str, int]
-    scope: list[str]            # partitions whose coverage is shown
-    usage: dict[str, Usage]     # partition -> element -> entities, cached
-    sides: dict[str, Sides]     # partition -> relation -> (as ?s, as ?o), cached
+    scope: list[str]            # partitions or groups whose coverage is shown
+    usage: dict[str, Usage]     # partition or group -> element -> entities, cached
+    sides: dict[str, Sides]     # partition or group -> relation -> (as ?s, as ?o), cached
     counted: set[ElementKey]    # elements counted, also those used nowhere
 
     def role_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         pattern_schema = inline_schema(PredicatePattern)
-        partition = {"type": "string", "enum": self.scope}
+        member = {"type": "string", "enum": self.scope}
         return [
             ({
                 "name": "try_pattern",
                 "description": (
-                    "Tests a predicate pattern: per partition, how many entities are ?s, how many "
+                    f"Tests a predicate pattern: per {self.unit}, how many entities are ?s, how many "
                     "distinct ?o and literal values it has, and examples with names. Use it for "
                     "attributes (names, codes: ?o is a literal) and structure relations (?o is an entity)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {"predicate_pattern": pattern_schema,
-                                   "partition": partition | {"description": "Partition for the examples; default: the best covered one."}},
+                                   self.unit: member | {"description": f"The {self.unit} for the examples; default: the best covered one."}},
                     "required": ["predicate_pattern"],
                     "additionalProperties": False,
                 },
@@ -384,13 +391,13 @@ class RoleEditingTask(ProfileStageTask):
             return
         sides: dict[str, Sides] = {}
         try:
-            usage = element_usage(self.manager, self.partitions, self.space, roles_from_elements(new), sides)
+            usage = element_usage(self.manager, self.grouping, self.space, roles_from_elements(new), sides)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
-        for partition, counts in usage.items():
-            self.usage.setdefault(partition, {}).update(counts)
-        for partition, counts in sides.items():
-            self.sides.setdefault(partition, {}).update(counts)
+        for member, counts in usage.items():
+            self.usage.setdefault(member, {}).update(counts)
+        for member, counts in sides.items():
+            self.sides.setdefault(member, {}).update(counts)
         self.counted |= set(new)
 
     def format_coverage(self, key: ElementKey) -> str:
@@ -414,7 +421,7 @@ class RoleEditingTask(ProfileStageTask):
         return f"  {describe_relation(relation)}{mark}\n    as ?s: {side(0)}\n    as ?o: {side(1)}"
 
     def format_roles(self, roles: Roles, origin: Callable[[ElementKey], str] | None = None) -> str:
-        """Each element with its coverage per partition in scope."""
+        """Each element with its coverage per partition or group in scope."""
         self.update_usage(roles)
         lines = [line for field in ROLE_FIELDS for line in self.format_field(field, getattr(roles, field), origin)]
         lines.append("structure relations:" if roles.structure else "structure relations: none")
@@ -428,39 +435,39 @@ class RoleEditingTask(ProfileStageTask):
             pattern = PredicatePattern.model_validate(fn_args.get("predicate_pattern") or {})
         except ValidationError as e:
             raise FunctionCallException(f"Invalid predicate_pattern: {e}") from e
-        partition = fn_args.get("partition")
-        if partition is not None and partition not in self.scope:
-            raise FunctionCallException(f"Unknown partition {partition}; partitions: {', '.join(self.scope)}")
+        member = fn_args.get(self.unit)
+        if member is not None and member not in self.scope:
+            raise FunctionCallException(f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}")
         sparql = pattern.predicates_to_sparql()
-        rows = run_rows(self.manager, partition_query(
-            self.manager, self.partitions, self.space,
-            "?partition (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
+        rows = run_rows(self.manager, grouping_query(
+            self.manager, self.grouping, self.space,
+            "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
             "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
-            "", "GROUP BY ?partition", pattern.alternatives(),
+            "", "GROUP BY ?group", pattern.alternatives(),
         ))
-        counts = {row["partition"].value: row for row in rows if "partition" in row}
+        counts = {row["group"].value: row for row in rows if "group" in row}
         value = lambda row, key: int(row[key].value) if key in row else 0
         lines = [f"Pattern: {sparql}"]
         for p in self.scope:
             row = counts.get(p, {})
-            lines.append(f"Partition {p}: {share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
+            lines.append(f"{self.unit.capitalize()} {p}: {share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
                          f"{value(row, 'n')} matches, {value(row, 'objects')} distinct ?o, "
                          f"{value(row, 'literals')} literal matches.")
-        if partition is None:
+        if member is None:
             in_scope = [p for p in self.scope if value(counts.get(p, {}), "subjects")]
-            partition = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
-        if partition is not None and value(counts.get(partition, {}), "subjects"):
-            lines.append(f"Examples in {partition} (?s -> ?o, with names in quotes):")
-            lines += self.format_examples(partition, pattern.alternatives())
+            member = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
+        if member is not None and value(counts.get(member, {}), "subjects"):
+            lines.append(f"Examples in {member} (?s -> ?o, with names in quotes):")
+            lines += self.format_examples(member, pattern.alternatives())
         return "\n".join(lines)
 
-    def format_examples(self, partition: str, parts: list[str]) -> list[str]:
+    def format_examples(self, member: str, parts: list[str]) -> list[str]:
         """Example matches with a name of ?s and of ?o (codes alone say little)."""
         names = self.roles.names.predicates if self.roles.names else []
         names_path = sparql_path(list(dict.fromkeys(names + LABEL_PREDICATES)))
-        rows = run_rows(self.manager, partition_query(
-            self.manager, self.partitions, self.space, "?s ?o ?s_name ?o_name",
-            f'FILTER(?partition = "{partition}")\n'
+        rows = run_rows(self.manager, grouping_query(
+            self.manager, self.grouping, self.space, "?s ?o ?s_name ?o_name",
+            f'FILTER(?group = "{member}")\n'
             f"OPTIONAL {{ ?s {names_path} ?s_name }}\nOPTIONAL {{ ?o {names_path} ?o_name }}",
             f"LIMIT {NUM_EXAMPLES * 4}", parts,
         ))
@@ -499,7 +506,7 @@ class RoleEditingTask(ProfileStageTask):
         new = PredicatePattern(predicates=predicates, patterns=patterns) if predicates or patterns else None
         self.update_usage(Roles(**{role: new}))  # may raise on SPARQL errors; then nothing changes
         self.roles = self.roles.model_copy(update={role: new})
-        return "Role now (coverage as ?s per partition):\n" + "\n".join(self.format_field(role, new))
+        return f"Role now (coverage as ?s per {self.unit}):\n" + "\n".join(self.format_field(role, new))
 
     def set_structure_relation(self, fn_args: dict) -> str:
         try:

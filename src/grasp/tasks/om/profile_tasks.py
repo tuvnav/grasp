@@ -1,9 +1,10 @@
 """
-The four stages of the KG profile (profile_model.py), each a GRASP task on one KG:
-    om-profile-space       a. entity space
-    om-profile-partitions  b. partitions: check the kinds; split, redefine, exclude
-    om-profile-roles       c. KG-wide roles and structure relations
-    om-profile-partition   d. one partition: local names and deviations from the KG-wide roles
+The five stages of the KG profile (profile_model.py), each a GRASP task on one KG:
+    om-profile-space       a.  entity space
+    om-profile-partitions  b1. exclusive partitions (kinds) and which do not compete
+    om-profile-roles       c.  KG-wide roles and structure relations
+    om-profile-groups      b2. overlapping groups, with the task in view; exclusion
+    om-profile-group       d.  one group: local names and deviations from the KG-wide roles
 """
 from collections import Counter
 from enum import StrEnum
@@ -12,14 +13,14 @@ from typing import Callable
 
 from grasp.manager import KgManager
 from grasp.tasks.om.kg_profile import (
-    KINDS, Coverage, LocalNameStats, Partitions, Sides, canon_roles, complement, default_entity_space,
-    default_roles, distinguishing_features, element_sparql, element_usage, kind_partitions, local_name_stats,
-    estimated_sizes, local_name_type, member_coverage, members_query, membership_overlap, prefix_counts,
-    prefix_totals,
-    partition_query, partition_sizes, predicate_coverage, sample_entities, type_coverage,
+    Coverage, Grouping, LocalNameStats, Sides, canon_roles, complement, default_entity_space,
+    default_roles, distinguishing_features, element_sparql, element_usage, estimated_sizes, group_grouping,
+    group_sizes, grouping_query, kind_partitions, local_name_stats, local_name_type, member_coverage,
+    members_query, membership_overlap, partition_grouping, predicate_coverage, prefix_counts, prefix_totals,
+    rest, sample_entities, type_coverage,
 )
 from grasp.tasks.om.kg_sample import (
-    class_counts, count_triples, current_sample, default_class_partitions, is_large, large_prefix_counts,
+    class_counts, count_triples, current_sample, default_class_groups, is_large, large_prefix_counts,
     type_membership, values_block,
 )
 from grasp.tasks.om.model import (
@@ -27,8 +28,8 @@ from grasp.tasks.om.model import (
     sparql_path,
 )
 from grasp.tasks.om.profile_model import (
-    ROLE_FIELDS, KgProfile, PartitionDefinition, PartitionOrigin, PartitionProfile, Roles, Stage, Usage,
-    derived_roles, diff_roles, effective_roles, role_elements, roles_from_elements, short_iri,
+    ROLE_FIELDS, GroupDefinition, GroupOrigin, GroupProfile, KgProfile, Partition, Roles, Separation, Stage,
+    derived_roles, describe_profile, diff_roles, effective_roles, role_elements, roles_from_elements, short_iri,
 )
 from grasp.tasks.om.profile_stage import (
     RoleEditingTask, ProfileStageTask, run_rows, share,
@@ -42,15 +43,18 @@ NUM_NAMESPACES = 15
 NUM_KINDS = 8
 NUM_FEATURES = 10
 NUM_PREDICATES = 25
-PARTITION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+# stage a counts entities per prefix by kind, without the subjects outside all kinds
+SPACE_GROUPING = partition_grouping(kind_partitions(), rest=False)
+# name of all entities of a grouping, to compare a group with the rest
+ALL = "_all"
 
 
-def entity_examples(task: ProfileStageTask, partitions: Partitions | None, space: list[str],
-                    where: str, k: int) -> list[str]:
-    """Up to k entities with a name and their partition."""
+def entity_examples(task: ProfileStageTask, grouping: Grouping, space: list[str], where: str, k: int) -> list[str]:
+    """Up to k entities with a name and their partition or group."""
     names = sparql_path(LABEL_PREDICATES)
-    rows = run_rows(task.manager, partition_query(
-        task.manager, partitions, space, "?entity ?partition ?name",
+    rows = run_rows(task.manager, grouping_query(
+        task.manager, grouping, space, "?entity ?group ?name",
         f"{where}\nOPTIONAL {{ ?entity {names} ?name }}", f"LIMIT {k * 4}",
     ))
     seen, lines = set(), []
@@ -60,7 +64,7 @@ def entity_examples(task: ProfileStageTask, partitions: Partitions | None, space
             continue
         seen.add(entity)
         name = f' "{clip(row["name"].value, 50)}"' if "name" in row else ""
-        lines.append(f"  {entity}{name} ({row['partition'].value})")
+        lines.append(f"  {entity}{name} ({row['group'].value})")
         if len(lines) == k:
             break
     return lines
@@ -73,16 +77,44 @@ def ensure_space(task: ProfileStageTask) -> list[str]:
     return space
 
 
-def ensure_partitions(task: ProfileStageTask, space: list[str]) -> Partitions:
+def default_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Partition]:
+    """The kind partitions with entities (in a large KG without the alternatives
+    that cannot be evaluated there)."""
+    large = task.input_profile.large
+    partitions = kind_partitions(large=large)
+    sizes = estimated_sizes(task.manager, partition_grouping(partitions, rest=False), space)
+    return {name: p for name, p in partitions.items() if sizes.get(name)}
+
+
+def ensure_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Partition]:
     if task.input_profile.partitions:
-        return {name: p.definition for name, p in task.input_profile.partitions.items()}
-    if task.input_profile.large:
-        # kinds cannot be computed: one partition per large class
-        # default partitions of a large KG, like the kinds of a small one (origin default)
-        return {name: PartitionDefinition(membership=type_membership(type_iri), features=f"typed {short_iri(type_iri)}")
-                for name, type_iri, _ in default_class_partitions(task.manager, tuple(space), class_counts(task.manager))}
-    sizes = partition_sizes(task.manager, None, space)
-    return kind_partitions(k for k in KINDS if sizes.get(k))
+        return dict(task.input_profile.partitions)
+    return default_partitions(task, space)
+
+
+def default_separations(partitions: dict[str, Partition]) -> list[Separation]:
+    """Properties do not compete with the other kinds (the default before stage b1 decides)."""
+    if "property" not in partitions:
+        return []
+    return [Separation(a="property", b=name, reason="properties and entities are not equivalent")
+            for name in partitions if name != "property"]
+
+
+def ensure_groups(task: ProfileStageTask, space: list[str]) -> dict[str, GroupDefinition]:
+    """The groups of the input profile; otherwise one per partition and, in a
+    large KG, one per large class."""
+    profile = task.input_profile
+    if profile.groups:
+        return {name: g.definition for name, g in profile.groups.items()}
+    groups = {name: GroupDefinition(membership_sparql=p.membership_sparql, origin=GroupOrigin.PARTITION,
+                                    features=p.features)
+              for name, p in ensure_partitions(task, space).items()}
+    if profile.large:
+        for name, type_iri, _ in default_class_groups(task.manager, tuple(space), class_counts(task.manager)):
+            if name not in groups:
+                groups[name] = GroupDefinition(membership_sparql=type_membership(type_iri), origin=GroupOrigin.CLASS,
+                                               features=f"typed {short_iri(type_iri)}")
+    return groups
 
 
 # --- a. entity space ----------------------------------------------------------------
@@ -145,7 +177,7 @@ class SpaceTask(ProfileStageTask):
         for prefix, _ in totals.most_common(3):
             examples.append(f"{prefix}:")
             examples += (self.sampled_examples(prefix, 4) if self.large
-                         else entity_examples(self, None, [prefix], "", 4))
+                         else entity_examples(self, SPACE_GROUPING, [prefix], "", 4))
         size = (f"Size: {self.triples} triples." if self.triples is not None
                 else "Size: the triples cannot be counted (the query times out).")
         if self.large:
@@ -202,22 +234,22 @@ class SpaceTask(ProfileStageTask):
             raise FunctionCallException("prefix required")
         if self.large:
             return self.inspect_sampled(prefix)
-        sizes = run_sizes(self, None, [prefix])
+        sizes = run_sizes(self, SPACE_GROUPING, [prefix])
         if not sizes:
             return f"No entities with IRIs starting with {prefix}."
-        named = run_rows(self.manager, partition_query(
-            self.manager, None, [prefix], "(COUNT(DISTINCT ?entity) AS ?n)",
+        named = run_rows(self.manager, grouping_query(
+            self.manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?entity) AS ?n)",
             f"FILTER EXISTS {{ ?entity {sparql_path(LABEL_PREDICATES)} ?name }}",
         ))
         n_named = int(named[0]["n"].value) if named and "n" in named[0] else 0
-        types = run_rows(self.manager, partition_query(
-            self.manager, None, [prefix], "?t (COUNT(DISTINCT ?entity) AS ?n)",
+        types = run_rows(self.manager, grouping_query(
+            self.manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?entity) AS ?n)",
             f"?entity <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
         ))
         return "\n".join([
             f"{prefix}: " + ", ".join(f"{p} {n}" for p, n in sizes.items()) + f"; {n_named} with a canon name",
             "Most frequent types: " + (", ".join(f"{short_iri(r['t'].value)} {r['n'].value}" for r in types if "t" in r) or "none"),
-            "Examples:", *entity_examples(self, None, [prefix], "", 8),
+            "Examples:", *entity_examples(self, SPACE_GROUPING, [prefix], "", 8),
         ])
 
     def inspect_sampled(self, prefix: str) -> str:
@@ -238,7 +270,7 @@ class SpaceTask(ProfileStageTask):
 
     def has_entities(self, prefix: str) -> bool:
         if not self.large:
-            return bool(run_sizes(self, None, [prefix]))
+            return bool(run_sizes(self, SPACE_GROUPING, [prefix]))
         if any(e.startswith(prefix) for sampled in self.prefix_examples.values() for e, _ in sampled):
             return True
         try:
@@ -259,7 +291,7 @@ class SpaceTask(ProfileStageTask):
 
 
 def size_text(task, name: str) -> str:
-    """Size of a partition: counted, or in a large KG estimated with the size of its sample."""
+    """Size of a partition or group: counted, or in a large KG estimated with the size of its sample."""
     if current_sample(task.manager) is None:
         return f"{task.sizes.get(name, 0)} entities"
     estimate = task.estimates.get(name)
@@ -267,20 +299,18 @@ def size_text(task, name: str) -> str:
 
 
 def size_stats(task) -> dict:
-    """Partition sizes for the output: estimates in a large KG, with the sample sizes."""
+    """Sizes for the output: estimates in a large KG, with the sample sizes."""
     if current_sample(task.manager) is None:
         return {"sizes": task.sizes}
     return {"sizes": task.estimates, "sample_sizes": task.sizes}
 
 
-def run_sizes(task: ProfileStageTask, partitions: Partitions | None, space: list[str]) -> dict[str, int]:
+def run_sizes(task: ProfileStageTask, grouping: Grouping, space: list[str]) -> dict[str, int]:
     try:
-        return partition_sizes(task.manager, partitions, space)
+        return group_sizes(task.manager, grouping, space)
     except Exception as e:
         raise FunctionCallException(f"The SPARQL query failed: {e}") from e
 
-
-# --- b. partitions ------------------------------------------------------------------
 
 def format_features(inside: dict[str, int], size_inside: int, outside: dict[str, int], size_outside: int,
                     other: str) -> list[str]:
@@ -288,139 +318,88 @@ def format_features(inside: dict[str, int], size_inside: int, outside: dict[str,
             for f in distinguishing_features(inside, size_inside, outside, size_outside, NUM_FEATURES)]
 
 
-class PartitionsTask(ProfileStageTask):
-    name = "om-profile-partitions"
-    stage = Stage.PARTITIONS
-    prompt_file = "profile_partitions.txt"
+def membership_argument(fn_args: dict) -> str:
+    membership = (fn_args.get("membership") or "").strip()
+    if not re.search(r"\?entity\b", membership):
+        raise FunctionCallException("The membership pattern must use ?entity")
+    return membership
 
-    def prepare(self, input: dict) -> str:
-        self.space = ensure_space(self)
-        self.definitions: Partitions = ensure_partitions(self, self.space)
-        self.tested: set[str] = set()
-        self.sizes = partition_sizes(self.manager, self.definitions, self.space)
-        self.estimates = estimated_sizes(self.manager, self.definitions, self.space)
-        self.predicates = {p: {k: c.entities for k, c in counts.items()}
-                           for p, counts in predicate_coverage(self.manager, self.definitions, self.space).items()}
-        self.types = type_coverage(self.manager, self.definitions, self.space)
-        self.stats = size_stats(self)
-        # without finish: the partitions with entities
-        self.default = self.with_partitions({n: d for n, d in self.definitions.items() if self.sizes.get(n)})
-        sections = [self.format_sizes()]
-        for name in self.definitions:
-            size = self.sizes.get(name, 0)
-            if not size:
-                continue
-            lines = [f"Partition {name} ({size_text(self, name)}). Examples:",
-                     *entity_examples(self, self.definitions, self.space, f'FILTER(?partition = "{name}")', 3)]
-            outside, size_outside = complement(self.predicates, self.sizes, name)
-            lines.append("Predicates (share of entities with the predicate):")
-            lines += format_features(self.predicates.get(name, {}), size, outside, size_outside, "other partitions")
-            outside, size_outside = complement(self.types, self.sizes, name)
-            if self.types.get(name):
-                lines.append("Types:")
-                lines += format_features(self.types[name], size, outside, size_outside, "other partitions")[:5]
-            sections.append("\n".join(lines))
-        return "\n\n".join(sections)
 
-    def format_sizes(self) -> str:
-        lines = []
-        for name, definition in self.definitions.items():
-            how = ("by kind" if definition.membership is None
-                   else f"{definition.origin.value}{' from ' + definition.parent if definition.parent else ''}: "
-                        f"{{ {definition.membership} }}")
-            excluded = " [excluded]" if definition.excluded else ""
-            lines.append(f"  {name}: {size_text(self, name)} ({how}){excluded}")
-        if self.sizes.get(UNCATEGORIZED):
-            lines.append(f"  {UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} entities (no partition matches)")
-        return "Partitions in order (an entity belongs to the first that matches):\n" + "\n".join(lines)
+def valid_name(name: str, unit: str) -> str:
+    if not NAME.match(name or "") or name in (UNCATEGORIZED, ALL):
+        raise FunctionCallException(f"Invalid {unit} name {name!r}: lower case letters, digits and _")
+    return name
 
-    def with_partitions(self, definitions: Partitions) -> KgProfile:
-        """The input profile with these partitions; profiles of kept partitions stay."""
-        old = self.input_profile.partitions
-        partitions = {
-            name: (old[name].model_copy(update={"definition": d}) if name in old else PartitionProfile(definition=d))
-            for name, d in definitions.items()
-        }
-        return self.input_profile.model_copy(update={"entity_space": self.space, "partitions": partitions}, deep=True)
 
-    def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
-        membership = {"type": "string", "description": (
-            "SPARQL group pattern over ?entity, e.g. ?entity <http://example.org/p> ?v")}
-        return [
-            ({
-                "name": "test_partition",
-                "description": (
-                    "Tests a membership pattern: how many entities of the entity space match, in which "
-                    "current partitions they are, which predicates and types distinguish them from the "
-                    "rest of the partition they overlap most (or compare_with), and examples. A pattern "
-                    "must be tested before it can be set."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"membership": membership,
-                                   "compare_with": {"type": "string", "description": "Partition to compare with."}},
-                    "required": ["membership"],
-                    "additionalProperties": False,
-                },
-            }, self.test_partition),
-            ({
-                "name": "set_partition",
-                "description": (
-                    "Defines a partition by a tested membership pattern, or redefines an existing one. "
-                    "With parent, it is split from that partition and placed before it; a new partition "
-                    "without parent is placed first. Shows the partition sizes afterwards."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "A short lower case noun for the group."},
-                        "membership": membership,
-                        "parent": {"type": "string"},
-                        "features": {"type": "string", "description": "What distinguishes its entities."},
-                    },
-                    "required": ["name", "membership", "features"],
-                    "additionalProperties": False,
-                },
-            }, self.set_partition),
-            ({
-                "name": "exclude_partition",
-                "description": ("Excludes a partition from the alignment (entities that would not be matched for this "
-                                "task), or includes it again."),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}, "reason": {"type": "string"},
-                                   "excluded": {"type": "boolean", "default": True}},
-                    "required": ["name", "reason"],
-                    "additionalProperties": False,
-                },
-            }, self.exclude_partition),
-            ({
-                "name": "remove_partition",
-                "description": "Removes a partition you defined; its entities fall to the next matching partition.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"],
-                    "additionalProperties": False,
-                },
-            }, self.remove_partition),
-        ]
+class GroupingStageTask(ProfileStageTask):
+    """Stages b1 and b2: definitions of partitions or groups by membership
+    patterns, tested before they are set, with sizes and distinguishing
+    features. Subclasses say how the definitions form a Grouping."""
+    unit: str  # "partition" or "group", in texts for the model
+    space: list[str]
+    definitions: dict  # name -> Partition or GroupDefinition, in order
+    tested: set[str]
+    sizes: dict[str, int]
+    estimates: dict[str, int]
+    predicates: dict[str, dict[str, int]]
+    types: dict[str, dict[str, int]]
 
-    def known_partition(self, name: str | None) -> str:
-        if name not in self.definitions:
-            raise FunctionCallException(f"Unknown partition {name}; partitions: {', '.join(self.definitions)}")
+    def grouping(self) -> Grouping:
+        raise NotImplementedError
+
+    def names(self) -> list[str]:
+        raise NotImplementedError
+
+    def outside(self, kind: str, name: str) -> tuple[dict[str, int], int]:
+        """Counts of predicates or types (kind) and size of the entities outside one partition or group."""
+        raise NotImplementedError
+
+    def update_statistics(self) -> None:
+        grouping = self.grouping()
+        try:
+            self.sizes = group_sizes(self.manager, grouping, self.space)
+            self.estimates = estimated_sizes(self.manager, grouping, self.space)
+            self.predicates = {p: {k: c.entities for k, c in counts.items()}
+                               for p, counts in predicate_coverage(self.manager, grouping, self.space).items()}
+            self.types = type_coverage(self.manager, grouping, self.space)
+        except Exception as e:
+            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+
+    def describe_member(self, name: str, title: str) -> str:
+        size = self.sizes.get(name, 0)
+        lines = [f"{title} ({size_text(self, name)}). Examples:",
+                 *entity_examples(self, self.grouping(), self.space, f'FILTER(?group = "{name}")', 3)]
+        outside, size_outside = self.outside("predicates", name)
+        lines.append("Predicates (share of entities with the predicate):")
+        lines += format_features(self.predicates.get(name, {}), size, outside, size_outside, f"other {self.unit}s")
+        if self.types.get(name):
+            outside, size_outside = self.outside("types", name)
+            lines.append("Types:")
+            lines += format_features(self.types[name], size, outside, size_outside, f"other {self.unit}s")[:5]
+        return "\n".join(lines)
+
+    def update_definitions(self, definitions: dict) -> None:
+        """Sets the definitions (self.definitions) and their statistics; on a failed query, nothing changes."""
+        old = self.definitions
+        self.definitions = definitions
+        try:
+            self.update_statistics()
+        except FunctionCallException:
+            self.definitions = old
+            raise
+
+    def known_name(self, name: str | None) -> str:
+        if name not in self.names():
+            raise FunctionCallException(f"Unknown {self.unit} {name}; {self.unit}s: {', '.join(self.names())}")
         return name
 
-    def test_partition(self, fn_args: dict) -> str:
-        membership = (fn_args.get("membership") or "").strip()
-        if "?entity" not in membership:
-            raise FunctionCallException("The membership pattern must use ?entity")
+    def test_definition(self, fn_args: dict) -> str:
+        membership = membership_argument(fn_args)
         try:
-            overlap = membership_overlap(self.manager, self.definitions, self.space, membership)
+            size, overlap = membership_overlap(self.manager, self.grouping(), self.space, membership)
             inside, inside_types = member_coverage(self.manager, self.space, membership)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
-        size = sum(overlap.values())
         self.tested.add(membership)
         if not size:
             return "No entity of the entity space matches."
@@ -434,17 +413,18 @@ class PartitionsTask(ProfileStageTask):
             size_line = f"{size} entities match; "
         compare = fn_args.get("compare_with")
         if compare is not None:
-            self.known_partition(compare)
+            self.known_name(compare)
         else:
             compare = max((p for p in overlap if p in self.sizes), key=overlap.get, default=None)
-        lines = [size_line + "by current partition: "
+        where = f"by current {self.unit} (share of the {self.unit} that matches)"
+        lines = [size_line + where + ": "
                  + ", ".join(f"{p} {share(n, self.sizes.get(p, 0))}" for p, n in sorted(overlap.items(), key=lambda x: -x[1]))]
         if compare is not None:
-            rest = self.sizes.get(compare, 0) - overlap.get(compare, 0)
+            rest_size = self.sizes.get(compare, 0) - overlap.get(compare, 0)
             for title, counts, ins in (("Predicates", self.predicates, inside), ("Types", self.types, inside_types)):
                 outside = {k: max(0, n - ins.get(k, 0)) for k, n in counts.get(compare, {}).items()}
                 lines.append(f"{title} (share of the matches vs. the rest of {compare}):")
-                lines += format_features(ins, size, outside, rest, f"rest of {compare}")[:NUM_FEATURES if title == "Predicates" else 5]
+                lines += format_features(ins, size, outside, rest_size, f"rest of {compare}")[:NUM_FEATURES if title == "Predicates" else 5]
         lines.append("Examples:")
         names = sparql_path(LABEL_PREDICATES)
         rows = run_rows(self.manager, (
@@ -455,77 +435,189 @@ class PartitionsTask(ProfileStageTask):
                   for r in rows if "entity" in r]
         return "\n".join(lines)
 
-    def set_partition(self, fn_args: dict) -> str:
-        name = fn_args.get("name") or ""
-        membership = (fn_args.get("membership") or "").strip()
-        parent = fn_args.get("parent")
-        if not PARTITION_NAME.match(name) or name == UNCATEGORIZED:
-            raise FunctionCallException(f"Invalid partition name {name!r}: lower case letters, digits and _")
+    def checked_membership(self, fn_args: dict) -> str:
+        membership = membership_argument(fn_args)
         if membership not in self.tested:
-            raise FunctionCallException("Test the membership pattern with test_partition first (exactly this pattern)")
-        if parent is not None and (self.known_partition(parent) == name):
-            raise FunctionCallException("A partition cannot be split from itself")
-        definition = PartitionDefinition(
-            membership=membership, parent=parent, features=fn_args.get("features") or "",
-            origin=PartitionOrigin.SPLIT if parent else PartitionOrigin.REDEFINED,
-        )
+            raise FunctionCallException(f"Test the membership pattern with test_{self.unit} first (exactly this pattern)")
+        return membership
+
+
+def test_function(unit: str, description: str) -> dict:
+    return {
+        "name": f"test_{unit}",
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {"membership": MEMBERSHIP,
+                           "compare_with": {"type": "string", "description": f"The {unit} to compare with."}},
+            "required": ["membership"],
+            "additionalProperties": False,
+        },
+    }
+
+
+MEMBERSHIP = {"type": "string", "description": (
+    "SPARQL group pattern over ?entity, e.g. ?entity <http://example.org/p> ?v")}
+
+
+# --- b1. partitions ----------------------------------------------------------------
+
+class PartitionsTask(GroupingStageTask):
+    name = "om-profile-partitions"
+    stage = Stage.PARTITIONS
+    prompt_file = "profile_partitions.txt"
+    unit = "partition"
+
+    def prepare(self, input: dict) -> str:
+        self.space = ensure_space(self)
+        self.definitions = ensure_partitions(self, self.space)
+        self.separations = (list(self.input_profile.separations) if self.input_profile.partitions
+                            else default_separations(self.definitions))
+        self.tested = set()
+        self.update_statistics()
+        self.stats = size_stats(self)
+        self.default = self.with_partitions()
+        sections = [self.format_sizes(), self.format_separations()]
+        for name in self.names() + [UNCATEGORIZED]:
+            if self.sizes.get(name):
+                title = (f"Partition {name}" if name != UNCATEGORIZED
+                         else f"Subjects that match no partition, {UNCATEGORIZED}, not aligned")
+                sections.append(self.describe_member(name, title))
+        return "\n\n".join(sections)
+
+    def grouping(self) -> Grouping:
+        # the subjects outside all partitions only in a small KG (a large one is not scanned)
+        return partition_grouping(self.definitions, rest=not self.input_profile.large)
+
+    def names(self) -> list[str]:
+        return list(self.definitions)
+
+    def outside(self, kind: str, name: str) -> tuple[dict[str, int], int]:
+        return complement(getattr(self, kind), self.sizes, name)
+
+    def format_sizes(self) -> str:
+        lines = [f"  {name}: {size_text(self, name)}: {{ {d.membership_sparql} }}"
+                 + (f"; {d.features}" if d.features else "") for name, d in self.definitions.items()]
+        if self.sizes.get(UNCATEGORIZED):
+            lines.append(f"  {UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} subjects match no partition")
+        return "Partitions in order (an entity belongs to the first that matches):\n" + "\n".join(lines)
+
+    def format_separations(self) -> str:
+        if not self.separations:
+            return "Partitions that do not compete with each other: none (all compete)."
+        return "Partitions that do not compete with each other:\n" + "\n".join(
+            f"  {s.a} - {s.b}" + (f": {s.reason}" if s.reason else "") for s in self.separations)
+
+    def with_partitions(self) -> KgProfile:
+        """The input profile with the partitions that have entities and their separations."""
+        kept = {name: d for name, d in self.definitions.items() if self.sizes.get(name)}
+        separations = [s for s in self.separations if s.pair() <= set(kept)]
+        return self.input_profile.model_copy(update={
+            "entity_space": self.space, "partitions": kept, "separations": separations}, deep=True)
+
+    def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
+        return [
+            (test_function("partition", (
+                "Tests a membership pattern: how many entities of the entity space match, in which "
+                "current partitions they are, which predicates and types distinguish them from the "
+                "rest of the partition they overlap most (or compare_with), and examples. A pattern "
+                "must be tested before it can be set.")), self.test_definition),
+            ({
+                "name": "set_partition",
+                "description": (
+                    "Defines a partition by a tested membership pattern, or redefines an existing one "
+                    "(it keeps its place). A new partition is placed before the partition named in "
+                    "before, otherwise first. Shows the partition sizes afterwards."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "A short lower case noun for the kind."},
+                        "membership": MEMBERSHIP,
+                        "features": {"type": "string", "description": "What distinguishes its entities."},
+                        "before": {"type": "string"},
+                    },
+                    "required": ["name", "membership", "features"],
+                    "additionalProperties": False,
+                },
+            }, self.set_partition),
+            ({
+                "name": "remove_partition",
+                "description": "Removes a partition; its entities fall to the next matching partition.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            }, self.remove_partition),
+            ({
+                "name": "set_competition",
+                "description": (
+                    "Sets whether the entities of two partitions compete with each other: if not, an "
+                    "entity of one is never a candidate or a rival for an entity of the other."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "string"}, "b": {"type": "string"},
+                        "compete": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["a", "b", "compete", "reason"],
+                    "additionalProperties": False,
+                },
+            }, self.set_competition),
+        ]
+
+    def set_partition(self, fn_args: dict) -> str:
+        name = valid_name(fn_args.get("name"), self.unit)
+        membership = self.checked_membership(fn_args)
+        before = fn_args.get("before")
+        if before is not None and self.known_name(before) == name:
+            raise FunctionCallException("A partition cannot be placed before itself")
+        definition = Partition(membership_sparql=membership, features=fn_args.get("features") or "")
         items = [(n, d) for n, d in self.definitions.items() if n != name]
         if name in self.definitions:
             index = list(self.definitions).index(name)
-        elif parent is not None:
-            index = [n for n, _ in items].index(parent)
+        elif before is not None:
+            index = [n for n, _ in items].index(before)
         else:
             index = 0
         items.insert(index, (name, definition))
         self.update_definitions(dict(items))
         return f"Partition {name} set.\n{self.format_sizes()}"
 
-    def exclude_partition(self, fn_args: dict) -> str:
-        name = self.known_partition(fn_args.get("name"))
-        definition = self.definitions[name]
-        excluded = fn_args.get("excluded", True)
-        reason = fn_args.get("reason") or ""
-        features = definition.features
-        if excluded and reason:
-            features = f"{features}; excluded: {reason}" if features else f"excluded: {reason}"
-        self.definitions[name] = definition.model_copy(update={"excluded": excluded, "features": features})
-        return f"Partition {name} {'excluded' if excluded else 'included'}.\n{self.format_sizes()}"
-
     def remove_partition(self, fn_args: dict) -> str:
-        name = self.known_partition(fn_args.get("name"))
-        if self.definitions[name].origin == PartitionOrigin.DEFAULT:
-            raise FunctionCallException(f"{name} is a default partition; exclude it or redefine it instead")
+        name = self.known_name(fn_args.get("name"))
+        if len(self.definitions) == 1:
+            raise FunctionCallException("The last partition cannot be removed")
         self.update_definitions({n: d for n, d in self.definitions.items() if n != name})
+        self.separations = [s for s in self.separations if name not in s.pair()]
         return f"Partition {name} removed.\n{self.format_sizes()}"
 
-    def update_definitions(self, definitions: Partitions) -> None:
-        sizes = run_sizes(self, definitions, self.space)
-        self.definitions, self.sizes = definitions, sizes
-        self.estimates = estimated_sizes(self.manager, definitions, self.space)
-        try:
-            self.predicates = {p: {k: c.entities for k, c in counts.items()}
-                               for p, counts in predicate_coverage(self.manager, definitions, self.space).items()}
-            self.types = type_coverage(self.manager, definitions, self.space)
-        except Exception as e:
-            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+    def set_competition(self, fn_args: dict) -> str:
+        a, b = self.known_name(fn_args.get("a")), self.known_name(fn_args.get("b"))
+        if a == b:
+            raise FunctionCallException("Entities of one partition always compete with each other")
+        self.separations = [s for s in self.separations if s.pair() != {a, b}]
+        if not fn_args.get("compete"):
+            self.separations.append(Separation(a=a, b=b, reason=fn_args.get("reason") or ""))
+        return self.format_separations()
 
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
-        kept = {name: d for name, d in self.definitions.items() if self.sizes.get(name)}
-        if not kept:
+        profile = self.with_partitions()
+        if not profile.partitions:
             raise FunctionCallException("No partition has entities")
         self.stats = size_stats(self)
-        dropped = [name for name in self.definitions if name not in kept]
-        summary = "Partitions: " + ", ".join(f"{n} {self.stats['sizes'].get(n, 0)}" for n in kept)
+        dropped = [name for name in self.definitions if name not in profile.partitions]
+        summary = "Partitions: " + ", ".join(f"{n} {self.stats['sizes'].get(n, 0)}" for n in profile.partitions)
         if dropped:
             summary += f"; dropped as empty: {', '.join(dropped)}"
-        return self.with_partitions(kept), summary
+        return profile, summary
 
 
 # --- c. KG-wide roles ----------------------------------------------------------------
-
-def active_partitions(profile: KgProfile) -> list[str]:
-    return [name for name, p in profile.partitions.items() if not p.definition.excluded]
-
 
 def format_values(values: int, literals: int, blanks: int) -> str:
     """Kinds of the values (objects) of a predicate."""
@@ -540,27 +632,27 @@ def format_values(values: int, literals: int, blanks: int) -> str:
 
 
 def format_predicate_overview(coverage: dict[str, dict[str, Coverage]], sizes: dict[str, int],
-                              partitions: list[str], roles: Roles, k: int) -> str:
+                              members: list[str], roles: Roles, k: int) -> str:
     """The predicates with the highest coverage in some partition: the share of
     each partition's entities that are its subject (as ?s), the kinds of its
     values (?o) over these partitions, and the role it has."""
     in_role = {key[2]: key[0] for key in role_elements(roles) if key[1] == "predicate"}
     best: dict[str, float] = {}
-    for p in partitions:
+    for p in members:
         for predicate, c in coverage.get(p, {}).items():
             if sizes.get(p):
                 best[predicate] = max(best.get(predicate, 0.0), c.entities / sizes[p])
     lines = []
     for predicate in sorted(best, key=lambda x: -best[x])[:k]:
-        per_partition = []
+        per_member = []
         values = literals = blanks = 0
-        for p in partitions:
+        for p in members:
             c = coverage.get(p, {}).get(predicate)
             if c is not None:
-                per_partition.append(f"{p} {c.entities / sizes[p]:.0%}")
+                per_member.append(f"{p} {c.entities / sizes[p]:.0%}")
                 values, literals, blanks = values + c.values, literals + c.literals, blanks + c.blanks
         role = f" [{in_role[predicate]}]" if predicate in in_role else ""
-        lines.append(f"  {short_iri(predicate)}{role}  as ?s: {', '.join(per_partition)}"
+        lines.append(f"  {short_iri(predicate)}{role}  as ?s: {', '.join(per_member)}"
                      f"  |  values: {format_values(values, literals, blanks)}")
     return "\n".join(lines)
 
@@ -569,28 +661,28 @@ class RolesTask(RoleEditingTask):
     name = "om-profile-roles"
     stage = Stage.ROLES
     prompt_file = "profile_roles.txt"
+    unit = "partition"
 
     def prepare(self, input: dict) -> str:
         self.space = ensure_space(self)
         profile = self.input_profile
         if not profile.partitions:
-            profile = profile.model_copy(update={"partitions": {
-                n: PartitionProfile(definition=d) for n, d in ensure_partitions(self, self.space).items()}})
-        self.partitions = {name: p.definition for name, p in profile.partitions.items()}
-        self.scope = active_partitions(profile)
-        self.sizes = partition_sizes(self.manager, self.partitions, self.space)
-        self.estimates = estimated_sizes(self.manager, self.partitions, self.space)
+            profile = profile.model_copy(update={"partitions": ensure_partitions(self, self.space)})
+        self.grouping = partition_grouping(profile.partitions, rest=False)
+        self.scope = list(profile.partitions)
+        self.sizes = group_sizes(self.manager, self.grouping, self.space)
+        self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
         sides: dict[str, Sides] = {}
-        usage = element_usage(self.manager, self.partitions, self.space, canon_roles(), sides)
+        usage = element_usage(self.manager, self.grouping, self.space, canon_roles(), sides)
         default = default_roles(usage, self.sizes, self.scope)
         self.init_roles(default, usage, sides, canon_roles())
-        coverage = predicate_coverage(self.manager, self.partitions, self.space)
+        coverage = predicate_coverage(self.manager, self.grouping, self.space)
         self.stats = size_stats(self)
         self.default = profile.model_copy(update={"entity_space": self.space, "roles": default}, deep=True)
         canon = ", ".join(short_iri(key[2]) if key[1] == "predicate" else key[2]
                           for key in role_elements(canon_roles()))
         return "\n\n".join([
-            "Partitions in scope: " + ", ".join(f"{p} ({size_text(self, p)})" for p in self.scope),
+            "Partitions: " + ", ".join(f"{p} ({size_text(self, p)})" for p in self.scope),
             f"Default canon checked: {canon}. Canon elements below "
             "1% coverage in every partition are left out of the default.",
             "Default roles (coverage as ?s per partition):\n" + self.format_roles(default),
@@ -612,40 +704,242 @@ class RolesTask(RoleEditingTask):
         return profile, "Changed: " + (", ".join(changed) or "nothing (default roles)")
 
 
-# --- d. one partition ----------------------------------------------------------------
+# --- b2. groups ----------------------------------------------------------------------
 
-def partition_name_stats(manager: KgManager, partitions: Partitions, space: list[str],
-                         partition: str, roles: Roles) -> LocalNameStats:
-    sample = sample_entities(manager, partitions, space, where=f'FILTER(?partition = "{partition}")')
-    return local_name_stats(manager, sample.get(partition, []), roles.names)
+# exclude_group warns if the excluded groups cover more of the entity space
+LARGE_EXCLUSION_SHARE = 0.5
 
 
-def partition_defaults(manager: KgManager, profile: KgProfile, partition: str
-                       ) -> tuple[PartitionProfile, LocalNameStats]:
-    """Profile of a partition without LLM: the local name type from its sample, its delta unchanged."""
-    partitions = {name: p.definition for name, p in profile.partitions.items()}
-    current = profile.partitions[partition]
-    usage = element_usage(manager, partitions, profile.entity_space, profile.roles).get(partition, {})
+class GroupsTask(GroupingStageTask):
+    """Input besides kg and profile: partner_profile, the profile of the other
+    KG of the task (optional; shown to the model if given)."""
+    name = "om-profile-groups"
+    stage = Stage.GROUPS
+    prompt_file = "profile_groups.txt"
+    unit = "group"
+
+    def prepare(self, input: dict) -> str:
+        self.space = ensure_space(self)
+        self.definitions = ensure_groups(self, self.space)
+        self.tested = set()
+        self.update_statistics()
+        self.stats = size_stats(self)
+        self.default = self.with_groups()
+        sections = []
+        partner = input.get("partner_profile")
+        if partner:
+            notes = describe_profile(KgProfile.model_validate(partner))
+            sections.append(format_section("Profile of the other knowledge graph of the task",
+                                           "\n".join(f"- {n}" for n in notes)))
+        sections.append(self.format_sizes())
+        for name in self.names():
+            if self.sizes.get(name):
+                sections.append(self.describe_member(name, f"Group {name}"))
+        return "\n\n".join(sections)
+
+    def grouping(self) -> Grouping:
+        return group_grouping(self.definitions)
+
+    def names(self) -> list[str]:
+        return list(self.definitions)
+
+    def update_statistics(self) -> None:
+        super().update_statistics()
+        # all entities in any group, to compare a group with the rest
+        merged = self.grouping().merged(ALL)
+        try:
+            self.all_size = group_sizes(self.manager, merged, self.space).get(ALL, 0)
+            self.all_predicates = {p: c.entities for p, c in
+                                   predicate_coverage(self.manager, merged, self.space).get(ALL, {}).items()}
+            self.all_types = type_coverage(self.manager, merged, self.space).get(ALL, {})
+        except Exception as e:
+            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+
+    def outside(self, kind: str, name: str) -> tuple[dict[str, int], int]:
+        total = self.all_predicates if kind == "predicates" else self.all_types
+        return rest(total, self.all_size, getattr(self, kind).get(name, {}), self.sizes.get(name, 0))
+
+    def format_sizes(self) -> str:
+        lines = []
+        for name, d in self.definitions.items():
+            notes = [d.origin.value] + ([f"part of {d.parent}"] if d.parent else [])
+            excluded = " [excluded]" if d.excluded else ""
+            lines.append(f"  {name}: {size_text(self, name)} ({', '.join(notes)}): {{ {d.membership_sparql} }}"
+                         + (f"; {d.features}" if d.features else "") + excluded)
+        return (f"Groups ({self.all_size} entities in any group; groups may overlap):\n" + "\n".join(lines))
+
+    def with_groups(self) -> KgProfile:
+        """The input profile with the groups that have entities; profiles of kept groups stay."""
+        old = self.input_profile.groups
+        groups = {
+            name: (old[name].model_copy(update={"definition": d}) if name in old else GroupProfile(definition=d))
+            for name, d in self.definitions.items() if self.sizes.get(name)
+        }
+        return self.input_profile.model_copy(update={"entity_space": self.space, "groups": groups}, deep=True)
+
+    def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
+        return [
+            (test_function("group", (
+                "Tests a membership pattern: how many entities of the entity space match, how much of "
+                "each current group they cover, which predicates and types distinguish them from the "
+                "rest of the group they overlap most (or compare_with), and examples. A pattern must "
+                "be tested before it can be set.")), self.test_definition),
+            ({
+                "name": "set_group",
+                "description": (
+                    "Defines a group by a tested membership pattern, or redefines an existing one. "
+                    "Groups may overlap. Shows the group sizes afterwards."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "A short lower case noun for the group."},
+                        "membership": MEMBERSHIP,
+                        "features": {"type": "string",
+                                     "description": "What distinguishes its entities, so that they can be recognized."},
+                        "parent": {"type": "string", "description": "A group it is part of, if one."},
+                    },
+                    "required": ["name", "membership", "features"],
+                    "additionalProperties": False,
+                },
+            }, self.set_group),
+            ({
+                "name": "exclude_group",
+                "description": ("Excludes a group from the alignment (entities that would not be matched for this "
+                                "task), or includes it again. An entity in an excluded group is not aligned, even "
+                                "if it is in other groups too."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "reason": {"type": "string"},
+                                   "excluded": {"type": "boolean", "default": True}},
+                    "required": ["name", "reason"],
+                    "additionalProperties": False,
+                },
+            }, self.exclude_group),
+            ({
+                "name": "remove_group",
+                "description": ("Removes a group. Its entities stay in their other groups; those in no other group "
+                                "are no longer aligned."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            }, self.remove_group),
+        ]
+
+    def set_group(self, fn_args: dict) -> str:
+        name = valid_name(fn_args.get("name"), self.unit)
+        membership = self.checked_membership(fn_args)
+        parent = fn_args.get("parent")
+        if parent is not None and self.known_name(parent) == name:
+            raise FunctionCallException("A group cannot be part of itself")
+        old = self.definitions.get(name)
+        definition = GroupDefinition(membership_sparql=membership, parent=parent, features=fn_args.get("features") or "",
+                                     excluded=old.excluded if old else False)
+        self.update_definitions({**self.definitions, name: definition})
+        return f"Group {name} set.\n{self.format_sizes()}"
+
+    def excluded_share(self, definitions: dict[str, GroupDefinition]) -> float:
+        excluded = [name for name, d in definitions.items() if d.excluded]
+        if not excluded or not self.all_size:
+            return 0.0
+        grouping = Grouping(tuple(("excluded", definitions[n].membership_sparql) for n in excluded), exclusive=True)
+        return group_sizes(self.manager, grouping, self.space).get("excluded", 0) / self.all_size
+
+    def exclude_group(self, fn_args: dict) -> str:
+        name = self.known_name(fn_args.get("name"))
+        excluded = fn_args.get("excluded", True)
+        definitions = {**self.definitions, name: self.definitions[name].model_copy(update={"excluded": excluded})}
+        if excluded and all(d.excluded for d in definitions.values()):
+            raise FunctionCallException("Not every group can be excluded: nothing would be aligned. To exclude "
+                                        "part of a group, define that part as a group of its own and exclude it.")
+        reason = fn_args.get("reason") or ""
+        if excluded and reason:
+            features = definitions[name].features
+            definitions[name] = definitions[name].model_copy(
+                update={"features": f"{features}; excluded: {reason}" if features else f"excluded: {reason}"})
+        self.definitions = definitions
+        try:
+            excluded_share = self.excluded_share(definitions)
+        except Exception as e:
+            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+        result = f"Group {name} {'excluded' if excluded else 'included'}; {excluded_share:.0%} of the entities in groups are excluded now."
+        if excluded and excluded_share > LARGE_EXCLUSION_SHARE:
+            result += (" This is a large part. Exclude only entities that would not be matched for this task; "
+                       "to exclude part of a group, define that part as a group of its own and exclude it.")
+        return f"{result}\n{self.format_sizes()}"
+
+    def remove_group(self, fn_args: dict) -> str:
+        name = self.known_name(fn_args.get("name"))
+        if len(self.definitions) == 1:
+            raise FunctionCallException("The last group cannot be removed")
+        membership = self.definitions[name].membership_sparql
+        remaining = {n: d for n, d in self.definitions.items() if n != name}
+        try:
+            size, overlap = membership_overlap(self.manager, group_grouping(remaining), self.space, membership)
+        except Exception as e:
+            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+        self.update_definitions(remaining)
+        alone = overlap.get(UNCATEGORIZED, 0)
+        return (f"Group {name} removed; {share(alone, size)} of its entities are in no other group and are no "
+                f"longer aligned.\n{self.format_sizes()}")
+
+    def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
+        profile = self.with_groups()
+        if not profile.groups:
+            raise FunctionCallException("No group has entities")
+        if all(g.definition.excluded for g in profile.groups.values()):
+            raise FunctionCallException("Every group is excluded: nothing would be aligned")
+        self.stats = size_stats(self)
+        dropped = [name for name in self.definitions if name not in profile.groups]
+        summary = "Groups: " + ", ".join(
+            f"{n} {self.stats['sizes'].get(n, 0)}" + (" (excluded)" if g.definition.excluded else "")
+            for n, g in profile.groups.items())
+        if dropped:
+            summary += f"; dropped as empty: {', '.join(dropped)}"
+        return profile, summary
+
+
+# --- d. one group --------------------------------------------------------------------
+
+def single_grouping(profile: KgProfile, group: str) -> Grouping:
+    """The grouping of one group only: stage d looks at no other group."""
+    return Grouping(((group, profile.groups[group].definition.membership_sparql),), exclusive=False)
+
+
+def group_name_stats(manager: KgManager, grouping: Grouping, space: list[str], group: str,
+                     roles: Roles) -> LocalNameStats:
+    sample = sample_entities(manager, grouping, space, where=f'FILTER(?group = "{group}")')
+    return local_name_stats(manager, sample.get(group, []), roles.names)
+
+
+def group_defaults(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupProfile, LocalNameStats]:
+    """Profile of a group without LLM: the local name type from its sample, its delta unchanged."""
+    grouping = single_grouping(profile, group)
+    current = profile.groups[group]
+    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
-    stats = partition_name_stats(manager, partitions, profile.entity_space, partition, effective)
+    stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
     return current.model_copy(update={"local_name_type": local_name_type(stats)}, deep=True), stats
 
 
-# stage d runs in full mode for a partition with at least MIN_UNASSIGNED
-# predicates without a role, each covering MIN_UNASSIGNED_SHARE of its entities
-# as subject (vocabulary predicates such as rdf:type not counted), or for a
-# partition formed in stage b; otherwise in light mode
+# stage d runs in full mode for a group with at least MIN_UNASSIGNED predicates
+# without a role, each covering MIN_UNASSIGNED_SHARE of its entities as subject
+# (vocabulary predicates such as rdf:type not counted), or for a group formed in
+# stage b2; otherwise in light mode
 MIN_UNASSIGNED = 3
 MIN_UNASSIGNED_SHARE = 0.05
 
 
-class PartitionMode(StrEnum):
-    FULL = "full"    # roles of the partition, findings
-    LIGHT = "light"  # mainly matching pitfalls of the partition as findings
+class GroupMode(StrEnum):
+    FULL = "full"    # roles of the group, findings
+    LIGHT = "light"  # mainly matching pitfalls of the group as findings
 
 
 def unassigned_predicates(roles: Roles, coverage: dict[str, Coverage]) -> list[tuple[str, Coverage]]:
-    """Predicates of a partition in no element of its roles (as predicate or
+    """Predicates of a group in no element of its roles (as predicate or
     inside a pattern), most frequent first."""
     elements = role_elements(roles)
     predicates = {key[2] for key in elements if key[1] == "predicate"}
@@ -654,78 +948,79 @@ def unassigned_predicates(roles: Roles, coverage: dict[str, Coverage]) -> list[t
     return [(p, c) for p, c in sorted(coverage.items(), key=lambda x: -x[1].entities) if not covered(p)]
 
 
-def partition_mode(manager: KgManager, profile: KgProfile, partition: str) -> tuple[PartitionMode, list[str]]:
-    """(mode of stage d for a partition, the unassigned predicates that count)."""
-    partitions = {name: p.definition for name, p in profile.partitions.items()}
-    current = profile.partitions[partition]
-    usage = element_usage(manager, partitions, profile.entity_space, profile.roles).get(partition, {})
+def group_mode(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupMode, list[str]]:
+    """(mode of stage d for a group, the unassigned predicates that count)."""
+    grouping = single_grouping(profile, group)
+    current = profile.groups[group]
+    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
-    coverage = predicate_coverage(manager, partitions, profile.entity_space).get(partition, {})
-    size = partition_sizes(manager, partitions, profile.entity_space).get(partition, 0)
+    coverage = predicate_coverage(manager, grouping, profile.entity_space).get(group, {})
+    size = group_sizes(manager, grouping, profile.entity_space).get(group, 0)
     counted = [p for p, c in unassigned_predicates(effective, coverage)
                if not p.startswith(VOCABULARY) and size and c.entities / size >= MIN_UNASSIGNED_SHARE]
-    formed = current.definition.origin != PartitionOrigin.DEFAULT
-    return (PartitionMode.FULL if formed or len(counted) >= MIN_UNASSIGNED else PartitionMode.LIGHT), counted
+    formed = current.definition.origin == GroupOrigin.FORMED
+    return (GroupMode.FULL if formed or len(counted) >= MIN_UNASSIGNED else GroupMode.LIGHT), counted
 
 
-class PartitionTask(RoleEditingTask):
-    name = "om-profile-partition"
-    stage = Stage.PARTITION
-    prompt_file = "profile_partition.txt"
-    prompt_files = {PartitionMode.FULL: "profile_partition.txt", PartitionMode.LIGHT: "profile_partition_light.txt"}
+class GroupTask(RoleEditingTask):
+    name = "om-profile-group"
+    stage = Stage.GROUP
+    prompt_file = "profile_group.txt"
+    prompt_files = {GroupMode.FULL: "profile_group.txt", GroupMode.LIGHT: "profile_group_light.txt"}
+    unit = "group"
 
     def prepare(self, input: dict) -> str:
         profile = self.input_profile
-        self.partition = input.get("partition")
-        self.mode = PartitionMode(input.get("mode") or PartitionMode.FULL)
+        self.group = input.get("group")
+        self.mode = GroupMode(input.get("mode") or GroupMode.FULL)
         self.prompt_file = self.prompt_files[self.mode]
-        if self.partition not in profile.partitions:
-            raise ValueError(f"Unknown partition {self.partition}; partitions: {', '.join(profile.partitions)}")
+        if self.group not in profile.groups:
+            raise ValueError(f"Unknown group {self.group}; groups: {', '.join(profile.groups)}")
         self.space = list(profile.entity_space)
-        self.partitions = {name: p.definition for name, p in profile.partitions.items()}
-        self.scope = [self.partition]
-        self.sizes = partition_sizes(self.manager, self.partitions, self.space)
-        self.estimates = estimated_sizes(self.manager, self.partitions, self.space)
-        current = profile.partitions[self.partition]
+        self.grouping = single_grouping(profile, self.group)
+        self.scope = [self.group]
+        self.sizes = group_sizes(self.manager, self.grouping, self.space)
+        self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
+        current = profile.groups[self.group]
         sides: dict[str, Sides] = {}
-        kg_usage = element_usage(self.manager, self.partitions, self.space,
+        kg_usage = element_usage(self.manager, self.grouping, self.space,
                                  roles_from_elements(role_elements(profile.roles) | role_elements(current.added)), sides)
         self.added_keys = set(role_elements(current.added))
-        self.derived = derived_roles(profile.roles, kg_usage.get(self.partition, {}))
-        effective = effective_roles(profile.roles, current, kg_usage.get(self.partition, {}))
+        self.derived = derived_roles(profile.roles, kg_usage.get(self.group, {}))
+        effective = effective_roles(profile.roles, current, kg_usage.get(self.group, {}))
         self.init_roles(effective, kg_usage, sides, effective)
-        stats = partition_name_stats(self.manager, self.partitions, self.space, self.partition, effective)
+        stats = group_name_stats(self.manager, self.grouping, self.space, self.group, effective)
         self.name_type = local_name_type(stats)
-        self.stats = {"size": size_stats(self)["sizes"].get(self.partition, 0), "mode": self.mode.value,
+        self.stats = {"size": size_stats(self)["sizes"].get(self.group, 0), "mode": self.mode.value,
                       "local_names": stats.model_dump()}
         default = current.model_copy(update={"local_name_type": self.name_type})
-        self.default = profile.model_copy(update={"partitions": {**profile.partitions, self.partition: default}}, deep=True)
+        self.default = profile.model_copy(update={"groups": {**profile.groups, self.group: default}}, deep=True)
 
         unused = [key for key in role_elements(profile.roles) if key not in role_elements(self.derived)
                   and key not in role_elements(current.added)]
-        coverage = predicate_coverage(self.manager, self.partitions, self.space).get(self.partition, {})
-        size = self.sizes.get(self.partition, 0)
+        coverage = predicate_coverage(self.manager, self.grouping, self.space).get(self.group, {})
+        size = self.sizes.get(self.group, 0)
         others = [f"  {short_iri(p)}  as ?s: {share(c.entities, size)}  |  values: {format_values(c.values, c.literals, c.blanks)}"
                   for p, c in unassigned_predicates(effective, coverage)][:NUM_PREDICATES]
         definition = current.definition
         agreement = "–" if stats.agreement is None else f"{stats.agreement:.0%}"
         speaking = "–" if stats.speaking is None else f"{stats.speaking:.0%}"
         return "\n\n".join([
-            f"Partition {self.partition}: {size_text(self, self.partition)}"
+            f"Group {self.group}: {size_text(self, self.group)}"
             + (f"; {definition.features}" if definition.features else "")
-            + (f"; membership {{ {definition.membership} }}" if definition.membership else "; by kind"),
+            + f"; membership {{ {definition.membership_sparql} }}",
             f"Local names (sample of {stats.sample_size}, {stats.labelled} with a name): {agreement} agree with "
             f"a name, {speaking} look like words -> default local_name_type: {self.name_type.value}",
-            "Roles of this partition: the KG-wide roles used here [kg], and its own additions [partition] "
+            "Roles of this group: the KG-wide roles used here [kg], and its own additions [group] "
             "(coverage as ?s):\n" + self.format_roles(effective, self.origin),
-            "KG-wide elements not used in this partition (dropped): "
+            "KG-wide elements not used in this group (dropped): "
             + (", ".join(short_iri(k[2]) for k in unused) or "none"),
-            "Predicates of this partition's entities that have no role yet: share of its entities that "
+            "Predicates of this group's entities that have no role yet: share of its entities that "
             "are their subject (as ?s), kinds of their values (?o):\n" + ("\n".join(others) or "  none"),
         ])
 
     def origin(self, key) -> str:
-        return "partition" if key in self.added_keys else "kg"
+        return "group" if key in self.added_keys else "kg"
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.role_functions()
@@ -740,12 +1035,12 @@ class PartitionTask(RoleEditingTask):
         roles = self.checked_roles()
         added, removed = diff_roles(self.derived, roles)
         name_type = NameType(fn_args.get("local_name_type") or self.name_type)
-        current = self.default.partitions[self.partition]
+        current = self.default.groups[self.group]
         updated = current.model_copy(update={"local_name_type": name_type, "added": added, "removed": removed})
-        profile = self.default.model_copy(update={"partitions": {**self.default.partitions, self.partition: updated}}, deep=True)
+        profile = self.default.model_copy(update={"groups": {**self.default.groups, self.group: updated}}, deep=True)
         count = lambda r: len(role_elements(r))
-        return profile, (f"Partition {self.partition}: local names {name_type.value}, "
+        return profile, (f"Group {self.group}: local names {name_type.value}, "
                          f"{count(added)} elements added or overridden, {count(removed)} removed")
 
 
-PROFILE_TASKS = [SpaceTask, PartitionsTask, RolesTask, PartitionTask]
+PROFILE_TASKS = [SpaceTask, PartitionsTask, RolesTask, GroupsTask, GroupTask]

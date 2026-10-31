@@ -4,7 +4,7 @@ from typing import Callable, Iterable
 import unicodedata
 
 from grasp.tasks.om.model import (
-    UNCATEGORIZED, GroupStats, KeyAnchor, TryKeyAnchorResult, KeyEntityRow, NormalizationLevelStats, PairingGroup, PartitionGroup)
+    SIDES, UNCATEGORIZED, GroupStats, KeyAnchor, TryKeyAnchorResult, KeyEntityRow, NormalizationLevelStats, PairingGroup, PartitionGroup)
 from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
 import re
@@ -193,7 +193,7 @@ def resolve_pairing(
         return [PartitionGroup(source=frozenset([p]), target=frozenset([p])) for p in common]
 
     groups = [PartitionGroup(source=frozenset(g.source), target=frozenset(g.target)) for g in pairing]
-    for side in ("source", "target"):
+    for side in SIDES:
         seen: set[str] = set()
         for group in groups:
             partitions = getattr(group, side)

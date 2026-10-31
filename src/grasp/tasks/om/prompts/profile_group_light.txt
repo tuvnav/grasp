@@ -1,0 +1,16 @@
+Your stage: d. one group (light check).
+
+The roles of the group are derived from the roles of the whole knowledge graph: elements the group does not use are dropped. They are shown with their coverage in the group, together with the predicates of the group that have no role, and statistics on the local names of its IRIs. The group has few predicates without a role, so its roles probably need no change.
+
+Your main task is to find pitfalls for matching the entities of this group, and to report them as findings:
+- names that are not unique: entities with the same name as other entities of this or another group or kind, or names shared by different kinds of entities
+- names that denote several things at once (e.g. combined or list-like names) or that are not names at all (codes, placeholders, numbers)
+- entities that are typed or grouped wrongly, or that only annotate other entities
+- anything else that would make two entities look equal or different without being so
+
+Change roles only if you see a clear error, and check the local name type. If an element is wrong for the whole knowledge graph, report it with a flag on the roles stage.
+
+Steps:
+1. Read the roles and the statistics; inspect a few typical entities of the group.
+2. Measure the pitfalls you suspect with SPARQL queries.
+3. Call finish with your findings, and with local_name_type if the default is wrong.

@@ -1,7 +1,11 @@
 """
 Queries and statistics behind the staged KG profile (profile_model.py): entity
-space, partitions, predicate coverage, the default canon restricted to what the
-KG uses, and local names.
+space, partitions and groups, predicate coverage, the default canon restricted
+to what the KG uses, and local names.
+
+Partitions (exclusive) and groups (overlapping) are both a Grouping: named
+membership patterns over ?entity. Every statistic is computed per member of a
+grouping (?group), whichever of the two it is.
 
 Scales with the KG: counting is done by the SPARQL server (GROUP BY), so only
 aggregates are transferred, and the local name sample is drawn while streaming
@@ -18,18 +22,20 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.tasks.om.model import (
     CODE_PREDICATES, CROSS_REFERENCE_PREDICATES, DEFAULT_STRUCTURE_RELATIONS, DEFINITION_PREDICATES,
-    IRI, KIND_PARTITION_SPARQL, LABEL_PREDICATES, RDF_TYPE, SYNONYM_PREDICATES, UNCATEGORIZED,
-    NameType, PredicatePattern, configured_namespaces, local_name, split_prologue, sparql_path,
+    IRI, KIND_ALTERNATIVES, LABEL_PREDICATES, RDF_TYPE, SYNONYM_PREDICATES, UNCATEGORIZED, UNIVERSE, VOCABULARY_PROLOGUE,
+    NameType, PredicatePattern, configured_namespaces, local_name, split_prologue, sparql_path, union_of,
 )
 from grasp.tasks.om.profile_model import (
-    ElementKey, PartitionDefinition, Roles, Usage, role_elements, roles_from_elements,
+    ElementKey, GroupDefinition, Partition, Roles, Usage, role_elements, roles_from_elements,
 )
 from grasp.tasks.om.kg_sample import current_sample, values_block
-from grasp.tasks.om.retrieve import select_rows, stream_rows, values_blocks
+from grasp.tasks.om.retrieve import select_rows, stream_rows, values_blocks, values_table
 from pydantic import BaseModel
 
-# partitions of the default partitioning by kind (KIND_PARTITION_SPARQL), in order
-KINDS = ("class", "property", "concept", "instance")
+# kinds of the default partitions (stage b1), in order: the first match wins
+KINDS = tuple(KIND_ALTERNATIVES)
+# kind alternatives left out in a large KG (their negations are evaluated on the whole KG)
+LARGE_KG_SKIPPED_ALTERNATIVES = {"instance": 2}
 
 # canon predicates per role field of Roles
 CANON = {
@@ -74,14 +80,52 @@ PREFIX_EXPRESSION = (
 # characters not allowed in a SPARQL IRI reference
 INVALID_IRI_CHARACTERS = re.compile(r'[\s<>"{}|^`\\]')
 
-type Partitions = dict[str, PartitionDefinition]
+@dataclass(frozen=True)
+class Grouping:
+    """Named membership patterns over ?entity, in order. Exclusive (partitions):
+    an entity belongs to the first member that matches. Overlapping (groups): to
+    every one that matches. A name may occur more than once (one set of
+    entities defined by several patterns)."""
+    members: tuple[tuple[str, str], ...]
+    exclusive: bool = True
+
+    @property
+    def names(self) -> list[str]:
+        return list(dict.fromkeys(name for name, _ in self.members))
+
+    def merged(self, name: str) -> "Grouping":
+        """All members as one: the entities of any member."""
+        return Grouping(tuple((name, m) for _, m in self.members if m != UNIVERSE), exclusive=True)
 
 
-def kind_partitions(kinds: Iterable[str] = KINDS) -> Partitions:
-    return {kind: PartitionDefinition() for kind in kinds}
+def kind_membership(kind: str, large: bool = False) -> str:
+    alternatives = list(KIND_ALTERNATIVES[kind])
+    if large and kind in LARGE_KG_SKIPPED_ALTERNATIVES:
+        alternatives.pop(LARGE_KG_SKIPPED_ALTERNATIVES[kind])
+    return union_of(alternatives)
 
 
-# --- partition queries ----------------------------------------------------------
+def kind_partitions(kinds: Iterable[str] = KINDS, large: bool = False) -> dict[str, Partition]:
+    return {kind: Partition(membership_sparql=kind_membership(kind, large)) for kind in kinds}
+
+
+def partition_grouping(partitions: dict[str, Partition], rest: bool = True) -> Grouping:
+    """The partitions, exclusive; with rest, the subjects outside all of them as
+    UNCATEGORIZED (not in a large KG, see grouping_subquery)."""
+    members = tuple((name, p.membership_sparql) for name, p in partitions.items())
+    return Grouping(members + (((UNCATEGORIZED, UNIVERSE),) if rest else ()), exclusive=True)
+
+
+def kind_grouping(large: bool = False) -> Grouping:
+    return partition_grouping(kind_partitions(large=large))
+
+
+def group_grouping(groups: dict[str, GroupDefinition]) -> Grouping:
+    """The groups, overlapping."""
+    return Grouping(tuple((name, g.membership_sparql) for name, g in groups.items()), exclusive=False)
+
+
+# --- grouping queries -------------------------------------------------------------
 
 def space_filter(space: Iterable[str]) -> str:
     space = tuple(space)
@@ -94,60 +138,42 @@ def prologue_of(prefixes: dict[str, str]) -> str:
     return "\n".join(f"PREFIX {short}: <{long}>" for short, long in prefixes.items())
 
 
-def partition_subquery(manager: KgManager, partitions: Partitions | None,
-                       space: Iterable[str] = ()) -> tuple[dict[str, str], str]:
-    """(prefixes, group pattern) binding ?entity ?partition within the entity
-    space. Without partitions: the kind partitions of KIND_PARTITION_SPARQL.
-    Otherwise each entity gets the first partition, in order, whose membership
-    matches (a membership pattern over ?entity, or for a default partition its
-    kind), else UNCATEGORIZED. An entity of several kinds (punning) may get
-    several partitions."""
-    prefixes, kind_query = split_prologue(manager, KIND_PARTITION_SPARQL)
-    space_part = space_filter(space)
+def literal(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def grouping_subquery(manager: KgManager, grouping: Grouping | None,
+                      space: Iterable[str] = ()) -> tuple[dict[str, str], str]:
+    """(prefixes, group pattern) binding ?entity ?group within the entity space.
+    Without a grouping: the kind partitions. In a large KG, the sampled members
+    (kg_sample), assigned in Python, as a VALUES table."""
+    grouping = grouping or kind_grouping()
+    prefixes, _ = split_prologue(manager, VOCABULARY_PROLOGUE + "\nSELECT * WHERE { ?s ?p ?o }")
     sample = current_sample(manager)
-    if sample is not None and partitions is not None:
-        # large KG: the sampled members of the partitions, assigned as below
-        entities = sample.entities([d.membership for d in partitions.values() if d.membership is not None])
-        return prefixes, (f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{values_block(entities)}\n"
-                          f"BIND({partition_choice(partitions)} AS ?partition)\n}} }}")
-    if partitions is None:
-        return prefixes, f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{kind_query}\n}} }}\n{space_part}"
-    entities = [f"{{ SELECT DISTINCT ?entity (?partition AS ?kind) WHERE {{\n{kind_query}\n}} }}"]
-    entities += [f"{{ SELECT DISTINCT ?entity WHERE {{ {d.membership} }} }}"
-                 for d in partitions.values() if d.membership is not None]
-    body = (" UNION ".join(entities) + f"\nFILTER(isIRI(?entity))\n{space_part}\n"
-            f"BIND({partition_choice(partitions)} AS ?partition)")
-    return prefixes, f"{{ SELECT DISTINCT ?entity ?partition WHERE {{\n{body}\n}} }}"
+    if sample is not None:
+        rows = [(f"<{e}>", literal(g)) for e, g in sample.assignments(grouping)]
+        return prefixes, f"{{ {values_table(['entity', 'group'], rows)} }}"
+    branches = " UNION ".join(
+        f"{{ {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
+        for rank, (_, membership) in enumerate(grouping.members)
+    )
+    where = f"{branches}\nFILTER(isIRI(?entity))\n{space_filter(space)}"
+    names = " ".join(f"({rank} {literal(name)})" for rank, (name, _) in enumerate(grouping.members))
+    if grouping.exclusive:
+        return prefixes, (f"{{ SELECT ?entity ?group WHERE {{\n"
+                          f"{{ SELECT ?entity (MIN(?rank) AS ?first) WHERE {{\n{where}\n}} GROUP BY ?entity }}\n"
+                          f"VALUES (?first ?group) {{ {names} }}\n}} }}")
+    return prefixes, (f"{{ SELECT DISTINCT ?entity ?group WHERE {{\n{where}\n"
+                      f"VALUES (?rank ?group) {{ {names} }}\n}} }}")
 
 
-def partition_choice(partitions: Partitions) -> str:
-    """Expression of the partition of ?entity: the first, in order, whose
-    membership matches (a pattern, or for a default partition its ?kind)."""
-    choice = f'"{UNCATEGORIZED}"'
-    for name, definition in reversed(partitions.items()):
-        condition = (f"EXISTS {{ {definition.membership} }}" if definition.membership is not None
-                     else f'COALESCE(?kind, "") = "{name}"')
-        choice = f'IF({condition}, "{name}", {choice})'
-    return choice
-
-
-def estimated_sizes(manager: KgManager, partitions: Partitions, space: Iterable[str]) -> dict[str, int]:
-    """Entities per partition: counted in a small KG, estimated from the
-    samples of the memberships in a large one (kg_sample)."""
+def estimated_sizes(manager: KgManager, grouping: Grouping, space: Iterable[str]) -> dict[str, int]:
+    """Entities per member of a grouping: counted in a small KG, estimated from
+    the samples of the memberships in a large one (kg_sample)."""
     sample = current_sample(manager)
     if sample is None:
-        return partition_sizes(manager, partitions, space)
-    rows = select_rows(manager, partition_query(manager, partitions, space, "?entity ?partition"))
-    assigned = {(r["entity"].value, r["partition"].value) for r in rows if "entity" in r and "partition" in r}
-    sizes = {}
-    for name, definition in partitions.items():
-        if definition.membership is None:
-            continue
-        members = sample.sample(definition.membership).in_space
-        estimate = sample.estimated_size(definition.membership, sum((m, name) in assigned for m in members))
-        if estimate is not None:
-            sizes[name] = estimate
-    return sizes
+        return group_sizes(manager, grouping, space)
+    return sample.estimated_sizes(grouping)
 
 
 def union_with(group: str, parts: list[str], var: str | None = "s") -> str:
@@ -161,13 +187,13 @@ def union_with(group: str, parts: list[str], var: str | None = "s") -> str:
     return " UNION ".join(f"{{ {group}\n{part} }}" for part in bound)
 
 
-def partition_query(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
-                    select: str, where: str = "", tail: str = "",
-                    parts: list[str] | None = None, var: str = "s") -> str:
-    """Query over the entities of the partitions (?entity ?partition), joined
-    with the given patterns; with parts, joined with the alternatives of a
-    pattern whose ?var is the entity (union_with)."""
-    prefixes, subquery = partition_subquery(manager, partitions, space)
+def grouping_query(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
+                   select: str, where: str = "", tail: str = "",
+                   parts: list[str] | None = None, var: str = "s") -> str:
+    """Query over the entities of a grouping (?entity ?group), joined with the
+    given patterns; with parts, joined with the alternatives of a pattern whose
+    ?var is the entity (union_with)."""
+    prefixes, subquery = grouping_subquery(manager, grouping, space)
     body = union_with(subquery, parts, var) if parts is not None else subquery
     return f"{prologue_of(prefixes)}\nSELECT {select} WHERE {{\n{body}\n{where}\n}} {tail}"
 
@@ -176,29 +202,29 @@ def count_rows(rows: list[dict], *keys: str) -> dict[tuple[str, ...], int]:
     return {tuple(row[k].value for k in keys): int(row["n"].value) for row in rows if all(k in row for k in keys)}
 
 
-def counts_by_partition(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
-                        where: str, parts: list[str] | None = None, var: str = "s") -> dict[str, int]:
-    sparql = partition_query(manager, partitions, space, "?partition (COUNT(DISTINCT ?entity) AS ?n)",
-                             where, "GROUP BY ?partition", parts, var)
-    return {partition: n for (partition,), n in count_rows(select_rows(manager, sparql), "partition").items()}
+def counts_by_group(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
+                    where: str, parts: list[str] | None = None, var: str = "s") -> dict[str, int]:
+    sparql = grouping_query(manager, grouping, space, "?group (COUNT(DISTINCT ?entity) AS ?n)",
+                            where, "GROUP BY ?group", parts, var)
+    return {group: n for (group,), n in count_rows(select_rows(manager, sparql), "group").items()}
 
 
-def partition_sizes(manager: KgManager, partitions: Partitions | None, space: Iterable[str]) -> dict[str, int]:
-    return counts_by_partition(manager, partitions, space, "")
+def group_sizes(manager: KgManager, grouping: Grouping | None, space: Iterable[str]) -> dict[str, int]:
+    return counts_by_group(manager, grouping, space, "")
 
 
 # --- entity space ---------------------------------------------------------------
 
 def prefix_counts(manager: KgManager, named_only: bool) -> dict[tuple[str, str], int]:
-    """(prefix, kind partition) -> entities, optionally only entities with a
+    """(prefix, kind) -> entities, optionally only entities with a
     canon name or synonym (keeps out e.g. image files of wiki KGs)."""
     named = (f"FILTER EXISTS {{ ?entity {sparql_path(LABEL_PREDICATES + SYNONYM_PREDICATES)} ?name }}"
              if named_only else "")
-    sparql = partition_query(
-        manager, None, (), "?prefix ?partition (COUNT(DISTINCT ?entity) AS ?n)",
-        f"{named}\nBIND({PREFIX_EXPRESSION} AS ?prefix)", "GROUP BY ?prefix ?partition",
+    sparql = grouping_query(
+        manager, None, (), "?prefix ?group (COUNT(DISTINCT ?entity) AS ?n)",
+        f"{named}\nBIND({PREFIX_EXPRESSION} AS ?prefix)", "GROUP BY ?prefix ?group",
     )
-    return count_rows(select_rows(manager, sparql), "prefix", "partition")
+    return count_rows(select_rows(manager, sparql), "prefix", "group")
 
 
 def prefix_totals(counts: dict[tuple[str, str], int]) -> Counter[str]:
@@ -232,20 +258,20 @@ class Coverage(BaseModel):
     blanks: int = 0      # triples with a blank node value; the rest have an IRI
 
 
-def predicate_coverage(manager: KgManager, partitions: Partitions | None, space: Iterable[str]
+def predicate_coverage(manager: KgManager, grouping: Grouping | None, space: Iterable[str]
                        ) -> dict[str, dict[IRI, Coverage]]:
-    """partition -> outgoing predicate (entities of the partition as subject)
+    """group -> outgoing predicate (entities of the group as subject)
     -> coverage, with the kinds of its values (objects)."""
-    sparql = partition_query(
-        manager, partitions, space,
-        "?partition ?p (COUNT(DISTINCT ?entity) AS ?n) (COUNT(?v) AS ?m) "
+    sparql = grouping_query(
+        manager, grouping, space,
+        "?group ?p (COUNT(DISTINCT ?entity) AS ?n) (COUNT(?v) AS ?m) "
         "(SUM(IF(isLiteral(?v), 1, 0)) AS ?lit) (SUM(IF(isBlank(?v), 1, 0)) AS ?blank)",
-        "?entity ?p ?v .", "GROUP BY ?partition ?p",
+        "?entity ?p ?v .", "GROUP BY ?group ?p",
     )
     coverage: dict[str, dict[IRI, Coverage]] = defaultdict(dict)
     for row in select_rows(manager, sparql):
-        if "partition" in row and "p" in row:
-            coverage[row["partition"].value][IRI(row["p"].value)] = Coverage(
+        if "group" in row and "p" in row:
+            coverage[row["group"].value][IRI(row["p"].value)] = Coverage(
                 entities=int(row["n"].value), values=int(row["m"].value),
                 literals=int(row["lit"].value) if "lit" in row else 0,
                 blanks=int(row["blank"].value) if "blank" in row else 0,
@@ -253,16 +279,16 @@ def predicate_coverage(manager: KgManager, partitions: Partitions | None, space:
     return dict(coverage)
 
 
-def type_coverage(manager: KgManager, partitions: Partitions | None, space: Iterable[str]
+def type_coverage(manager: KgManager, grouping: Grouping | None, space: Iterable[str]
                   ) -> dict[str, dict[IRI, int]]:
-    """partition -> rdf:type value -> entities."""
-    sparql = partition_query(
-        manager, partitions, space, "?partition ?t (COUNT(DISTINCT ?entity) AS ?n)",
-        f"?entity <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?partition ?t",
+    """group -> rdf:type value -> entities."""
+    sparql = grouping_query(
+        manager, grouping, space, "?group ?t (COUNT(DISTINCT ?entity) AS ?n)",
+        f"?entity <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?group ?t",
     )
     coverage: dict[str, dict[IRI, int]] = defaultdict(dict)
-    for (partition, t), n in count_rows(select_rows(manager, sparql), "partition", "t").items():
-        coverage[partition][IRI(t)] = n
+    for (group, t), n in count_rows(select_rows(manager, sparql), "group", "t").items():
+        coverage[group][IRI(t)] = n
     return dict(coverage)
 
 
@@ -292,14 +318,20 @@ def distinguishing_features(inside: dict[str, int], size_inside: int,
     return sorted(features, key=lambda f: (-abs(f.contrast), f.key))[:k]
 
 
-def complement(counts: dict[str, dict[str, int]], sizes: dict[str, int], partition: str
+def complement(counts: dict[str, dict[str, int]], sizes: dict[str, int], group: str
                ) -> tuple[dict[str, int], int]:
-    """Counts and size of all partitions except one, summed."""
+    """Counts and size of all members of an exclusive grouping except one, summed."""
     total: Counter[str] = Counter()
     for other, other_counts in counts.items():
-        if other != partition:
+        if other != group:
             total.update(other_counts)
-    return dict(total), sum(n for other, n in sizes.items() if other != partition)
+    return dict(total), sum(n for other, n in sizes.items() if other != group)
+
+
+def rest(total: dict[str, int], total_size: int, inside: dict[str, int], size: int) -> tuple[dict[str, int], int]:
+    """Counts and size of the entities of a total outside a part of it (a group
+    of an overlapping grouping within all its entities)."""
+    return {k: max(0, n - inside.get(k, 0)) for k, n in total.items()}, max(0, total_size - size)
 
 
 def members_query(membership: str, space: Iterable[str], manager: KgManager | None = None) -> str:
@@ -310,22 +342,26 @@ def members_query(membership: str, space: Iterable[str], manager: KgManager | No
     return f"{{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }}\nFILTER(isIRI(?entity))\n{space_filter(space)}"
 
 
-def membership_overlap(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
-                       membership: str) -> dict[str, int]:
-    """Entities matching a membership pattern per current partition
-    (UNCATEGORIZED for matches outside every partition); in a large KG for the
+def membership_overlap(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
+                       membership: str) -> tuple[int, dict[str, int]]:
+    """(entities matching a membership pattern, those per current group or
+    partition, UNCATEGORIZED for matches in none); in a large KG for the
     sampled matches."""
-    if current_sample(manager) is not None and partitions is not None:
-        prefixes, _ = split_prologue(manager, KIND_PARTITION_SPARQL)
-        sparql = (f"{prologue_of(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
-                  f"{members_query(membership, space, manager)}\nBIND({partition_choice(partitions)} AS ?part)\n"
-                  f"}} GROUP BY ?part")
-        return {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
-    prefixes, subquery = partition_subquery(manager, partitions, space)
+    sample = current_sample(manager)
+    if sample is not None:
+        matches = sample.sample(membership).in_space
+        counts: Counter[str] = Counter(g for _, g in sample.assignments(grouping, matches))
+        assigned = {e for e, _ in sample.assignments(grouping, matches)}
+        counts[UNCATEGORIZED] += sum(e not in assigned for e in matches)
+        return len(matches), {g: n for g, n in counts.items() if n}
+    prefixes, subquery = grouping_subquery(manager, grouping, space)
     sparql = (f"{prologue_of(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
               f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
-              f'BIND(COALESCE(?partition, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part')
-    return {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
+              f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part')
+    overlap = {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
+    size = select_rows(manager, f"{prologue_of(prefixes)}\nSELECT (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
+                                f"{members_query(membership, space, manager)}\n}}")
+    return (int(size[0]["n"].value) if size and "n" in size[0] else 0), overlap
 
 
 def member_coverage(manager: KgManager, space: Iterable[str], membership: str
@@ -377,9 +413,9 @@ def element_sparql(key: ElementKey, value) -> str:
 type Sides = dict[ElementKey, tuple[int, int]]
 
 
-def element_usage(manager: KgManager, partitions: Partitions | None, space: Iterable[str], roles: Roles,
+def element_usage(manager: KgManager, grouping: Grouping | None, space: Iterable[str], roles: Roles,
                   sides: dict[str, Sides] | None = None) -> dict[str, Usage]:
-    """partition -> element of the roles -> entities using it: as ?s for
+    """group -> element of the roles -> entities using it: as ?s for
     predicates and patterns; as ?s or ?o for structure relations, whichever
     side has more (e.g. classes are only ?o of instance_of), with both sides
     in sides if given. Predicates in one query, every pattern in its own,
@@ -389,35 +425,35 @@ def element_usage(manager: KgManager, partitions: Partitions | None, space: Iter
     predicates = sorted({key[2] for key in elements if key[1] == "predicate"})
     if predicates:
         values = " ".join(f"<{p}>" for p in predicates)
-        sparql = partition_query(manager, partitions, space, "?partition ?p (COUNT(DISTINCT ?entity) AS ?n)",
-                                 f"VALUES ?p {{ {values} }}\n?entity ?p ?value .", "GROUP BY ?partition ?p")
-        by_predicate = count_rows(select_rows(manager, sparql), "partition", "p")
+        sparql = grouping_query(manager, grouping, space, "?group ?p (COUNT(DISTINCT ?entity) AS ?n)",
+                                 f"VALUES ?p {{ {values} }}\n?entity ?p ?value .", "GROUP BY ?group ?p")
+        by_predicate = count_rows(select_rows(manager, sparql), "group", "p")
         for key in elements:
             if key[1] == "predicate":
-                for (partition, p), n in by_predicate.items():
+                for (group, p), n in by_predicate.items():
                     if p == key[2]:
-                        usage[partition][key] = n
+                        usage[group][key] = n
     for key, value in elements.items():
         if key[1] == "pattern":
-            for partition, n in counts_by_partition(manager, partitions, space, "", element_parts(key, value)).items():
-                usage[partition][key] = n
+            for group, n in counts_by_group(manager, grouping, space, "", element_parts(key, value)).items():
+                usage[group][key] = n
         elif key[1] == "relation":
             parts = element_parts(key, value)
-            as_s = counts_by_partition(manager, partitions, space, "", parts, "s")
-            as_o = counts_by_partition(manager, partitions, space, "", parts, "o")
-            for partition in set(as_s) | set(as_o):
-                n_s, n_o = as_s.get(partition, 0), as_o.get(partition, 0)
-                usage[partition][key] = max(n_s, n_o)
+            as_s = counts_by_group(manager, grouping, space, "", parts, "s")
+            as_o = counts_by_group(manager, grouping, space, "", parts, "o")
+            for group in set(as_s) | set(as_o):
+                n_s, n_o = as_s.get(group, 0), as_o.get(group, 0)
+                usage[group][key] = max(n_s, n_o)
                 if sides is not None:
-                    sides.setdefault(partition, {})[key] = (n_s, n_o)
+                    sides.setdefault(group, {})[key] = (n_s, n_o)
     return dict(usage)
 
 
 def default_roles(usage: dict[str, Usage], sizes: dict[str, int], active: Iterable[str]) -> Roles:
-    """Canon elements covering at least MIN_DEFAULT_COVERAGE of an active partition."""
+    """Canon elements covering at least MIN_DEFAULT_COVERAGE of an active group or partition."""
     keep = {
-        key for partition in active if sizes.get(partition)
-        for key, n in usage.get(partition, {}).items() if n / sizes[partition] >= MIN_DEFAULT_COVERAGE
+        key for group in active if sizes.get(group)
+        for key, n in usage.get(group, {}).items() if n / sizes[group] >= MIN_DEFAULT_COVERAGE
     }
     return roles_from_elements({k: v for k, v in role_elements(canon_roles()).items() if k in keep})
 
@@ -425,30 +461,30 @@ def default_roles(usage: dict[str, Usage], sizes: dict[str, int], active: Iterab
 # --- local names --------------------------------------------------------------------
 
 class LocalNameStats(BaseModel):
-    """Local names of a sample of a partition compared with the entities' names."""
+    """Local names of a sample of a group compared with the entities' names."""
     sample_size: int = 0
     labelled: int = 0
     agreement: float | None = None  # share of named entities whose local name agrees with a name
     speaking: float | None = None   # share of local names that look like words
 
 
-def sample_entities(manager: KgManager, partitions: Partitions | None, space: Iterable[str],
+def sample_entities(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
                     k: int = SAMPLE_SIZE, seed: int = SAMPLE_SEED, where: str = "") -> dict[str, list[IRI]]:
-    """Up to k random entities per partition, drawn while streaming (reservoir
-    sampling), so memory stays at k per partition whatever the KG size."""
+    """Up to k random entities per group, drawn while streaming (reservoir
+    sampling), so memory stays at k per group whatever the KG size."""
     rng = random.Random(seed)
     samples: dict[str, list[IRI]] = defaultdict(list)
     seen: Counter[str] = Counter()
-    sparql = partition_query(manager, partitions, space, "?entity ?partition", where, "ORDER BY ?entity")
+    sparql = grouping_query(manager, grouping, space, "?entity ?group", where, "ORDER BY ?entity")
     for row in stream_rows(manager, sparql):
-        entity, partition = IRI(row["entity"]["value"]), row["partition"]["value"]
+        entity, group = IRI(row["entity"]["value"]), row["group"]["value"]
         if INVALID_IRI_CHARACTERS.search(entity):
             continue
-        seen[partition] += 1
-        if len(samples[partition]) < k:
-            samples[partition].append(entity)
-        elif (j := rng.randrange(seen[partition])) < k:
-            samples[partition][j] = entity
+        seen[group] += 1
+        if len(samples[group]) < k:
+            samples[group].append(entity)
+        elif (j := rng.randrange(seen[group])) < k:
+            samples[group][j] = entity
     return dict(samples)
 
 
@@ -499,7 +535,7 @@ def local_name_type(stats: LocalNameStats) -> NameType:
     """Local names agreeing with names, or speaking without names to compare
     with, count as names. A speaking local name that differs from the name
     (e.g. another language) is reported in the statistics."""
-    # small partitions (e.g. a handful of properties) count if all are labelled
+    # small groups (e.g. a handful of properties) count if all are labelled
     enough_labelled = stats.labelled >= min(MIN_LABELLED, stats.sample_size)
     if enough_labelled and stats.agreement is not None and stats.agreement >= AGREEMENT_SHARE:
         return NameType.LABEL

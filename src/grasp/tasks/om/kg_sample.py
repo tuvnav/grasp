@@ -2,15 +2,20 @@
 Large KG mode of the profile (e.g. dblp with 1.6 billion triples, or Wikidata):
 queries that collect all entities of a KG (the kind partitions, prefix counts)
 do not finish there. Instead:
-- entities are partitioned by their types (membership patterns), not by kind;
-- per membership pattern, a sample of members is drawn at evenly spread
-  offsets (cheap index scans) and its members are counted on the server;
-- all statistics of the profile (coverage, value kinds, usage of patterns,
-  local names, examples) are computed on the union of the samples: the
-  partition subquery becomes VALUES of the sampled entities, so every query of
-  kg_profile works unchanged and scales with the sample, not with the KG;
-- partition sizes are estimated from the member counts and the share of each
-  sample that falls into the partition (first match in order, as in a small KG).
+- per membership pattern (of a partition or group), a sample of members is
+  drawn at evenly spread offsets (cheap index scans) and its members are
+  counted on the server;
+- the sampled entities are assigned to the partitions or groups in Python
+  (which membership each matches, asked for the sampled entities only), and
+  all statistics of the profile (coverage, value kinds, usage of patterns,
+  local names, examples) are computed on them: the grouping subquery becomes a
+  VALUES table of (entity, group), so every query of kg_profile works unchanged
+  and scales with the sample, not with the KG;
+- sizes are estimated from the member counts and the share of each sample
+  that falls into the partition or group (for partitions: the first match in
+  order, as in a small KG);
+- the subjects outside all partitions (UNCATEGORIZED) are not sampled;
+- stage b2 starts with a group per large class (rdf:type) besides the partitions.
 
 The sample of a KG is registered per KG name while a stage runs
 (use_sample), so the query functions of kg_profile pick it up.
@@ -21,8 +26,15 @@ import math
 import re
 
 from grasp.manager import KgManager
-from grasp.tasks.om.model import IRI, LABEL_PREDICATES, RDF_TYPE, SYNONYM_PREDICATES, local_name, sparql_path
+from typing import TYPE_CHECKING, Iterable
+
+from grasp.tasks.om.model import (
+    IRI, LABEL_PREDICATES, RDF_TYPE, SYNONYM_PREDICATES, UNIVERSE, local_name, sparql_path, union_alternatives,
+)
 from grasp.tasks.om.retrieve import select_rows, values_clause
+
+if TYPE_CHECKING:
+    from grasp.tasks.om.kg_profile import Grouping
 
 # a KG with more triples, or whose triples cannot be counted, is profiled in the large mode
 LARGE_TRIPLES = 100_000_000
@@ -31,9 +43,11 @@ SAMPLE_PER_MEMBERSHIP = 200
 SAMPLE_CHUNKS = 10
 # stage a: sampled members per class to tell its prefixes and named share
 CLASS_SAMPLE = 30
-# stage b: classes with fewer estimated members in the entity space get no default partition
+# stage b2: classes with fewer estimated members in the entity space get no default group
 MIN_CLASS_MEMBERS = 1000
-MAX_DEFAULT_PARTITIONS = 30
+MAX_DEFAULT_GROUPS = 30
+# sampled entities per query when asking which of them match a membership
+MATCH_BATCH = 1000
 
 
 def count_triples(manager: KgManager) -> int | None:
@@ -106,6 +120,8 @@ class KgSample:
     space: tuple[str, ...]
     per_membership: int = SAMPLE_PER_MEMBERSHIP
     samples: dict[str, MembershipSample] = field(default_factory=dict)
+    # membership -> entity -> whether it matches (asked for sampled entities only)
+    matched: dict[str, dict[IRI, bool]] = field(default_factory=dict)
 
     def sample(self, membership: str) -> MembershipSample:
         membership = membership.strip()
@@ -121,21 +137,66 @@ class KgSample:
             self.samples[membership] = _CACHE[key]
         return self.samples[membership]
 
-    def entities(self, memberships: list[str]) -> list[IRI]:
+    def entities(self, memberships: Iterable[str]) -> list[IRI]:
         """Union of the in-space samples of the memberships."""
         entities: dict[IRI, None] = {}
         for membership in memberships:
-            entities.update(dict.fromkeys(self.sample(membership).in_space))
+            if membership != UNIVERSE:
+                entities.update(dict.fromkeys(self.sample(membership).in_space))
         return list(entities)
 
-    def estimated_size(self, membership: str, assigned: int) -> int | None:
-        """Members in the entity space that fall into the partition of this
-        membership: the member count times the share of its sample that is in
-        the space and assigned to the partition."""
-        sample = self.sample(membership)
-        if sample.count is None or not sample.members:
-            return None
-        return round(sample.count * assigned / len(sample.members))
+    def matches(self, membership: str, entities: list[IRI]) -> set[IRI]:
+        """The entities matching a membership pattern; asked for the entities only
+        (each alternative of the pattern joined with their VALUES), cached."""
+        membership = membership.strip()
+        known = self.matched.setdefault(membership, {})
+        # the sample of a membership matches it by construction
+        if membership in self.samples:
+            known.update(dict.fromkeys(self.samples[membership].members, True))
+        unknown = [e for e in entities if e not in known]
+        for start in range(0, len(unknown), MATCH_BATCH):
+            batch = unknown[start:start + MATCH_BATCH]
+            values = values_block(batch)
+            alternatives = union_alternatives(membership)
+            body = (f"{values}\n{alternatives[0]}" if len(alternatives) == 1
+                    else " UNION ".join(f"{{ {values}\n{a} }}" for a in alternatives))
+            found = {IRI(r["entity"].value) for r in select_rows(
+                self.manager, f"SELECT DISTINCT ?entity WHERE {{ {body} }}") if "entity" in r}
+            known.update({e: e in found for e in batch})
+        return {e for e in entities if known.get(e)}
+
+    def assignments(self, grouping: "Grouping", entities: list[IRI] | None = None) -> list[tuple[IRI, str]]:
+        """(entity, member name) of the sampled entities of a grouping (or the
+        given entities): every match of an overlapping grouping, the first of an
+        exclusive one. UNIVERSE is not sampled."""
+        members = [(name, m) for name, m in grouping.members if m != UNIVERSE]
+        if entities is None:
+            entities = self.entities(m for _, m in members)
+        pairs: dict[tuple[IRI, str], None] = {}
+        assigned: set[IRI] = set()
+        for name, membership in members:
+            matching = self.matches(membership, entities)
+            for entity in entities:
+                if entity in matching and not (grouping.exclusive and entity in assigned):
+                    pairs[(entity, name)] = None
+                    assigned.add(entity)
+        return list(pairs)
+
+    def estimated_sizes(self, grouping: "Grouping") -> dict[str, int]:
+        """Members in the entity space per member name: the member count of its
+        membership times the share of its sample that is in the space and
+        assigned to it (in an exclusive grouping, not to an earlier member)."""
+        assigned = set(self.assignments(grouping))
+        sizes: dict[str, int] = {}
+        for name, membership in grouping.members:
+            if membership == UNIVERSE:
+                continue
+            sample = self.sample(membership)
+            if sample.count is None or not sample.members:
+                continue
+            estimate = round(sample.count * sum((m, name) in assigned for m in sample.in_space) / len(sample.members))
+            sizes[name] = max(sizes.get(name, 0), estimate)
+        return sizes
 
 
 # KG name -> sample of the stage running on it
@@ -230,8 +291,8 @@ def large_prefix_counts(manager: KgManager, classes: dict[IRI, int]) -> PrefixCo
     return PrefixCounts(dict(rounded(counts)), dict(rounded(named)), rounded(totals), rounded(named_totals), examples)
 
 
-def partition_name(type_iri: str, taken: set[str]) -> str:
-    """Lower case partition name from the local name of a class, unique among taken."""
+def group_name(type_iri: str, taken: set[str]) -> str:
+    """Lower case group name from the local name of a class, unique among taken."""
     words = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", local_name(type_iri)).lower()
     name = re.sub(r"[^a-z0-9_]+", "_", words).strip("_")
     name = name if name and name[0].isalpha() else f"c_{name}"
@@ -241,13 +302,12 @@ def partition_name(type_iri: str, taken: set[str]) -> str:
     return unique
 
 
-def default_class_partitions(manager: KgManager, space: tuple[str, ...], classes: dict[IRI, int]
-                             ) -> list[tuple[str, IRI, int]]:
+def default_class_groups(manager: KgManager, space: tuple[str, ...], classes: dict[IRI, int]
+                         ) -> list[tuple[str, IRI, int]]:
     """(name, class, estimated members in the entity space) of the default
-    partitions of a large KG: one per class with at least MIN_CLASS_MEMBERS
-    estimated members in the space, at most MAX_DEFAULT_PARTITIONS of the
-    largest, ordered from small to large so that a subclass comes before its
-    superclass (the first match wins)."""
+    class groups of a large KG: one per class with at least MIN_CLASS_MEMBERS
+    estimated members in the space, at most MAX_DEFAULT_GROUPS of the largest,
+    from large to small."""
     estimates = []
     for type_iri, n in sorted(classes.items(), key=lambda x: -x[1])[:MAX_SAMPLED_CLASSES]:
         if n < MIN_CLASS_MEMBERS:
@@ -256,11 +316,10 @@ def default_class_partitions(manager: KgManager, space: tuple[str, ...], classes
         share = sum(not space or e.startswith(space) for e in sample) / len(sample) if sample else 0.0
         if n * share >= MIN_CLASS_MEMBERS:
             estimates.append((type_iri, round(n * share)))
-    chosen = sorted(estimates, key=lambda x: -x[1])[:MAX_DEFAULT_PARTITIONS]
     taken: set[str] = set()
-    partitions = []
-    for type_iri, estimate in sorted(chosen, key=lambda x: x[1]):
-        name = partition_name(type_iri, taken)
+    groups = []
+    for type_iri, estimate in sorted(estimates, key=lambda x: -x[1])[:MAX_DEFAULT_GROUPS]:
+        name = group_name(type_iri, taken)
         taken.add(name)
-        partitions.append((name, type_iri, estimate))
-    return partitions
+        groups.append((name, type_iri, estimate))
+    return groups

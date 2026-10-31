@@ -20,7 +20,15 @@ import yaml
 
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
-SIDES = ("source", "target")
+
+
+class Side(StrEnum):
+    """Side of a KG pair: the source or the target KG (also of a correspondence)."""
+    SOURCE = "source"
+    TARGET = "target"
+
+
+SIDES = tuple(Side)
 
 # an IRI as such, e.g. http://human.owl#NCI_C12432
 IRI = NewType("IRI", str)
@@ -391,6 +399,9 @@ NAME_ANCHORS_SPARQL = (
 # partition get UNCATEGORIZED. An entity may be in several partitions (e.g.
 # punning). ?evidence is for inspection only.
 UNCATEGORIZED = "uncategorized"
+# membership matched by every subject: in the profile, the entities outside all
+# partitions are UNCATEGORIZED
+UNIVERSE = "?entity ?anyPredicate ?anyObject"
 # partition of all entities when a side has no partition query
 ALL = "all"
 
@@ -440,6 +451,90 @@ SELECT DISTINCT ?entity ?partition ?evidence WHERE {
   FILTER(!STRSTARTS(STR(?entity), STR(rdf:)) && !STRSTARTS(STR(?entity), STR(rdfs:))
       && !STRSTARTS(STR(?entity), STR(owl:)) && !STRSTARTS(STR(?entity), STR(skos:)))
 }"""
+
+# Default partitions of the profile (stage b1) by kind: membership patterns over
+# ?entity, as alternatives, in order. Partitions are exclusive, an entity belongs
+# to the first that matches: an entity used as a predicate is a property even if
+# it is also typed as a class (punning), a class is not also an instance.
+# KIND_PARTITION_SPARQL above is the older, non-exclusive form of the anchor stage.
+_NOT_VOCABULARY_TYPE = ("FILTER(isIRI(?type) && !STRSTARTS(STR(?type), STR(owl:)) && !STRSTARTS(STR(?type), STR(rdfs:)) "
+                        "&& !STRSTARTS(STR(?type), STR(rdf:)) && !STRSTARTS(STR(?type), STR(skos:)))")
+KIND_ALTERNATIVES: dict[str, tuple[str, ...]] = {
+    "property": (
+        "?anySubject ?entity ?anyObject",
+        "?entity rdf:type ?type VALUES ?type { owl:ObjectProperty owl:DatatypeProperty owl:AnnotationProperty rdf:Property }",
+    ),
+    "class": (
+        "?entity rdf:type ?type VALUES ?type { owl:Class rdfs:Class }",
+        "?anyInstance rdf:type ?entity",
+        "?entity rdfs:subClassOf ?anySuper",
+        "?anySub rdfs:subClassOf ?entity",
+    ),
+    "concept": ("?entity rdf:type skos:Concept",),
+    "instance": (
+        # owl:Thing: e.g. DBkWik articles typed with nothing else
+        "?entity rdf:type ?type VALUES ?type { owl:NamedIndividual owl:Thing }",
+        f"?entity rdf:type ?type {_NOT_VOCABULARY_TYPE}",
+        # untyped individuals (e.g. wiki articles): data beyond names; helper nodes
+        # that only carry a label match no kind (in a large KG left out: the
+        # negations would be evaluated on the whole KG)
+        "?entity ?p ?o FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:comment, skos:prefLabel, skos:altLabel)) "
+        "FILTER NOT EXISTS { ?entity rdf:type ?anyType } FILTER NOT EXISTS { ?anyInstance rdf:type ?entity } "
+        "FILTER NOT EXISTS { ?entity rdfs:subClassOf ?anySuper } FILTER NOT EXISTS { ?anySub rdfs:subClassOf ?entity } "
+        "FILTER NOT EXISTS { ?anySubject ?entity ?anyObject }",
+    ),
+}
+# prologue of the vocabulary prefixes used in membership patterns
+VOCABULARY_PROLOGUE = "\n".join(f"PREFIX {prefix}: <{namespace}>" for namespace, prefix in VOCABULARY_PREFIXES.items())
+
+
+def union_of(alternatives: list[str] | tuple[str, ...]) -> str:
+    """A group pattern of alternatives: the pattern itself if only one."""
+    return alternatives[0] if len(alternatives) == 1 else " UNION ".join(f"{{ {a} }}" for a in alternatives)
+
+
+IRI_REFERENCE = re.compile(r"<[^\s<>\"{}|^`\\]*>")
+
+
+def closing_brace(text: str, start: int) -> int | None:
+    """Index of the brace closing the one at start; braces in strings and
+    IRIs do not count."""
+    depth, quote, i = 0, None, start
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "<" and (m := IRI_REFERENCE.match(text, i)):
+            i = m.end() - 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def union_alternatives(pattern: str) -> list[str]:
+    """The alternatives of a pattern of the form { A } UNION { B } ...; the
+    pattern itself if it is not of this form."""
+    text, parts, i = pattern.strip(), [], 0
+    while True:
+        if not text.startswith("{", i) or (end := closing_brace(text, i)) is None:
+            return [pattern]
+        parts.append(text[i + 1:end].strip())
+        i = len(text) - len(text[end + 1:].lstrip())
+        if i == len(text):
+            return parts if len(parts) > 1 else [pattern]
+        if not text.startswith("UNION", i):
+            return [pattern]
+        i = len(text) - len(text[i + len("UNION"):].lstrip())
 
 
 class AnchorStrategyType(StrEnum):
@@ -867,9 +962,12 @@ def get_relation_profile(config: GraspConfig) -> RelationProfile:
     )
 
 
-class CorrespondenceSide(StrEnum):
-    SOURCE = "source"
-    TARGET = "target"
+class Provenance(BaseModel):
+    """Where a correspondence of the pipeline comes from."""
+    stage: str                    # e.g. anchors, candidates
+    round: int = 0                # round of the candidate stage's meta-loop
+    stratum: str | None = None    # strategy and stratum it was found in
+    rationale: str | None = None  # judge's reason, if judged one by one
 
 
 class Correspondence(BaseModel):
@@ -886,6 +984,8 @@ class Correspondence(BaseModel):
     measure: float = 1.0
     # iri of a RelationSpec from the task's relation profile
     relation: str = EQUIVALENCE.iri
+    # set by the pipeline stages; None for correspondences of the agentic search
+    provenance: Provenance | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:

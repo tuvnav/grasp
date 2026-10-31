@@ -1,17 +1,20 @@
-Your stage: b. partitions.
+Your stage: b1. partitions.
 
-Partitions are groups of entities that are recognizable by features of their own: a predicate they all have, a type, an IRI pattern. Later stages profile each partition, and matching compares entities within corresponding partitions. By default, entities are partitioned by kind (class, property, concept, instance); the partitions are shown with their sizes, examples and the predicates and types that distinguish them from the other partitions.
+Partitions are the hard boundaries between kinds of entities in this knowledge graph: kinds whose entities are fundamentally different, e.g. in an OWL ontology classes, properties and individuals, in a thesaurus concepts, in Wikidata items and properties. They are exclusive: in their order, an entity belongs to the first partition whose membership pattern matches. Judge them from this knowledge graph alone, not from the task: groups of entities that matter for the task (e.g. starships among the instances, image pages to exclude) are defined in a later stage, and may overlap.
 
-Check whether the default fits this knowledge graph, in this order:
-1. Exclusion: does a partition, or a large group within one, contain entities that would not be matched for this task? Typical are annotation-like entities that only describe or hold values for other entities (helper nodes, reified statements, synonym or definition nodes), entities without an identity of their own (e.g. entities that only occur as objects of links and carry no name, type or description), and records of files, media or administration. What counts depends on the task: if the task-specific instructions ask to match such entities, keep them. Matching the others only costs time and adds false candidates. Exclude a whole partition with exclude_partition; for a group within one, split it off first and then exclude it.
-2. Splits: is a partition heterogeneous, i.e. does it contain groups with clearly different features (e.g. a subgroup whose entities share predicates or types that the rest of the partition lacks)? Then split the group off.
-3. Redefinition: are kinds the wrong criterion here (e.g. classes and instances in one hierarchy, all entities typed only by a custom type)? Then redefine the partition by a membership pattern.
-Only define a partition if its features are clear and it has enough entities to matter; leave the default as it is when it fits.
+By default, entities are partitioned by the kinds property, class, concept and instance, with membership patterns over the standard vocabularies (RDF, RDFS, OWL, SKOS). The partitions are shown with their sizes, examples and the predicates and types that distinguish them from the other partitions; in a knowledge graph that is not very large also the subjects that match no partition (uncategorized; they are not aligned).
 
-Membership patterns are SPARQL group patterns over ?entity. Partitions are checked in order; an entity belongs to the first one that matches. A split is placed before its parent, so the parent keeps the rest.
+Check whether the kinds fit this knowledge graph, in this order:
+1. Membership: does a pattern miss entities of its kind, or catch entities of another kind? Typical are knowledge graphs that type their entities with their own vocabulary (e.g. an instance-of property instead of rdf:type, their own class of properties), classes and instances in one hierarchy, and punning (one IRI used as class and as individual). Redefine the partition then.
+2. Kinds: is a default kind wrong or missing here? Remove a partition, or define a kind of your own, e.g. for entities that only annotate others (helper nodes holding synonyms or values, reified statements) if they form a kind of their own here. Do not split a kind into types of things (persons, places, starships); that is the job of the groups stage.
+3. Uncategorized: do subjects that match no partition belong to a kind?
+4. Competition: entities of partitions that compete may be candidates or rivals for each other in matching. Decide which partitions do not compete. Properties are usually not equivalent to classes, concepts or individuals; in OWL, classes, properties and individuals do not compete with each other. Where kinds are only a modelling choice of a knowledge graph, they may compete (e.g. a concept of a thesaurus and a class of an ontology, an item that is both class and instance). By default, only properties are separated from the other partitions.
+Only define a partition if its entities are clearly of another kind; leave the default as it is when it fits.
+
+Membership patterns are SPARQL group patterns over ?entity; write alternatives as { A } UNION { B }. Partitions are checked in order; place a partition before the ones whose patterns would also match its entities.
 
 Steps:
-1. Read the partitions and their distinguishing features. Inspect examples of each partition with the SPARQL functions, including entities without names.
-2. Test candidate groups with test_partition; it shows how many entities match, where they are now, and what distinguishes them.
-3. Exclude, set or remove partitions; each change shows the new sizes.
+1. Read the partitions and their distinguishing features. Inspect examples of each partition with the SPARQL functions, including uncategorized entities and entities without names.
+2. Test candidate patterns with test_partition; it shows how many entities match, where they are now, and what distinguishes them.
+3. Set or remove partitions; each change shows the new sizes. Set the competition with set_competition.
 4. Call finish.

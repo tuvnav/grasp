@@ -39,7 +39,8 @@ class Task(StrEnum):
     OM_PROFILE_SPACE = "om-profile-space"
     OM_PROFILE_PARTITIONS = "om-profile-partitions"
     OM_PROFILE_ROLES = "om-profile-roles"
-    OM_PROFILE_PARTITION = "om-profile-partition"
+    OM_PROFILE_GROUPS = "om-profile-groups"
+    OM_PROFILE_GROUP = "om-profile-group"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {

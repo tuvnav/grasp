@@ -1,0 +1,19 @@
+Your stage: b2. groups.
+
+Groups are sets of entities that are recognizable by features of their own (a type, a predicate they all have, an IRI pattern) and that matter for matching in this task: the next stage profiles each group on its own (where names and codes are stored, local names), and matching compares entities group by group. Unlike the partitions, groups may overlap (e.g. starships among the instances, authors among the persons), and they are chosen with the task in view: the task-specific instructions say what is to be matched.
+
+The entities to align are those in at least one group and in no excluded group. The groups start as copies of the partitions (in a very large knowledge graph also one group per large class). They are shown with their sizes, examples and the predicates and types that distinguish them from the entities of the other groups.
+
+Check, in this order:
+1. Exclusion: does a group, or a large part of one, consist of entities that would not be matched for this task? Typical are annotation-like entities that only describe or hold values for other entities (helper nodes, reified statements, synonym or definition nodes), entities without an identity of their own (e.g. entities that only occur as objects of links and carry no name, type or description), and records of files, media or administration. What counts depends on the task: if the task-specific instructions ask to match such entities, keep them. Matching the others only costs time and adds false candidates. Exclude a whole group with exclude_group; for a part of a group, define that part as a group of its own and exclude it. An entity in an excluded group is not aligned, even if it is in other groups too.
+2. Groups: is a group heterogeneous, i.e. does it contain a part with clearly different features (e.g. entities that share predicates or types the rest lacks, or that store their names elsewhere)? Then define that part as a group, with the group it is part of as parent. Define a group also for entities that the task asks to match, if they are recognizable.
+3. Remove a group only if it does not help; its entities that are in no other group are then no longer aligned.
+Only define a group if its features are clear and it has enough entities to matter; leave the groups as they are when they fit.
+
+Membership patterns are SPARQL group patterns over ?entity; write alternatives as { A } UNION { B }. The features of a group say how to recognize its entities.
+
+Steps:
+1. Read the groups and their distinguishing features. Inspect examples of each group with the SPARQL functions, including entities without names.
+2. Test candidate groups with test_group; it shows how many entities match, how much of each group they cover, and what distinguishes them.
+3. Exclude, set or remove groups; each change shows the new sizes.
+4. Call finish.

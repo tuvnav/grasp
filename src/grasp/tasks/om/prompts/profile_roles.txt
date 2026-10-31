@@ -2,7 +2,7 @@ Your stage: c. roles of the whole knowledge graph.
 
 A default was computed from a standard canon of predicates (RDFS, OWL, SKOS, OBO and Dublin Core) and structure relations; it keeps the canon elements this knowledge graph uses. It is shown with the coverage of each element per partition, together with the most frequent predicates of the knowledge graph. Check the default and correct and complete it where this knowledge graph deviates from the canon: names or codes under local properties, relations encoded indirectly (e.g. in OWL restrictions, reified statements or intermediate nodes), alias or identity links, definitions that are only editorial notes.
 
-Roles are set for the whole knowledge graph; the next stage derives each partition's roles from them (elements a partition does not use are dropped there automatically) and adds what is specific to a partition. So add an element here if it has its role wherever it occurs, even if only one partition uses it.
+Roles are set for the whole knowledge graph; a later stage derives the roles of each group of entities from them (elements a group does not use are dropped there automatically) and adds what is specific to a group. So add an element here if it has its role wherever it occurs, even if only one partition uses it.
 
 Roles:
 - names: preferred names. synonyms: alternative names.
