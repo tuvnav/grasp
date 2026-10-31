@@ -2,23 +2,39 @@ import random
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, Callable
+
+from pydantic import BaseModel, ValidationError
+
 from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model.base import Message
 from grasp.tasks.base import GraspTask
-from grasp.functions import find_manager
-from grasp.tasks.om.compare import key_anchors, stratum
-from grasp.tasks.om.model import (
-    IRI, PROMPT_DIR, UNCATEGORIZED, AnchorConflict,
-    AnchorRecord, AnchorStageResult, FunctionRegistry,
-    KeyAnchor, KeyAnchorParams, SelectedRun, 
-    TryKeyAnchorResult, SIDES, add_equivalence_condition, configured_namespaces, load_prompt, load_task_instructions, resolve_managers)
-from grasp.tasks.om.retrieve import determine_entity_space, namespace_counts, retrieve_key_rows
+from grasp.tasks.om.data_models.anchors import (
+    AnchorConflict,
+    AnchorRecord,
+    AnchorStageResult,
+    KeyAnchor,
+    KeyAnchorParams,
+    SelectedRun,
+    TryKeyAnchorResult,
+)
+from grasp.tasks.om.foundation.configuration import (
+    configured_namespaces,
+    load_task_instructions,
+)
+from grasp.tasks.om.foundation.types import IRI, SIDES
+from grasp.tasks.om.foundation.vocabulary import UNCATEGORIZED
+from grasp.tasks.om.kg_operations.anchor_key_retrieval import (
+    determine_entity_space,
+    namespace_counts,
+    retrieve_key_rows,
+)
+from grasp.tasks.om.kg_operations.key_comparison import key_anchors, stratum
+from grasp.tasks.om.tasks.function_registry import FunctionRegistry
+from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
+from grasp.tasks.om.tasks.task_input import resolve_managers
 from grasp.utils import FunctionCallException, format_section
-from pydantic import BaseModel, ValidationError
-
 
 # TODO: Move this to central place
 # example anchors per stratum in the LLM view of a result

@@ -1,8 +1,8 @@
-from grasp.tasks.om.alignment_state import AlignmentState
-from grasp.tasks.om.candidate_model import Generator
-from grasp.tasks.om.model import Side
-from grasp.tasks.om.profile_model import GroupDefinition, KgProfile
-from grasp.tasks.om.scope_model import GroupRef, Population
+from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.data_models.candidate_generators import Generator
+from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile
+from grasp.tasks.om.data_models.scope import GroupRef, Population
+from grasp.tasks.om.foundation.types import Side
 from grasp.utils import FunctionCallException
 
 

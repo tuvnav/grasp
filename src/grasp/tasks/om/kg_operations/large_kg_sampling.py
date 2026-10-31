@@ -9,7 +9,7 @@ do not finish there. Instead:
   (which membership each matches, asked for the sampled entities only), and
   all statistics of the profile (coverage, value kinds, usage of patterns,
   local names, examples) are computed on them: the grouping subquery becomes a
-  VALUES table of (entity, group), so every query of kg_profile works unchanged
+  VALUES table of (entity, group), so every query of profile_statistics works unchanged
   and scales with the sample, not with the KG;
 - sizes are estimated from the member counts and the share of each sample
   that falls into the partition or group (for partitions: the first match in
@@ -18,23 +18,29 @@ do not finish there. Instead:
 - stage b2 starts with a group per large class (rdf:type) besides the partitions.
 
 The sample of a KG is registered per KG name while a stage runs
-(use_sample), so the query functions of kg_profile pick it up.
+(use_sample), so the query functions of grouping and profile_statistics pick it up.
 """
-from collections import Counter
-from dataclasses import dataclass, field
 import math
 import re
-
-from grasp.manager import KgManager
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable
 
-from grasp.tasks.om.model import (
-    IRI, LABEL_PREDICATES, RDF_TYPE, SYNONYM_PREDICATES, UNIVERSE, local_name, sparql_path, union_alternatives,
+from grasp.manager import KgManager
+from grasp.tasks.om.foundation.types import IRI
+from grasp.tasks.om.foundation.vocabulary import (
+    LABEL_PREDICATES,
+    RDF_TYPE,
+    SYNONYM_PREDICATES,
+    UNIVERSE,
+    local_name,
 )
-from grasp.tasks.om.retrieve import select_rows, values_clause
+from grasp.tasks.om.sparql_access.execution import select_rows
+from grasp.tasks.om.sparql_access.query_building import sparql_path, union_alternatives
+from grasp.tasks.om.sparql_access.values import values_clause
 
 if TYPE_CHECKING:
-    from grasp.tasks.om.kg_profile import Grouping
+    from grasp.tasks.om.kg_operations.grouping import Grouping
 
 # a KG with more triples, or whose triples cannot be counted, is profiled in the large mode
 LARGE_TRIPLES = 100_000_000
@@ -226,7 +232,7 @@ def values_block(entities: list[IRI]) -> str:
 # --- stage a: prefixes from class samples ---------------------------------------------
 
 def prefix_of(iri: str) -> str:
-    """As PREFIX_EXPRESSION of kg_profile: host and first path segment if more path follows."""
+    """As PREFIX_EXPRESSION of profile_statistics: host and first path segment if more path follows."""
     scheme, sep, rest = iri.partition("://")
     if not sep:
         cut = max(iri.rfind("#"), iri.rfind("/"))

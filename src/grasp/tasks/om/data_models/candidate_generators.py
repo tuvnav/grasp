@@ -2,22 +2,22 @@
 Data model of the candidate stage (after the anchor certification): a
 generator produces, per source entity, a list of target candidates.
 
-    Generator = Population   which entities (scope_model)
+    Generator = Population   which entities (scope.py)
               × Strategy     how candidates are found, one of three families:
                              key         exact equality of normalized values (hash join)
                              vector      similarity of values in a vector space (top-k search)
                              neighbours  witnesses: neighbours already matched to each other
               × Selection    how scores become a candidate list
 
-Key and vector strategies compare values (scope_model.SideValues), neighbour
+Key and vector strategies compare values (scope.ValuePatterns), neighbour
 strategies the current alignment, so they change from round to round.
 """
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.model import StructureRelation
-from grasp.tasks.om.scope_model import Normalization, Population, ValuePatterns
+from grasp.tasks.om.data_models.patterns import StructureRelation
+from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
 
 
 class KeyStrategy(BaseModel):

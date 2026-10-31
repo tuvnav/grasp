@@ -3,9 +3,14 @@ look the same in all stages. Task-specific views (e.g. of an anchor result or an
 entity context) stay with their task and use these blocks."""
 from grasp.sparql.types import Binding
 from grasp.tasks.entities import Entity
-from grasp.tasks.om.model import (
-    IRI, OWL_ON_PROPERTY, RDF_FIRST, RDF_REST, RDF_TYPE, VOCABULARY_PREFIXES,
-    BindingType, BlankNodeTree, local_name,
+from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
+from grasp.tasks.om.foundation.vocabulary import (
+    OWL_ON_PROPERTY,
+    RDF_FIRST,
+    RDF_REST,
+    RDF_TYPE,
+    VOCABULARY_PREFIXES,
+    local_name,
 )
 
 # restriction predicates and their keyword in Manchester syntax

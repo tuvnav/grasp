@@ -1,41 +1,95 @@
 """
-The five stages of the KG profile (profile_model.py), each a GRASP task on one KG:
+The five stages of the KG profile (data_models/profile.py), each a GRASP task on one KG:
     om-profile-space       a.  entity space
     om-profile-partitions  b1. exclusive partitions (kinds) and which do not compete
     om-profile-roles       c.  KG-wide roles and structure relations
     om-profile-groups      b2. overlapping groups, with the task in view; exclusion
     om-profile-group       d.  one group: local names and deviations from the KG-wide roles
 """
+import re
 from collections import Counter
 from enum import StrEnum
-import re
 from typing import Callable
 
 from grasp.manager import KgManager
-from grasp.tasks.om.kg_profile import (
-    Coverage, Grouping, LocalNameStats, Sides, canon_roles, complement, default_entity_space,
-    default_roles, distinguishing_features, element_sparql, element_usage, estimated_sizes, group_grouping,
-    group_sizes, grouping_query, kind_partitions, local_name_stats, local_name_type, member_coverage,
-    members_query, membership_overlap, partition_grouping, predicate_coverage, prefix_counts, prefix_totals,
-    rest, sample_entities, type_coverage,
+from grasp.tasks.om.data_models.profile import (
+    ROLE_FIELDS,
+    GroupDefinition,
+    GroupOrigin,
+    GroupProfile,
+    KgProfile,
+    Partition,
+    Roles,
+    Stage,
+    WithinKgNonCompetingPair,
+    derived_roles,
+    describe_profile,
+    diff_roles,
+    effective_roles,
+    role_elements,
+    roles_from_elements,
+    short_iri,
 )
-from grasp.tasks.om.kg_sample import (
-    class_counts, count_triples, current_sample, default_class_groups, is_large, large_prefix_counts,
-    type_membership, values_block,
+from grasp.tasks.om.foundation.configuration import configured_namespaces
+from grasp.tasks.om.foundation.types import NameType
+from grasp.tasks.om.foundation.vocabulary import (
+    LABEL_PREDICATES,
+    RDF_TYPE,
+    UNCATEGORIZED,
+    VOCABULARY,
+    namespace_of,
 )
-from grasp.tasks.om.model import (
-    LABEL_PREDICATES, RDF_TYPE, UNCATEGORIZED, VOCABULARY, NameType, configured_namespaces, namespace_of,
-    sparql_path,
+from grasp.tasks.om.kg_operations.entity_rendering import clip
+from grasp.tasks.om.kg_operations.grouping import (
+    Grouping,
+    estimated_sizes,
+    group_grouping,
+    group_sizes,
+    grouping_query,
+    kind_partitions,
+    partition_grouping,
 )
-from grasp.tasks.om.profile_model import (
-    ROLE_FIELDS, GroupDefinition, GroupOrigin, GroupProfile, KgProfile, Partition, Roles, Stage, WithinKgNonCompetingPair,
-    derived_roles, describe_profile, diff_roles, effective_roles, role_elements, roles_from_elements, short_iri,
+from grasp.tasks.om.kg_operations.large_kg_sampling import (
+    class_counts,
+    count_triples,
+    current_sample,
+    default_class_groups,
+    is_large,
+    large_prefix_counts,
+    type_membership,
+    values_block,
 )
-from grasp.tasks.om.profile_stage import (
-    RoleEditingTask, ProfileStageTask, run_rows, share,
+from grasp.tasks.om.kg_operations.profile_statistics import (
+    Coverage,
+    LocalNameStats,
+    Sides,
+    canon_roles,
+    complement,
+    default_entity_space,
+    default_roles,
+    distinguishing_features,
+    element_sparql,
+    element_usage,
+    local_name_stats,
+    local_name_type,
+    member_coverage,
+    members_query,
+    membership_overlap,
+    predicate_coverage,
+    prefix_counts,
+    prefix_totals,
+    rest,
+    sample_entities,
+    type_coverage,
 )
-from grasp.tasks.om.render import clip
-from grasp.tasks.om.retrieve import select_rows
+from grasp.tasks.om.sparql_access.execution import select_rows
+from grasp.tasks.om.sparql_access.query_building import sparql_path
+from grasp.tasks.om.tasks.profile_stage import (
+    ProfileStageTask,
+    RoleEditingTask,
+    run_rows,
+    share,
+)
 from grasp.utils import FunctionCallException, format_section
 
 NUM_NAMESPACES = 15

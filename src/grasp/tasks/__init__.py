@@ -13,15 +13,15 @@ from grasp.tasks.entity_linking import EntityLinkingTask
 from grasp.tasks.general_qa import GeneralQaTask
 from grasp.tasks.notes_from_samples import NotesFromSamplesTask
 from grasp.tasks.notes_from_traces import NotesFromTracesTask
-from grasp.tasks.om.verify_task import OMVerifyTask
+from grasp.tasks.om.tasks.verify_task import OMVerifyTask
 from grasp.tasks.question_generation import QuestionGenerationTask
 from grasp.tasks.shapes_setup import ShapesSetupTask
 from grasp.tasks.sparql_qa import SparqlQaTask
 from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
-from grasp.tasks.om.agentic_search_verify import OmTask
-from grasp.tasks.om.anchor_task import OMAnchorTask
-from grasp.tasks.om.profile_tasks import PROFILE_TASKS
+from grasp.tasks.om.tasks.agentic_search_verify import OmTask
+from grasp.tasks.om.tasks.anchor_task import OMAnchorTask
+from grasp.tasks.om.tasks.profile_tasks import PROFILE_TASKS
 
 
 # official tasks supported by GRASP, excluding exploration

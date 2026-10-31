@@ -1,21 +1,19 @@
-import json
 import random
 from collections import deque
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import requests
-import yaml
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 from universal_ml_utils.table import generate_table
 
+from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
 from grasp.configs import GraspConfig, ShapeConfig
 from grasp.functions import (
+    SHAPE_CAVEAT,
     find_manager,
     list_triples,
     update_known_from_shape_iris,
-    SHAPE_CAVEAT,
 )
 from grasp.manager import KgManager, format_kgs
 from grasp.model import Message
@@ -23,15 +21,22 @@ from grasp.sparql.types import AskResult, ObjType, SelectResult
 from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import FeedbackTask, GraspTask
 from grasp.tasks.entities import Entity, prepare_entity
+from grasp.tasks.om.data_models.correspondence import (
+    Correspondence,
+    PotentialCorrespondences,
+)
+from grasp.tasks.om.data_models.relations import (
+    RELATION_PROFILES,
+    RelationProfile,
+    RelationSpec,
+    allows_many,
+    get_relation_profile,
+)
+from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.tasks.om.foundation.types import Side
+from grasp.tasks.om.kg_operations.entity_rendering import format_entity
+from grasp.tasks.om.sparql_access.lookups import ensure_known
 from grasp.utils import FunctionCallException, format_list, format_notes, format_section
-from grasp.build.shapes import collect_iris, compute_shape, emit_pseudo_shex
-from grasp.tasks.om.model import (
-    allows_many, PotentialCorrespondences,
-    Correspondence, RelationProfile,
-    RELATION_PROFILES, Side,
-    RelationSpec, ensure_known, get_relation_profile, load_task_instructions
-    )
-from grasp.tasks.om.render import format_entity
 
 
 class AlignmentTaskInput(BaseModel):

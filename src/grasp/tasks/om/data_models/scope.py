@@ -1,25 +1,19 @@
-"""
-Scope of a matching strategy, shared by the stages after the KG profile (the
-candidate stage now, the anchor stage later):
-    Population     which entities: groups of the source and target KG
-    SideValues     which values of an entity are compared: profile roles or own patterns
-    Normalization  how the values are prepared: own transforms, then the
-                   normalization ladder of compare.NORMALIZATION_LEVELS
-
-Groups are defined by the profile stages (profile_model.GroupDefinition) and
-referred to by name here; a stage may also define one inline for its own use.
-"""
 import re
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.compare import NORMALIZATION_LEVELS, STANDARD_LEVELS
-from grasp.tasks.om.model import PredicatePattern, Side
-from grasp.tasks.om.profile_model import GroupDefinition, RoleName, Roles
+from grasp.tasks.om.data_models.patterns import PredicatePattern
+from grasp.tasks.om.data_models.profile import GroupDefinition, RoleName
+from grasp.tasks.om.foundation.text_normalization import (
+    NORMALIZATION_LEVELS,
+    STANDARD_LEVELS,
+)
+from grasp.tasks.om.foundation.types import Side
 
 # the entities of a side that are not matched yet
 REST = "rest"
+
 
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
@@ -46,26 +40,7 @@ class ValuePatterns(BaseModel):
         return self.source if side == Side.SOURCE or self.target is None else self.target
 
 
-def value_parts(source: ValuePatternSource, roles: Roles) -> list[str]:
-    """SPARQL alternatives over ?s (entity) and ?o (value), each binding ?role."""
-    if isinstance(source, PredicatePattern):
-        return [
-            f'{part} BIND("own" AS ?role)'
-            for part in source.alternatives()
-            ]
-    role_names = source
-    parts = []
-    for role_name in role_names:
-        pattern = getattr(roles, role_name)
-        if pattern is not None:
-            parts += [
-                f'{part} BIND("{role_name}" AS ?role)'
-                for part in pattern.alternatives()
-                ]
-    return parts
-
-
-# levels of the anchor normalization ladder (compare.py), fine to coarse
+# levels of the anchor normalization ladder (foundation/text_normalization.py), fine to coarse
 type LevelName = Literal[*NORMALIZATION_LEVELS]
 
 

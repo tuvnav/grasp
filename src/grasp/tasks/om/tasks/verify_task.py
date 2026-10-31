@@ -1,17 +1,25 @@
+import random
 from dataclasses import dataclass, field
 from enum import StrEnum
-import random
 from typing import Any, Callable, Optional
 
 from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.tasks.om.entity_context import entity_context
-from grasp.tasks.om.model import (
-    IRI, AnchorRecord, EntityContextConfig, Verdict, VerdictOption, VerifyInput,
-    add_equivalence_condition, get_om_task_config, load_task_instructions, local_name, namespace_of, FunctionRegistry, resolve_managers
+from grasp.tasks.om.data_models.anchors import AnchorRecord
+from grasp.tasks.om.data_models.verification import Verdict, VerdictOption, VerifyInput
+from grasp.tasks.om.foundation.configuration import (
+    get_om_task_config,
+    load_task_instructions,
 )
+from grasp.tasks.om.foundation.types import IRI
+from grasp.tasks.om.foundation.vocabulary import local_name, namespace_of
+from grasp.tasks.om.kg_operations.entity_context import entity_context
+from grasp.tasks.om.kg_operations.entity_context_config import EntityContextConfig
+from grasp.tasks.om.tasks.function_registry import FunctionRegistry
+from grasp.tasks.om.tasks.prompting import add_equivalence_condition
+from grasp.tasks.om.tasks.task_input import resolve_managers
 from grasp.utils import FunctionCallException, format_section
 
 

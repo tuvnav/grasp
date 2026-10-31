@@ -24,16 +24,24 @@ from universal_ml_utils.ops import consume_generator
 
 from grasp.configs import GraspConfig
 from grasp.core import generate
-from grasp.manager import KgManager
 from grasp.functions import find_manager
+from grasp.manager import KgManager
 from grasp.model import Message, get_model
 from grasp.tasks import get_task
-from grasp.utils import format_enumerate, format_section
-from grasp.tasks.om.model import (
-    AnchorRecord, AnchorStageResult, CertificationParams, CertificationResult, JudgeMode,
-    JudgeVariant, Judgment, StratumDecision, StratumDecisionType, Verdict, VerdictOption,
+from grasp.tasks.om.data_models.anchors import AnchorRecord, AnchorStageResult
+from grasp.tasks.om.data_models.verification import (
+    CertificationParams,
+    CertificationResult,
+    JudgeMode,
+    JudgeVariant,
+    Judgment,
+    StratumDecision,
+    StratumDecisionType,
+    Verdict,
+    VerdictOption,
     VerifyInput,
 )
+from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"
 # config nesting: task_kwargs -> om (shared by all om stages) -> om_verify

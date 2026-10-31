@@ -38,7 +38,9 @@ from typing import Iterable, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from grasp.tasks.om.model import IRI, VOCABULARY_PREFIXES, NameType, PredicatePattern, StructureRelation
+from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
+from grasp.tasks.om.foundation.types import IRI, NameType
+from grasp.tasks.om.foundation.vocabulary import VOCABULARY_PREFIXES
 
 
 class Stage(StrEnum):
@@ -67,7 +69,7 @@ class Roles(BaseModel):
     structure: list[StructureRelation] = []
 
 
-# the role fields of Roles; also used to refer to a role elsewhere (scope_model.SideValues)
+# the role fields of Roles; also used to refer to a role elsewhere (scope.ValuePatterns)
 type RoleName = Literal["names", "synonyms", "definitions", "codes", "cross_references", "noise"]
 ROLE_FIELDS: tuple[RoleName, ...] = get_args(RoleName.__value__)  # a type alias keeps its Literal in __value__
 assert set(Roles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the fields of Roles differ"
@@ -139,7 +141,7 @@ class Flag(BaseModel):
 class KgProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kg_name: str
-    # triples of the KG (None: not countable); a large KG is profiled on samples (kg_sample)
+    # triples of the KG (None: not countable); a large KG is profiled on samples (large_kg_sampling)
     triples: int | None = None
     large: bool = False
     entity_space: list[str] = []

@@ -22,9 +22,10 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from grasp.tasks.om.model import IRI, Correspondence, Side
-from grasp.tasks.om.profile_model import KgProfile, WithinKgNonCompetingPair
-from grasp.tasks.om.scope_model import Population
+from grasp.tasks.om.data_models.correspondence import Correspondence
+from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPair
+from grasp.tasks.om.data_models.scope import Population
+from grasp.tasks.om.foundation.types import IRI, Side
 
 
 class CrossKgNonCompetingPair(BaseModel):

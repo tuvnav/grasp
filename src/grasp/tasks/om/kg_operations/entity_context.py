@@ -4,14 +4,23 @@ from typing import Iterable
 
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding
-from grasp.tasks.om.model import (
-    IRI, VOCABULARY, BindingType, BlankNodeTree, EntityContextConfig, local_name, sparql_path,
+from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
+from grasp.tasks.om.foundation.vocabulary import VOCABULARY, local_name
+from grasp.tasks.om.kg_operations.entity_context_config import EntityContextConfig
+from grasp.tasks.om.kg_operations.entity_rendering import (
+    clip,
+    display_iri,
+    render_blank_node,
 )
-from grasp.tasks.om.render import clip, display_iri, render_blank_node
-from grasp.tasks.om.retrieve import (
-    retrieve_blank_nodes, retrieve_outgoing_edges, select_object_iris, select_rows, to_sparql_term,
-    values_blocks,
+from grasp.tasks.om.sparql_access.execution import select_object_iris, select_rows
+from grasp.tasks.om.sparql_access.lookups import (
+    retrieve_blank_nodes,
+    retrieve_outgoing_edges,
+    to_sparql_term,
 )
+from grasp.tasks.om.sparql_access.query_building import sparql_path
+from grasp.tasks.om.sparql_access.values import values_blocks
+
 
 @dataclass
 class IncomingEdgesSummary:

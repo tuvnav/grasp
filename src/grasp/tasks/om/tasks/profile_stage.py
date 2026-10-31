@@ -11,24 +11,43 @@ try_pattern and the role editing functions.
 from abc import abstractmethod
 from typing import Any, Callable
 
+from pydantic import BaseModel, ValidationError
+
 from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.tasks.om.kg_profile import Grouping, Sides, element_usage, grouping_query
-from grasp.tasks.om.kg_sample import KgSample, use_sample
-from grasp.tasks.om.model import (
-    LABEL_PREDICATES, PredicatePattern, StructureRelation, get_om_task_config, load_prompt,
-    load_task_instructions, sparql_path,
+from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
+from grasp.tasks.om.data_models.profile import (
+    ROLE_FIELDS,
+    STAGES,
+    ElementKey,
+    Finding,
+    Flag,
+    KgProfile,
+    Roles,
+    Stage,
+    Usage,
+    check_structure,
+    describe_pattern,
+    describe_profile,
+    describe_relation,
+    role_elements,
+    roles_from_elements,
 )
-from grasp.tasks.om.profile_model import (
-    ROLE_FIELDS, STAGES, ElementKey, Finding, Flag, KgProfile, Roles, Stage, Usage, check_structure,
-    describe_pattern, describe_profile, describe_relation, role_elements, roles_from_elements,
+from grasp.tasks.om.foundation.configuration import (
+    get_om_task_config,
+    load_task_instructions,
 )
-from grasp.tasks.om.render import clip
-from grasp.tasks.om.retrieve import select_rows
+from grasp.tasks.om.foundation.vocabulary import LABEL_PREDICATES
+from grasp.tasks.om.kg_operations.entity_rendering import clip
+from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_query
+from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
+from grasp.tasks.om.kg_operations.profile_statistics import Sides, element_usage
+from grasp.tasks.om.sparql_access.execution import select_rows
+from grasp.tasks.om.sparql_access.query_building import sparql_path
+from grasp.tasks.om.tasks.prompting import load_prompt
 from grasp.utils import FunctionCallException, format_enumerate, format_section
-from pydantic import BaseModel, ValidationError
 
 FINISH = "finish"
 LARGE_KG_NOTE = (
@@ -136,7 +155,7 @@ class ProfileStageTask(GraspTask):
         if self.input_profile.kg_name != self.manager.kg:
             raise ValueError(f"Profile of {self.input_profile.kg_name} given for {self.manager.kg}")
         self.finished, self.rationale, self.stats = False, None, {}
-        # a large KG is profiled on samples of the partitions and groups (kg_sample); the
+        # a large KG is profiled on samples of the partitions and groups (large_kg_sampling); the
         # space stage decides whether the KG is large
         large = self.input_profile.large and self.stage != Stage.SPACE
         use_sample(self.manager, KgSample(self.manager, tuple(self.input_profile.entity_space)) if large else None)
