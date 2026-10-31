@@ -17,7 +17,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from grasp.tasks.om.model import StructureRelation
-from grasp.tasks.om.scope_model import Normalization, Population, SideValues
+from grasp.tasks.om.scope_model import Normalization, Population, ValuePatterns
 
 
 class KeyStrategy(BaseModel):
@@ -25,7 +25,7 @@ class KeyStrategy(BaseModel):
     name). The anchor rule is a key strategy on names with a unique selection."""
     model_config = ConfigDict(extra="forbid")
     kind: Literal["key"] = "key"
-    values: SideValues = SideValues()
+    values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
 
 
@@ -35,7 +35,7 @@ class VectorStrategy(BaseModel):
     compared by cosine; the best score over the value pairs counts."""
     model_config = ConfigDict(extra="forbid")
     kind: Literal["vector"] = "vector"
-    values: SideValues = SideValues()
+    values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization(levels=["words"])
     vectorizer: Literal["idf_tokens", "char_3grams", "embedding"] = "idf_tokens"
     model: str | None = None  # embedding model; None: the default model

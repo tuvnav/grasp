@@ -168,10 +168,13 @@ class KgSample:
     def assignments(self, grouping: "Grouping", entities: list[IRI] | None = None) -> list[tuple[IRI, str]]:
         """(entity, member name) of the sampled entities of a grouping (or the
         given entities): every match of an overlapping grouping, the first of an
-        exclusive one. UNIVERSE is not sampled."""
+        exclusive one, without the entities matching a membership of minus.
+        UNIVERSE is not sampled."""
         members = [(name, m) for name, m in grouping.members if m != UNIVERSE]
         if entities is None:
             entities = self.entities(m for _, m in members)
+        left_out = set().union(*(self.matches(membership, entities) for membership in grouping.minus))
+        entities = [entity for entity in entities if entity not in left_out]
         pairs: dict[tuple[IRI, str], None] = {}
         assigned: set[IRI] = set()
         for name, membership in members:

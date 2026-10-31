@@ -68,8 +68,8 @@ class Roles(BaseModel):
 
 
 # the role fields of Roles; also used to refer to a role elsewhere (scope_model.SideValues)
-RoleName = Literal["names", "synonyms", "definitions", "codes", "cross_references", "noise"]
-ROLE_FIELDS: tuple[RoleName, ...] = get_args(RoleName)
+type RoleName = Literal["names", "synonyms", "definitions", "codes", "cross_references", "noise"]
+ROLE_FIELDS: tuple[RoleName, ...] = get_args(RoleName.__value__)  # a type alias keeps its Literal in __value__
 assert set(Roles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the fields of Roles differ"
 
 
@@ -81,18 +81,18 @@ class Partition(BaseModel):
     features: str = ""      # what distinguishes its entities from the rest
 
 
-class Separation(BaseModel):
+class WithinKgNonCompetingPair(BaseModel):
     """Two partitions of one KG whose entities do not compete with each other
     (e.g. properties and classes): neither is a candidate or a rival for the
-    other. Symmetric."""
+    other. Symmetric: the order of the two partitions does not matter."""
     model_config = ConfigDict(extra="forbid")
-    a: str
-    b: str
+    partition_a: str
+    partition_b: str
     reason: str = ""
     set_by: str = "partitions"  # the stage that set it (stage b1, or a stage of the pair)
 
-    def pair(self) -> frozenset[str]:
-        return frozenset((self.a, self.b))
+    def partitions(self) -> frozenset[str]:
+        return frozenset((self.partition_a, self.partition_b))
 
 
 class GroupOrigin(StrEnum):
@@ -144,23 +144,24 @@ class KgProfile(BaseModel):
     large: bool = False
     entity_space: list[str] = []
     partitions: dict[str, Partition] = {}  # in order: the first match wins
-    separations: list[Separation] = []
+    non_competing_pairs: list[WithinKgNonCompetingPair] = []
     roles: Roles = Roles()
     groups: dict[str, GroupProfile] = {}
     findings: list[Finding] = []
     flags: list[Flag] = []
 
     @model_validator(mode="after")
-    def separations_name_partitions(self) -> Self:
-        for separation in self.separations:
-            unknown = separation.pair() - set(self.partitions)
-            if unknown or separation.a == separation.b:
-                raise ValueError(f"separation {separation.a} - {separation.b}: "
+    def non_competing_pairs_name_partitions(self) -> Self:
+        for pair in self.non_competing_pairs:
+            unknown = pair.partitions() - set(self.partitions)
+            if unknown or pair.partition_a == pair.partition_b:
+                raise ValueError(f"non-competing pair {pair.partition_a} - {pair.partition_b}: "
                                  + (f"unknown partitions {sorted(unknown)}" if unknown else "a partition with itself"))
         return self
 
-    def separated(self, a: str, b: str) -> bool:
-        return any(s.pair() == {a, b} for s in self.separations)
+    def competes(self, partition_a: str, partition_b: str) -> bool:
+        """Whether entities of the two partitions of this KG compete with each other."""
+        return all(pair.partitions() != {partition_a, partition_b} for pair in self.non_competing_pairs)
 
     def excluded_groups(self) -> list[str]:
         return [name for name, group in self.groups.items() if group.definition.excluded]
@@ -208,11 +209,11 @@ def roles_from_elements(elements: Elements) -> Roles:
     return Roles(structure=structure, **fields)
 
 
-def same_element(a: str | StructureRelation, b: str | StructureRelation) -> bool:
+def same_element(element_a: str | StructureRelation, element_b: str | StructureRelation) -> bool:
     # a relation edited without change stays the same, whoever set it
-    if isinstance(a, StructureRelation) and isinstance(b, StructureRelation):
-        return a.model_dump(exclude={"source"}) == b.model_dump(exclude={"source"})
-    return a == b
+    if isinstance(element_a, StructureRelation) and isinstance(element_b, StructureRelation):
+        return element_a.model_dump(exclude={"source"}) == element_b.model_dump(exclude={"source"})
+    return element_a == element_b
 
 
 # number of entities of a group (or partition) that an element covers (as ?s)
@@ -253,8 +254,8 @@ def diff_roles(derived: Roles, final: Roles) -> tuple[Roles, Roles]:
     """(added, removed) that turn derived into final. A relation changed
     under its name is added (overriding), not removed and added."""
     before, after = role_elements(derived), role_elements(final)
-    added = {k: v for k, v in after.items() if k not in before or not same_element(before[k], v)}
-    removed = {k: v for k, v in before.items() if k not in after}
+    added = {key: value for key, value in after.items() if key not in before or not same_element(before[key], value)}
+    removed = {key: value for key, value in before.items() if key not in after}
     return roles_from_elements(added), roles_from_elements(removed)
 
 
@@ -289,11 +290,12 @@ def short_iri(iri: str) -> str:
 
 
 def describe_pattern(pattern: PredicatePattern) -> str:
-    return ", ".join([short_iri(p) for p in pattern.predicates] + [f"pattern {{ {p} }}" for p in pattern.patterns])
+    return ", ".join([short_iri(predicate) for predicate in pattern.predicates]
+                     + [f"pattern {{ {sparql} }}" for sparql in pattern.patterns])
 
 
 def describe_relation(relation: StructureRelation) -> str:
-    algebra = [a for a in ("transitive", "symmetric") if getattr(relation, a)]
+    algebra = [property_name for property_name in ("transitive", "symmetric") if getattr(relation, property_name)]
     if relation.inverse_of:
         algebra.append(f"inverse of {relation.inverse_of}")
     return (f"{relation.name} ({relation.kind.value}{', ' + ', '.join(algebra) if algebra else ''}): "
@@ -303,7 +305,7 @@ def describe_relation(relation: StructureRelation) -> str:
 def describe_roles(roles: Roles) -> list[str]:
     lines = [f"{field.replace('_', ' ')}: {describe_pattern(pattern)}"
              for field in ROLE_FIELDS if (pattern := getattr(roles, field)) is not None]
-    lines += [f"structure relation {describe_relation(r)}" for r in roles.structure]
+    lines += [f"structure relation {describe_relation(relation)}" for relation in roles.structure]
     return lines
 
 
@@ -316,11 +318,13 @@ def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable
     if profile.entity_space:
         notes.append("Entities to align have IRIs starting with " + " or ".join(profile.entity_space) + ".")
     if profile.partitions:
-        parts = [f"{name}: {p.features}" if p.features else name for name, p in profile.partitions.items()]
+        parts = [f"{name}: {partition.features}" if partition.features else name
+                 for name, partition in profile.partitions.items()]
         notes.append("Partitions (exclusive kinds of entities): " + "; ".join(parts) + ".")
-    if profile.separations:
+    if profile.non_competing_pairs:
         notes.append("Do not compete with each other: "
-                     + "; ".join(f"{s.a} and {s.b}" + (f" ({s.reason})" if s.reason else "") for s in profile.separations)
+                     + "; ".join(f"{pair.partition_a} and {pair.partition_b}" + (f" ({pair.reason})" if pair.reason else "")
+                                 for pair in profile.non_competing_pairs)
                      + ".")
     if profile.groups:
         parts = []

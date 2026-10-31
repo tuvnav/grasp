@@ -28,7 +28,7 @@ from grasp.tasks.om.model import (
     sparql_path,
 )
 from grasp.tasks.om.profile_model import (
-    ROLE_FIELDS, GroupDefinition, GroupOrigin, GroupProfile, KgProfile, Partition, Roles, Separation, Stage,
+    ROLE_FIELDS, GroupDefinition, GroupOrigin, GroupProfile, KgProfile, Partition, Roles, Stage, WithinKgNonCompetingPair,
     derived_roles, describe_profile, diff_roles, effective_roles, role_elements, roles_from_elements, short_iri,
 )
 from grasp.tasks.om.profile_stage import (
@@ -92,11 +92,12 @@ def ensure_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Par
     return default_partitions(task, space)
 
 
-def default_separations(partitions: dict[str, Partition]) -> list[Separation]:
+def default_non_competing_pairs(partitions: dict[str, Partition]) -> list[WithinKgNonCompetingPair]:
     """Properties do not compete with the other kinds (the default before stage b1 decides)."""
     if "property" not in partitions:
         return []
-    return [Separation(a="property", b=name, reason="properties and entities are not equivalent")
+    return [WithinKgNonCompetingPair(partition_a="property", partition_b=name,
+                                     reason="properties and entities are not equivalent")
             for name in partitions if name != "property"]
 
 
@@ -471,13 +472,13 @@ class PartitionsTask(GroupingStageTask):
     def prepare(self, input: dict) -> str:
         self.space = ensure_space(self)
         self.definitions = ensure_partitions(self, self.space)
-        self.separations = (list(self.input_profile.separations) if self.input_profile.partitions
-                            else default_separations(self.definitions))
+        self.non_competing_pairs = (list(self.input_profile.non_competing_pairs) if self.input_profile.partitions
+                                    else default_non_competing_pairs(self.definitions))
         self.tested = set()
         self.update_statistics()
         self.stats = size_stats(self)
         self.default = self.with_partitions()
-        sections = [self.format_sizes(), self.format_separations()]
+        sections = [self.format_sizes(), self.format_non_competing_pairs()]
         for name in self.names() + [UNCATEGORIZED]:
             if self.sizes.get(name):
                 title = (f"Partition {name}" if name != UNCATEGORIZED
@@ -496,24 +497,26 @@ class PartitionsTask(GroupingStageTask):
         return complement(getattr(self, kind), self.sizes, name)
 
     def format_sizes(self) -> str:
-        lines = [f"  {name}: {size_text(self, name)}: {{ {d.membership_sparql} }}"
-                 + (f"; {d.features}" if d.features else "") for name, d in self.definitions.items()]
+        lines = [f"  {name}: {size_text(self, name)}: {{ {partition.membership_sparql} }}"
+                 + (f"; {partition.features}" if partition.features else "")
+                 for name, partition in self.definitions.items()]
         if self.sizes.get(UNCATEGORIZED):
             lines.append(f"  {UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} subjects match no partition")
         return "Partitions in order (an entity belongs to the first that matches):\n" + "\n".join(lines)
 
-    def format_separations(self) -> str:
-        if not self.separations:
+    def format_non_competing_pairs(self) -> str:
+        if not self.non_competing_pairs:
             return "Partitions that do not compete with each other: none (all compete)."
         return "Partitions that do not compete with each other:\n" + "\n".join(
-            f"  {s.a} - {s.b}" + (f": {s.reason}" if s.reason else "") for s in self.separations)
+            f"  {pair.partition_a} - {pair.partition_b}" + (f": {pair.reason}" if pair.reason else "")
+            for pair in self.non_competing_pairs)
 
     def with_partitions(self) -> KgProfile:
-        """The input profile with the partitions that have entities and their separations."""
-        kept = {name: d for name, d in self.definitions.items() if self.sizes.get(name)}
-        separations = [s for s in self.separations if s.pair() <= set(kept)]
+        """The input profile with the partitions that have entities and their non-competing pairs."""
+        kept = {name: partition for name, partition in self.definitions.items() if self.sizes.get(name)}
+        non_competing_pairs = [pair for pair in self.non_competing_pairs if pair.partitions() <= set(kept)]
         return self.input_profile.model_copy(update={
-            "entity_space": self.space, "partitions": kept, "separations": separations}, deep=True)
+            "entity_space": self.space, "partitions": kept, "non_competing_pairs": non_competing_pairs}, deep=True)
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [
@@ -560,11 +563,11 @@ class PartitionsTask(GroupingStageTask):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "a": {"type": "string"}, "b": {"type": "string"},
+                        "partition_a": {"type": "string"}, "partition_b": {"type": "string"},
                         "compete": {"type": "boolean"},
                         "reason": {"type": "string"},
                     },
-                    "required": ["a", "b", "compete", "reason"],
+                    "required": ["partition_a", "partition_b", "compete", "reason"],
                     "additionalProperties": False,
                 },
             }, self.set_competition),
@@ -592,18 +595,21 @@ class PartitionsTask(GroupingStageTask):
         name = self.known_name(fn_args.get("name"))
         if len(self.definitions) == 1:
             raise FunctionCallException("The last partition cannot be removed")
-        self.update_definitions({n: d for n, d in self.definitions.items() if n != name})
-        self.separations = [s for s in self.separations if name not in s.pair()]
+        self.update_definitions({other: partition for other, partition in self.definitions.items() if other != name})
+        self.non_competing_pairs = [pair for pair in self.non_competing_pairs if name not in pair.partitions()]
         return f"Partition {name} removed.\n{self.format_sizes()}"
 
     def set_competition(self, fn_args: dict) -> str:
-        a, b = self.known_name(fn_args.get("a")), self.known_name(fn_args.get("b"))
-        if a == b:
+        partition_a = self.known_name(fn_args.get("partition_a"))
+        partition_b = self.known_name(fn_args.get("partition_b"))
+        if partition_a == partition_b:
             raise FunctionCallException("Entities of one partition always compete with each other")
-        self.separations = [s for s in self.separations if s.pair() != {a, b}]
+        self.non_competing_pairs = [pair for pair in self.non_competing_pairs
+                                    if pair.partitions() != {partition_a, partition_b}]
         if not fn_args.get("compete"):
-            self.separations.append(Separation(a=a, b=b, reason=fn_args.get("reason") or ""))
-        return self.format_separations()
+            self.non_competing_pairs.append(WithinKgNonCompetingPair(
+                partition_a=partition_a, partition_b=partition_b, reason=fn_args.get("reason") or ""))
+        return self.format_non_competing_pairs()
 
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         profile = self.with_partitions()
@@ -905,8 +911,11 @@ class GroupsTask(GroupingStageTask):
 # --- d. one group --------------------------------------------------------------------
 
 def single_grouping(profile: KgProfile, group: str) -> Grouping:
-    """The grouping of one group only: stage d looks at no other group."""
-    return Grouping(((group, profile.groups[group].definition.membership_sparql),), exclusive=False)
+    """The grouping of one group only, without the entities of excluded groups
+    (they are not aligned): stage d looks at no other group."""
+    excluded = tuple(profile.groups[name].definition.membership_sparql
+                     for name in profile.excluded_groups() if name != group)
+    return Grouping(((group, profile.groups[group].definition.membership_sparql),), exclusive=False, minus=excluded)
 
 
 def group_name_stats(manager: KgManager, grouping: Grouping, space: list[str], group: str,

@@ -16,13 +16,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from grasp.tasks.om.compare import NORMALIZATION_LEVELS, STANDARD_LEVELS
 from grasp.tasks.om.model import PredicatePattern, Side
-from grasp.tasks.om.profile_model import GroupDefinition, RoleName
+from grasp.tasks.om.profile_model import GroupDefinition, RoleName, Roles
 
 # the entities of a side that are not matched yet
 REST = "rest"
 
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
+
 
 class Population(BaseModel):
     """Source and target entities a strategy compares."""
@@ -33,16 +34,35 @@ class Population(BaseModel):
 
 # values of an entity: one or more roles of its (effective) profile, or an own
 # pattern over ?s (the entity) and ?o (the value); a pattern may compute ?o (BIND)
-type ValueSource = RoleName | list[RoleName] | PredicatePattern
+type ValuePatternSource = list[RoleName] | PredicatePattern
 
 
-class SideValues(BaseModel):
+class ValuePatterns(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: ValueSource = ["names", "synonyms"]
-    target: ValueSource | None = None  # None: like the source
+    source: ValuePatternSource = ["names", "synonyms"]
+    target: ValuePatternSource | None = None  # None: like the source
 
-    def side(self, side: Side) -> ValueSource:
+    def side(self, side: Side) -> ValuePatternSource:
         return self.source if side == Side.SOURCE or self.target is None else self.target
+
+
+def value_parts(source: ValuePatternSource, roles: Roles) -> list[str]:
+    """SPARQL alternatives over ?s (entity) and ?o (value), each binding ?role."""
+    if isinstance(source, PredicatePattern):
+        return [
+            f'{part} BIND("own" AS ?role)'
+            for part in source.alternatives()
+            ]
+    role_names = source
+    parts = []
+    for role_name in role_names:
+        pattern = getattr(roles, role_name)
+        if pattern is not None:
+            parts += [
+                f'{part} BIND("{role_name}" AS ?role)'
+                for part in pattern.alternatives()
+                ]
+    return parts
 
 
 # levels of the anchor normalization ladder (compare.py), fine to coarse

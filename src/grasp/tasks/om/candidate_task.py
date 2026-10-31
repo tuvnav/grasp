@@ -30,5 +30,8 @@ def resolve_population(kg_profile: KgProfile, population: Population) -> dict[Si
     }
 
 
-def get_key_candidates(alignment_state: AlignmentState, kg_profile: KgProfile, generator: Generator):
+def get_key_candidates(
+        alignment_state: AlignmentState, kg_profile: KgProfile, generator: Generator
+        ):
     groups = resolve_population(kg_profile, generator.population)
+    source_groups, target_groups = groups[Side.SOURCE], groups[Side.TARGET]

@@ -9,10 +9,14 @@ from grasp.build.data import stream_json
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding, SelectResult
 from grasp.sparql.utils import READ_TIMEOUT, execute, prepare_identifier_for_sparql
+from grasp.tasks.om.alignment_state import AlignmentState
+from grasp.tasks.om.kg_profile import Grouping, grouping_query
 from grasp.tasks.om.model import (
-    IRI, ALL, BindingType, BlankNodeTree, KeyEntityRow, QueryPart, SideQueries, SparqlTerm,
+    IRI, ALL, BindingType, BlankNodeTree, KeyEntityRow, PredicatePattern, QueryPart, Side, SideQueries, SparqlTerm,
     compose, namespace_of,
 )
+from grasp.tasks.om.scope_model import ValuePatternSource, ValuePatterns, value_parts
+from grasp.tasks.om.profile_model import RoleName, Roles
 
 # IRIs per VALUES block in batch queries
 BATCH_SIZE = 200
@@ -193,3 +197,19 @@ def retrieve_blank_nodes(manager: KgManager, entity: IRI, max_depth: int) -> Bla
         if not new_edges or not any(row["o"].typ == BindingType.BNODE for row in rows):
             break
     return tree
+
+
+def retrieve_value_rows(
+        manager: KgManager,
+        grouping: Grouping,
+        namespace: Iterable[str],
+        value_source: ValuePatternSource,
+        roles: Roles
+        ):
+    parts = value_parts(value_source, roles)
+
+    query_sparql = grouping_query(
+        manager, grouping, namespace,
+        "?entity ?group ?o", parts=parts
+        )
+    rows = stream_rows(manager, query_sparql)

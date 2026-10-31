@@ -85,9 +85,11 @@ class Grouping:
     """Named membership patterns over ?entity, in order. Exclusive (partitions):
     an entity belongs to the first member that matches. Overlapping (groups): to
     every one that matches. A name may occur more than once (one set of
-    entities defined by several patterns)."""
-    members: tuple[tuple[str, str], ...]
+    entities defined by several patterns). Entities matching a membership of
+    minus belong to no member (e.g. the entities of excluded groups)."""
+    members: tuple[tuple[str, str], ...]  # ((group_name, sparql_pattern), ...)
     exclusive: bool = True
+    minus: tuple[str, ...] = ()
 
     @property
     def names(self) -> list[str]:
@@ -95,7 +97,8 @@ class Grouping:
 
     def merged(self, name: str) -> "Grouping":
         """All members as one: the entities of any member."""
-        return Grouping(tuple((name, m) for _, m in self.members if m != UNIVERSE), exclusive=True)
+        return Grouping(tuple((name, membership) for _, membership in self.members if membership != UNIVERSE),
+                        exclusive=True, minus=self.minus)
 
 
 def kind_membership(kind: str, large: bool = False) -> str:
@@ -157,7 +160,8 @@ def grouping_subquery(manager: KgManager, grouping: Grouping | None,
         f"{{ {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
         for rank, (_, membership) in enumerate(grouping.members)
     )
-    where = f"{branches}\nFILTER(isIRI(?entity))\n{space_filter(space)}"
+    minus = "".join(f"\nMINUS {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }}" for membership in grouping.minus)
+    where = f"{branches}\nFILTER(isIRI(?entity))\n{space_filter(space)}{minus}"
     names = " ".join(f"({rank} {literal(name)})" for rank, (name, _) in enumerate(grouping.members))
     if grouping.exclusive:
         return prefixes, (f"{{ SELECT ?entity ?group WHERE {{\n"

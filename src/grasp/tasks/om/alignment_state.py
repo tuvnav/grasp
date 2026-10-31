@@ -1,40 +1,49 @@
 """
 State of the alignment of one KG pair, passed through the stages after the KG
 profiles (the anchor stage later, the candidate stage now):
-    source, target   the profiles of the two KGs: the working profiles of the
-                     pair (copies of the profile pipeline's output, changed
-                     only here by the stages of the pair)
-    correspondences  accepted correspondences, with their provenance
-    rejected         pairs judged wrong (counter-evidence; not proposed again)
-    reviewed         source entities the judge has looked at, and the outcome
-    exclusions       which partitions of different KGs do not compete
-    skipped          populations not worth searching
+    source, target                the profiles of the two KGs: the working profiles
+                                  of the pair (copies of the profile pipeline's
+                                  output, changed only here by the stages of the pair)
+    correspondences               accepted correspondences, with their provenance
+    rejected                      pairs judged wrong (counter-evidence; not proposed again)
+    reviewed                      source entities the judge has looked at, and the outcome
+    cross_kg_non_competing_pairs  partitions of the two KGs that do not compete
+    skipped                       populations not worth searching
 
 Competition: uniqueness, ambiguity and rank of a candidate are measured against
 all entities of both KGs except those in partitions that do not compete with its
 partition. Partitions (profile stage b1) are exclusive, so the partition of an
 entity and thus its competitors are unique. Each fact has one place: within a KG,
-the separations of its profile; across the KGs, the exclusions here (none at the
-start: every partition competes until a pair stage excludes pairs).
+the non-competing pairs of its profile; across the KGs, the non-competing pairs
+here (none at the start: every partition competes until a stage of the pair
+forbids it).
 """
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from grasp.tasks.om.model import IRI, SIDES, Correspondence, Side
-from grasp.tasks.om.profile_model import KgProfile, Separation
+from grasp.tasks.om.model import IRI, Correspondence, Side
+from grasp.tasks.om.profile_model import KgProfile, WithinKgNonCompetingPair
 from grasp.tasks.om.scope_model import Population
 
 
-def partition_key(side: Side, partition: str) -> str:
-    """A partition of one side, e.g. source:class."""
-    return f"{Side(side).value}:{partition}"
-
-
-class Exclusion(BaseModel):
+class CrossKgNonCompetingPair(BaseModel):
+    """A partition of the source KG and one of the target KG whose entities do
+    not compete with each other."""
     model_config = ConfigDict(extra="forbid")
+    source_partition: str
+    target_partition: str
     reason: str
     set_by: str  # the stage that set it
+
+
+class NonCompetingPartition(BaseModel):
+    """A partition that does not compete with a given one (non_competing_partitions)."""
+    model_config = ConfigDict(extra="forbid")
+    side: Side
+    partition: str
+    reason: str
+    set_by: str
 
 
 class ReviewedSource(BaseModel):
@@ -61,22 +70,13 @@ class AlignmentState(BaseModel):
     correspondences: list[Correspondence] = []
     rejected: list[Correspondence] = []
     reviewed: list[ReviewedSource] = []
-    # partition_key -> partition_key of a partition of the other KG it does not
-    # compete with -> why; symmetric (each exclusion is stored for both partitions)
-    exclusions: dict[str, dict[str, Exclusion]] = {}
+    cross_kg_non_competing_pairs: list[CrossKgNonCompetingPair] = []
     skipped: list[SkippedScope] = []
 
     @model_validator(mode="after")
-    def exclusions_valid(self) -> Self:
-        known = {partition_key(side, name) for side in SIDES for name in self.profile(side).partitions}
-        for a, excluded in self.exclusions.items():
-            for b, exclusion in excluded.items():
-                if a.split(":", 1)[0] == b.split(":", 1)[0]:
-                    raise ValueError(f"exclusion {a} - {b} within one KG: a separation of its profile")
-                if {a, b} - known:
-                    raise ValueError(f"exclusion {a} - {b} names unknown partitions {sorted({a, b} - known)}")
-                if self.exclusions.get(b, {}).get(a) != exclusion:
-                    raise ValueError(f"exclusion {a} - {b} is not stored for both partitions alike")
+    def cross_kg_pairs_name_partitions(self) -> Self:
+        for pair in self.cross_kg_non_competing_pairs:
+            self.check_known_partitions(Side.SOURCE, pair.source_partition, Side.TARGET, pair.target_partition)
         return self
 
     @classmethod
@@ -95,55 +95,71 @@ class AlignmentState(BaseModel):
     def profile(self, side: Side) -> KgProfile:
         return self.source if Side(side) == Side.SOURCE else self.target
 
-    def check_partitions(self, side_a: Side, a: str, side_b: Side, b: str) -> None:
-        for side, name in ((side_a, a), (side_b, b)):
-            if name not in self.profile(side).partitions:
-                raise ValueError(f"unknown partition {partition_key(side, name)}; partitions: "
+    def check_known_partitions(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> None:
+        for side, partition in ((side_a, partition_a), (side_b, partition_b)):
+            if partition not in self.profile(side).partitions:
+                raise ValueError(f"unknown partition {partition} of the {Side(side).value} KG; partitions: "
                                  f"{', '.join(self.profile(side).partitions) or 'none'}")
-        if Side(side_a) == Side(side_b) and a == b:
+        if Side(side_a) == Side(side_b) and partition_a == partition_b:
             raise ValueError("entities of one partition always compete with each other")
 
-    def exclude(self, side_a: Side, a: str, side_b: Side, b: str, reason: str, set_by: str) -> None:
-        """The two partitions no longer compete: within a KG as a separation of
-        its profile, across the KGs as an exclusion of the state."""
-        self.check_partitions(side_a, a, side_b, b)
+    def forbid_competition(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str,
+                           reason: str, set_by: str) -> None:
+        """The two partitions no longer compete: within a KG as a non-competing
+        pair of its profile, across the KGs as one of the state."""
+        self.allow_competition(side_a, partition_a, side_b, partition_b)  # replaces an earlier reason
         if Side(side_a) == Side(side_b):
-            profile = self.profile(side_a)
-            profile.separations = [s for s in profile.separations if s.pair() != {a, b}]
-            profile.separations.append(Separation(a=a, b=b, reason=reason, set_by=set_by))
+            self.profile(side_a).non_competing_pairs.append(WithinKgNonCompetingPair(
+                partition_a=partition_a, partition_b=partition_b, reason=reason, set_by=set_by))
             return
-        exclusion = Exclusion(reason=reason, set_by=set_by)
-        key_a, key_b = partition_key(side_a, a), partition_key(side_b, b)
-        self.exclusions.setdefault(key_a, {})[key_b] = exclusion
-        self.exclusions.setdefault(key_b, {})[key_a] = exclusion
+        source_partition, target_partition = self.by_side(side_a, partition_a, partition_b)
+        self.cross_kg_non_competing_pairs.append(CrossKgNonCompetingPair(
+            source_partition=source_partition, target_partition=target_partition, reason=reason, set_by=set_by))
 
-    def include(self, side_a: Side, a: str, side_b: Side, b: str) -> bool:
+    def allow_competition(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> bool:
         """Lets the two partitions compete again; whether they did not before."""
-        self.check_partitions(side_a, a, side_b, b)
+        self.check_known_partitions(side_a, partition_a, side_b, partition_b)
         if Side(side_a) == Side(side_b):
             profile = self.profile(side_a)
-            kept = [s for s in profile.separations if s.pair() != {a, b}]
-            found = len(kept) < len(profile.separations)
-            profile.separations = kept
+            kept = [pair for pair in profile.non_competing_pairs if pair.partitions() != {partition_a, partition_b}]
+            found = len(kept) < len(profile.non_competing_pairs)
+            profile.non_competing_pairs = kept
             return found
-        key_a, key_b = partition_key(side_a, a), partition_key(side_b, b)
-        found = self.exclusions.get(key_a, {}).pop(key_b, None) is not None
-        self.exclusions.get(key_b, {}).pop(key_a, None)
-        for key in (key_a, key_b):
-            if key in self.exclusions and not self.exclusions[key]:
-                del self.exclusions[key]
+        source_partition, target_partition = self.by_side(side_a, partition_a, partition_b)
+        kept = [pair for pair in self.cross_kg_non_competing_pairs
+                if (pair.source_partition, pair.target_partition) != (source_partition, target_partition)]
+        found = len(kept) < len(self.cross_kg_non_competing_pairs)
+        self.cross_kg_non_competing_pairs = kept
         return found
 
-    def excluded(self, side: Side, partition: str) -> dict[str, Exclusion]:
-        """The partitions (partition_key) the partition does not compete with,
-        within its KG (separations of its profile) and across."""
-        within = {partition_key(side, s.b if s.a == partition else s.a): Exclusion(reason=s.reason, set_by=s.set_by)
-                  for s in self.profile(side).separations if partition in s.pair()}
-        return within | self.exclusions.get(partition_key(side, partition), {})
+    @staticmethod
+    def by_side(side_a: Side, partition_a: str, partition_b: str) -> tuple[str, str]:
+        """(source partition, target partition) of two partitions of different KGs."""
+        return (partition_a, partition_b) if Side(side_a) == Side.SOURCE else (partition_b, partition_a)
 
-    def competes(self, side_a: Side, a: str, side_b: Side, b: str) -> bool:
-        """Whether an entity of partition b (side_b) may be a candidate or a
-        rival for an entity of partition a (side_a)."""
+    def competes(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> bool:
+        """Whether an entity of partition_b (side_b) may be a candidate or a
+        rival for an entity of partition_a (side_a). Partitions, not entities:
+        the caller looks up the partition of an entity first."""
         if Side(side_a) == Side(side_b):
-            return not self.profile(side_a).separated(a, b)
-        return partition_key(side_b, b) not in self.exclusions.get(partition_key(side_a, a), {})
+            return self.profile(side_a).competes(partition_a, partition_b)
+        source_partition, target_partition = self.by_side(side_a, partition_a, partition_b)
+        return all((pair.source_partition, pair.target_partition) != (source_partition, target_partition)
+                   for pair in self.cross_kg_non_competing_pairs)
+
+    def non_competing_partitions(self, side: Side, partition: str) -> list[NonCompetingPartition]:
+        """The partitions of both KGs that do not compete with this one."""
+        side = Side(side)
+        other_side = Side.TARGET if side == Side.SOURCE else Side.SOURCE
+        result = [
+            NonCompetingPartition(side=side, partition=pair.partition_b if pair.partition_a == partition else pair.partition_a,
+                                  reason=pair.reason, set_by=pair.set_by)
+            for pair in self.profile(side).non_competing_pairs if partition in pair.partitions()
+        ]
+        for pair in self.cross_kg_non_competing_pairs:
+            own, other = ((pair.source_partition, pair.target_partition) if side == Side.SOURCE
+                          else (pair.target_partition, pair.source_partition))
+            if own == partition:
+                result.append(NonCompetingPartition(side=other_side, partition=other, reason=pair.reason,
+                                                    set_by=pair.set_by))
+        return result
