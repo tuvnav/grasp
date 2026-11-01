@@ -286,7 +286,7 @@ class ProfileStageTask(GraspTask):
             flags = [Flag(stage=self.stage, **f) for f in fn_args.get("flags") or []]
         except (ValidationError, TypeError) as e:
             raise FunctionCallException(f"Invalid findings or flags: {e}") from e
-        known = set(profile.partitions) | set(profile.groups)
+        known = set(profile.partition_names()) | set(profile.group_names())
         unknown = {x.group for x in findings + flags if x.group and x.group not in known}
         if unknown:
             raise FunctionCallException(

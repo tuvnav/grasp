@@ -98,9 +98,9 @@ class AlignmentState(BaseModel):
 
     def check_known_partitions(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> None:
         for side, partition in ((side_a, partition_a), (side_b, partition_b)):
-            if partition not in self.profile(side).partitions:
+            if partition not in self.profile(side).partition_names():
                 raise ValueError(f"unknown partition {partition} of the {Side(side).value} KG; partitions: "
-                                 f"{', '.join(self.profile(side).partitions) or 'none'}")
+                                 f"{', '.join(self.profile(side).partition_names()) or 'none'}")
         if Side(side_a) == Side(side_b) and partition_a == partition_b:
             raise ValueError("entities of one partition always compete with each other")
 

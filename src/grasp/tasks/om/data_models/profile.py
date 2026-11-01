@@ -79,6 +79,7 @@ class Partition(BaseModel):
     """A partition of stage b1. Partitions are exclusive: in their order, an
     entity belongs to the first whose membership matches."""
     model_config = ConfigDict(extra="forbid")
+    name: str
     membership_sparql: str  # SPARQL group pattern over ?entity
     features: str = ""      # what distinguishes its entities from the rest
 
@@ -104,22 +105,31 @@ class GroupOrigin(StrEnum):
 
 
 class GroupDefinition(BaseModel):
+    """Which entities form a group: its name and membership. Also the form in
+    which a stage defines a group inline (scope.Population)."""
     model_config = ConfigDict(extra="forbid")
+    name: str
     membership_sparql: str  # SPARQL group pattern over ?entity
     origin: GroupOrigin = GroupOrigin.FORMED
     parent: str | None = None  # a group it is part of (for reading; membership is its own)
     features: str = ""         # what distinguishes its entities, to recognize them
-    # not aligned (e.g. image pages, helper nodes); an entity in an excluded group
-    # is not aligned even if it is in other groups
-    excluded: bool = False
 
 
 class GroupProfile(BaseModel):
+    """A group of the profile: its definition and what the stages decided about it."""
     model_config = ConfigDict(extra="forbid")
     definition: GroupDefinition
+    # not aligned (e.g. image pages, helper nodes), set by stage b2; an entity in an
+    # excluded group is not aligned even if it is in other groups
+    excluded: bool = False
+    exclusion_reason: str = ""
     local_name_type: NameType | None = None  # set by stage d (or its default)
     added: Roles = Roles()    # group-specific; a relation overrides the KG-wide one of its name
     removed: Roles = Roles()  # used in the group, but uninformative there
+
+    @property
+    def name(self) -> str:
+        return self.definition.name
 
 
 class Finding(BaseModel):
@@ -145,29 +155,108 @@ class KgProfile(BaseModel):
     triples: int | None = None
     large: bool = False
     entity_space: list[str] = []
-    partitions: dict[str, Partition] = {}  # in order: the first match wins
+    partitions: list[Partition] = []  # in order: the first match wins
     non_competing_pairs: list[WithinKgNonCompetingPair] = []
     roles: Roles = Roles()
-    groups: dict[str, GroupProfile] = {}
+    groups: list[GroupProfile] = []
     findings: list[Finding] = []
     flags: list[Flag] = []
 
     @model_validator(mode="after")
     def non_competing_pairs_name_partitions(self) -> Self:
         for pair in self.non_competing_pairs:
-            unknown = pair.partitions() - set(self.partitions)
+            unknown = pair.partitions() - set(self.partition_names())
             if unknown or pair.partition_a == pair.partition_b:
                 raise ValueError(f"non-competing pair {pair.partition_a} - {pair.partition_b}: "
                                  + (f"unknown partitions {sorted(unknown)}" if unknown else "a partition with itself"))
         return self
+
+    @model_validator(mode="after")
+    def partition_group_names_unique(self) -> Self:
+        for kind, names in (
+                ("partition", self.partition_names()), ("group", self.group_names())
+                ):
+            duplicates = sorted({name for name in names if names.count(name) > 1})
+            if duplicates:
+                raise ValueError(f"Duplicate {kind} names: {duplicates}")
+        return self
+
+    def partition_names(self) -> list[str]:
+        return [partition.name for partition in self.partitions]
+
+    def group_names(self) -> list[str]:
+        return [group.name for group in self.groups]
+
+    def get_partition(self, partition_name: str) -> Partition:
+        partition_names = self.partition_names()
+        if partition_name not in partition_names:
+            error_message = (
+                f"{partition_name} is not an existing partition name "
+                f"in this knowledge graph."
+                )
+            if len(partition_names) == 0:
+                error_message += " No partitions defined in this knowledge graph yet."
+            else:
+                error_message += f" Choose between: {partition_names}"
+            raise ValueError(error_message)
+        try:
+            return next(p for p in self.partitions if p.name == partition_name)
+        except Exception as e:
+            raise ValueError from e
+
+    def get_group(self, group_name: str) -> GroupProfile:
+        group_names = self.group_names()
+        if group_name not in group_names:
+            error_message = (
+                f"{group_name} is not an existing group name "
+                f"in this knowledge graph."
+                )
+            if len(group_names) == 0:
+                error_message += " No groups defined in this knowledge graph yet."
+            else:
+                error_message += f" Choose between: {group_names}"
+            raise ValueError(error_message)
+        try:
+            return next(g for g in self.groups if g.name == group_name)
+        except Exception as e:
+            raise ValueError from e
 
     def competes(self, partition_a: str, partition_b: str) -> bool:
         """Whether entities of the two partitions of this KG compete with each other."""
         return all(pair.partitions() != {partition_a, partition_b} for pair in self.non_competing_pairs)
 
     def excluded_groups(self) -> list[str]:
-        return [name for name, group in self.groups.items() if group.definition.excluded]
+        return [group.name for group in self.groups if group.excluded]
 
+    def with_group(self, group: GroupProfile | GroupDefinition) -> "KgProfile":
+        """A copy with the group appended."""
+        copied = self.model_copy(deep=True)
+        copied.append_group(group)
+        return copied
+
+    def with_replaced_group(self, group: GroupProfile) -> "KgProfile":
+        """A copy with the group of the same name replaced by this one."""
+        self.get_group(group.name)
+        groups = [group if existing.name == group.name else existing for existing in self.groups]
+        return self.model_copy(update={"groups": groups}, deep=True)
+
+    def group_name_already_exists(self, name: str) -> bool:
+        return name in self.group_names()
+
+    def append_group(self, group: GroupDefinition | GroupProfile):
+        match group:
+            case GroupDefinition():
+                group_profile = GroupProfile(definition=group)
+            case GroupProfile():
+                group_profile = group
+            case _:
+                raise TypeError(f"Expected GroupDefinition or GroupProfile, got {type(group)}")
+        if self.group_name_already_exists(group_profile.name):
+            raise ValueError(
+                f"{group_profile.name} already exists in this knowledge graph."
+                f" Please choose a new name. Already existing: {self.group_names()}"
+                )
+        self.groups.append(group_profile)
 
 # --- elements and deltas ------------------------------------------------------
 
@@ -312,7 +401,7 @@ def describe_roles(roles: Roles) -> list[str]:
 
 
 def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable[str] | None = None) -> list[str]:
-    """The profile as short notes for prompts (in place of structural notes).
+    """The profile as short notes for prompts.
     Patterns read from ?s, the entity, to ?o; structure relations from the
     specific to the general entity. With groups, only the findings about the
     whole KG and about these groups (or partitions)."""
@@ -320,8 +409,8 @@ def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable
     if profile.entity_space:
         notes.append("Entities to align have IRIs starting with " + " or ".join(profile.entity_space) + ".")
     if profile.partitions:
-        parts = [f"{name}: {partition.features}" if partition.features else name
-                 for name, partition in profile.partitions.items()]
+        parts = [f"{partition.name}: {partition.features}" if partition.features else partition.name
+                 for partition in profile.partitions]
         notes.append("Partitions (exclusive kinds of entities): " + "; ".join(parts) + ".")
     if profile.non_competing_pairs:
         notes.append("Do not compete with each other: "
@@ -330,21 +419,21 @@ def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable
                      + ".")
     if profile.groups:
         parts = []
-        for name, group in profile.groups.items():
+        for group in profile.groups:
             definition = group.definition
-            text = name
+            text = group.name
             if definition.parent:
                 text += f" (part of {definition.parent})"
             if definition.features:
                 text += f": {definition.features}"
-            if definition.excluded:
-                text += " [excluded from the alignment]"
+            if group.excluded:
+                text += " [excluded from the alignment" + (f": {group.exclusion_reason}" if group.exclusion_reason else "") + "]"
             parts.append(text)
         notes.append("Groups (may overlap): " + "; ".join(parts) + ".")
     role_lines = describe_roles(profile.roles)
     if role_lines:
         notes.append("Roles of predicates (?s entity, ?o value): " + "; ".join(role_lines) + ".")
-    for name, group in profile.groups.items():
+    for group in profile.groups:
         details = []
         if group.local_name_type is not None:
             details.append(f"local names of IRIs are {group.local_name_type.value}s"
@@ -355,7 +444,7 @@ def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable
         if removed:
             details.append("not informative here: " + "; ".join(removed))
         if details:
-            notes.append(f"Group {name}: " + "; ".join(details) + ".")
+            notes.append(f"Group {group.name}: " + "; ".join(details) + ".")
     if findings:
         shown = None if groups is None else set(groups)
         for finding in profile.findings:

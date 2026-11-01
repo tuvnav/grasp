@@ -137,12 +137,12 @@ def default_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Pa
     large = task.input_profile.large
     partitions = kind_partitions(large=large)
     sizes = estimated_sizes(task.manager, partition_grouping(partitions, rest=False), space)
-    return {name: p for name, p in partitions.items() if sizes.get(name)}
+    return {p.name: p for p in partitions if sizes.get(p.name)}
 
 
 def ensure_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Partition]:
     if task.input_profile.partitions:
-        return dict(task.input_profile.partitions)
+        return {p.name: p for p in task.input_profile.partitions}
     return default_partitions(task, space)
 
 
@@ -160,15 +160,17 @@ def ensure_groups(task: ProfileStageTask, space: list[str]) -> dict[str, GroupDe
     large KG, one per large class."""
     profile = task.input_profile
     if profile.groups:
-        return {name: g.definition for name, g in profile.groups.items()}
-    groups = {name: GroupDefinition(membership_sparql=p.membership_sparql, origin=GroupOrigin.PARTITION,
+        return {g.name: g.definition for g in profile.groups}
+    groups = {name: GroupDefinition(name=p.name, membership_sparql=p.membership_sparql, origin=GroupOrigin.PARTITION,
                                     features=p.features)
               for name, p in ensure_partitions(task, space).items()}
     if profile.large:
         for name, type_iri, _ in default_class_groups(task.manager, tuple(space), class_counts(task.manager)):
             if name not in groups:
-                groups[name] = GroupDefinition(membership_sparql=type_membership(type_iri), origin=GroupOrigin.CLASS,
-                                               features=f"typed {short_iri(type_iri)}")
+                groups[name] = GroupDefinition(
+                    name=name, membership_sparql=type_membership(type_iri),
+                    origin=GroupOrigin.CLASS, features=f"typed {short_iri(type_iri)}"
+                    )
     return groups
 
 
@@ -256,7 +258,7 @@ class SpaceTask(ProfileStageTask):
             return []
         names = {}
         rows = run_rows(self.manager, f"SELECT ?entity ?name WHERE {{ {values_block([e for e, _ in pairs])} "
-                                      f"?entity {sparql_path(LABEL_PREDICATES)} ?name }}")
+                        f"?entity {sparql_path(LABEL_PREDICATES)} ?name }}")
         for row in rows:
             names.setdefault(row["entity"].value, row["name"].value)
         return [f"  {e}" + (f' "{clip(names[e], 50)}"' if e in names else "") + f" ({c})" for e, c in pairs]
@@ -542,7 +544,7 @@ class PartitionsTask(GroupingStageTask):
 
     def grouping(self) -> Grouping:
         # the subjects outside all partitions only in a small KG (a large one is not scanned)
-        return partition_grouping(self.definitions, rest=not self.input_profile.large)
+        return partition_grouping(list(self.definitions.values()), rest=not self.input_profile.large)
 
     def names(self) -> list[str]:
         return list(self.definitions)
@@ -567,8 +569,9 @@ class PartitionsTask(GroupingStageTask):
 
     def with_partitions(self) -> KgProfile:
         """The input profile with the partitions that have entities and their non-competing pairs."""
-        kept = {name: partition for name, partition in self.definitions.items() if self.sizes.get(name)}
-        non_competing_pairs = [pair for pair in self.non_competing_pairs if pair.partitions() <= set(kept)]
+        kept = [partition for name, partition in self.definitions.items() if self.sizes.get(name)]
+        kept_names = {partition.name for partition in kept}
+        non_competing_pairs = [pair for pair in self.non_competing_pairs if pair.partitions() <= kept_names]
         return self.input_profile.model_copy(update={
             "entity_space": self.space, "partitions": kept, "non_competing_pairs": non_competing_pairs}, deep=True)
 
@@ -633,7 +636,7 @@ class PartitionsTask(GroupingStageTask):
         before = fn_args.get("before")
         if before is not None and self.known_name(before) == name:
             raise FunctionCallException("A partition cannot be placed before itself")
-        definition = Partition(membership_sparql=membership, features=fn_args.get("features") or "")
+        definition = Partition(name=name, membership_sparql=membership, features=fn_args.get("features") or "")
         items = [(n, d) for n, d in self.definitions.items() if n != name]
         if name in self.definitions:
             index = list(self.definitions).index(name)
@@ -670,8 +673,9 @@ class PartitionsTask(GroupingStageTask):
         if not profile.partitions:
             raise FunctionCallException("No partition has entities")
         self.stats = size_stats(self)
-        dropped = [name for name in self.definitions if name not in profile.partitions]
-        summary = "Partitions: " + ", ".join(f"{n} {self.stats['sizes'].get(n, 0)}" for n in profile.partitions)
+        dropped = [name for name in self.definitions if name not in profile.partition_names()]
+        summary = "Partitions: " + ", ".join(f"{name} {self.stats['sizes'].get(name, 0)}"
+                                             for name in profile.partition_names())
         if dropped:
             summary += f"; dropped as empty: {', '.join(dropped)}"
         return profile, summary
@@ -727,9 +731,9 @@ class RolesTask(RoleEditingTask):
         self.space = ensure_space(self)
         profile = self.input_profile
         if not profile.partitions:
-            profile = profile.model_copy(update={"partitions": ensure_partitions(self, self.space)})
+            profile = profile.model_copy(update={"partitions": list(ensure_partitions(self, self.space).values())})
         self.grouping = partition_grouping(profile.partitions, rest=False)
-        self.scope = list(profile.partitions)
+        self.scope = profile.partition_names()
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
         self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
         sides: dict[str, Sides] = {}
@@ -781,6 +785,8 @@ class GroupsTask(GroupingStageTask):
     def prepare(self, input: dict) -> str:
         self.space = ensure_space(self)
         self.definitions = ensure_groups(self, self.space)
+        # name of an excluded group -> reason
+        self.exclusions = {group.name: group.exclusion_reason for group in self.input_profile.groups if group.excluded}
         self.tested = set()
         self.update_statistics()
         self.stats = size_stats(self)
@@ -798,7 +804,7 @@ class GroupsTask(GroupingStageTask):
         return "\n\n".join(sections)
 
     def grouping(self) -> Grouping:
-        return group_grouping(self.definitions)
+        return group_grouping(list(self.definitions.values()))
 
     def names(self) -> list[str]:
         return list(self.definitions)
@@ -821,20 +827,23 @@ class GroupsTask(GroupingStageTask):
 
     def format_sizes(self) -> str:
         lines = []
-        for name, d in self.definitions.items():
-            notes = [d.origin.value] + ([f"part of {d.parent}"] if d.parent else [])
-            excluded = " [excluded]" if d.excluded else ""
-            lines.append(f"  {name}: {size_text(self, name)} ({', '.join(notes)}): {{ {d.membership_sparql} }}"
-                         + (f"; {d.features}" if d.features else "") + excluded)
+        for name, definition in self.definitions.items():
+            notes = [definition.origin.value] + ([f"part of {definition.parent}"] if definition.parent else [])
+            excluded = f" [excluded: {self.exclusions[name]}]" if name in self.exclusions else ""
+            lines.append(f"  {name}: {size_text(self, name)} ({', '.join(notes)}): {{ {definition.membership_sparql} }}"
+                         + (f"; {definition.features}" if definition.features else "") + excluded)
         return (f"Groups ({self.all_size} entities in any group; groups may overlap):\n" + "\n".join(lines))
 
     def with_groups(self) -> KgProfile:
         """The input profile with the groups that have entities; profiles of kept groups stay."""
-        old = self.input_profile.groups
-        groups = {
-            name: (old[name].model_copy(update={"definition": d}) if name in old else GroupProfile(definition=d))
-            for name, d in self.definitions.items() if self.sizes.get(name)
-        }
+        old = {group.name: group for group in self.input_profile.groups}
+        groups = []
+        for name, definition in self.definitions.items():
+            if not self.sizes.get(name):
+                continue
+            exclusion = {"excluded": name in self.exclusions, "exclusion_reason": self.exclusions.get(name, "")}
+            groups.append(old[name].model_copy(update={"definition": definition, **exclusion}) if name in old
+                          else GroupProfile(definition=definition, **exclusion))
         return self.input_profile.model_copy(update={"entity_space": self.space, "groups": groups}, deep=True)
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
@@ -895,34 +904,31 @@ class GroupsTask(GroupingStageTask):
         parent = fn_args.get("parent")
         if parent is not None and self.known_name(parent) == name:
             raise FunctionCallException("A group cannot be part of itself")
-        old = self.definitions.get(name)
-        definition = GroupDefinition(membership_sparql=membership, parent=parent, features=fn_args.get("features") or "",
-                                     excluded=old.excluded if old else False)
+        definition = GroupDefinition(name=name, membership_sparql=membership, parent=parent,
+                                     features=fn_args.get("features") or "")
         self.update_definitions({**self.definitions, name: definition})
         return f"Group {name} set.\n{self.format_sizes()}"
 
-    def excluded_share(self, definitions: dict[str, GroupDefinition]) -> float:
-        excluded = [name for name, d in definitions.items() if d.excluded]
-        if not excluded or not self.all_size:
+    def excluded_share(self, exclusions: dict[str, str]) -> float:
+        """Share of the entities in any group that are in an excluded group."""
+        if not exclusions or not self.all_size:
             return 0.0
-        grouping = Grouping(tuple(("excluded", definitions[n].membership_sparql) for n in excluded), exclusive=True)
+        grouping = Grouping(tuple(("excluded", self.definitions[name].membership_sparql) for name in exclusions),
+                            exclusive=True)
         return group_sizes(self.manager, grouping, self.space).get("excluded", 0) / self.all_size
 
     def exclude_group(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
         excluded = fn_args.get("excluded", True)
-        definitions = {**self.definitions, name: self.definitions[name].model_copy(update={"excluded": excluded})}
-        if excluded and all(d.excluded for d in definitions.values()):
+        exclusions = {other: reason for other, reason in self.exclusions.items() if other != name}
+        if excluded:
+            exclusions[name] = fn_args.get("reason") or ""
+        if set(exclusions) == set(self.definitions):
             raise FunctionCallException("Not every group can be excluded: nothing would be aligned. To exclude "
                                         "part of a group, define that part as a group of its own and exclude it.")
-        reason = fn_args.get("reason") or ""
-        if excluded and reason:
-            features = definitions[name].features
-            definitions[name] = definitions[name].model_copy(
-                update={"features": f"{features}; excluded: {reason}" if features else f"excluded: {reason}"})
-        self.definitions = definitions
+        self.exclusions = exclusions
         try:
-            excluded_share = self.excluded_share(definitions)
+            excluded_share = self.excluded_share(exclusions)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
         result = f"Group {name} {'excluded' if excluded else 'included'}; {excluded_share:.0%} of the entities in groups are excluded now."
@@ -938,10 +944,12 @@ class GroupsTask(GroupingStageTask):
         membership = self.definitions[name].membership_sparql
         remaining = {n: d for n, d in self.definitions.items() if n != name}
         try:
-            size, overlap = membership_overlap(self.manager, group_grouping(remaining), self.space, membership)
+            size, overlap = membership_overlap(self.manager, group_grouping(list(remaining.values())), self.space,
+                                               membership)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
         self.update_definitions(remaining)
+        self.exclusions.pop(name, None)
         alone = overlap.get(UNCATEGORIZED, 0)
         return (f"Group {name} removed; {share(alone, size)} of its entities are in no other group and are no "
                 f"longer aligned.\n{self.format_sizes()}")
@@ -950,13 +958,14 @@ class GroupsTask(GroupingStageTask):
         profile = self.with_groups()
         if not profile.groups:
             raise FunctionCallException("No group has entities")
-        if all(g.definition.excluded for g in profile.groups.values()):
+        if all(g.excluded for g in profile.groups):
             raise FunctionCallException("Every group is excluded: nothing would be aligned")
         self.stats = size_stats(self)
-        dropped = [name for name in self.definitions if name not in profile.groups]
+        dropped = [name for name in self.definitions if name not in profile.group_names()]
         summary = "Groups: " + ", ".join(
-            f"{n} {self.stats['sizes'].get(n, 0)}" + (" (excluded)" if g.definition.excluded else "")
-            for n, g in profile.groups.items())
+            f"{group.name} {self.stats['sizes'].get(group.name, 0)}" + (" (excluded)" if group.excluded else "")
+            for group in profile.groups
+        )
         if dropped:
             summary += f"; dropped as empty: {', '.join(dropped)}"
         return profile, summary
@@ -967,9 +976,9 @@ class GroupsTask(GroupingStageTask):
 def single_grouping(profile: KgProfile, group: str) -> Grouping:
     """The grouping of one group only, without the entities of excluded groups
     (they are not aligned): stage d looks at no other group."""
-    excluded = tuple(profile.groups[name].definition.membership_sparql
+    excluded = tuple(profile.get_group(name).definition.membership_sparql
                      for name in profile.excluded_groups() if name != group)
-    return Grouping(((group, profile.groups[group].definition.membership_sparql),), exclusive=False, minus=excluded)
+    return Grouping(((group, profile.get_group(group).definition.membership_sparql),), exclusive=False, minus=excluded)
 
 
 def group_name_stats(manager: KgManager, grouping: Grouping, space: list[str], group: str,
@@ -981,7 +990,7 @@ def group_name_stats(manager: KgManager, grouping: Grouping, space: list[str], g
 def group_defaults(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupProfile, LocalNameStats]:
     """Profile of a group without LLM: the local name type from its sample, its delta unchanged."""
     grouping = single_grouping(profile, group)
-    current = profile.groups[group]
+    current = profile.get_group(group)
     usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
     stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
@@ -1014,7 +1023,7 @@ def unassigned_predicates(roles: Roles, coverage: dict[str, Coverage]) -> list[t
 def group_mode(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupMode, list[str]]:
     """(mode of stage d for a group, the unassigned predicates that count)."""
     grouping = single_grouping(profile, group)
-    current = profile.groups[group]
+    current = profile.get_group(group)
     usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
     coverage = predicate_coverage(manager, grouping, profile.entity_space).get(group, {})
@@ -1037,14 +1046,14 @@ class GroupTask(RoleEditingTask):
         self.group = input.get("group")
         self.mode = GroupMode(input.get("mode") or GroupMode.FULL)
         self.prompt_file = self.prompt_files[self.mode]
-        if self.group not in profile.groups:
-            raise ValueError(f"Unknown group {self.group}; groups: {', '.join(profile.groups)}")
+        if self.group not in profile.group_names():
+            raise ValueError(f"Unknown group {self.group}; groups: {', '.join(profile.group_names())}")
         self.space = list(profile.entity_space)
         self.grouping = single_grouping(profile, self.group)
         self.scope = [self.group]
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
         self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
-        current = profile.groups[self.group]
+        current = profile.get_group(self.group)
         sides: dict[str, Sides] = {}
         kg_usage = element_usage(self.manager, self.grouping, self.space,
                                  roles_from_elements(role_elements(profile.roles) | role_elements(current.added)), sides)
@@ -1057,7 +1066,7 @@ class GroupTask(RoleEditingTask):
         self.stats = {"size": size_stats(self)["sizes"].get(self.group, 0), "mode": self.mode.value,
                       "local_names": stats.model_dump()}
         default = current.model_copy(update={"local_name_type": self.name_type})
-        self.default = profile.model_copy(update={"groups": {**profile.groups, self.group: default}}, deep=True)
+        self.default = profile.with_replaced_group(default)
 
         unused = [key for key in role_elements(profile.roles) if key not in role_elements(self.derived)
                   and key not in role_elements(current.added)]
@@ -1098,9 +1107,9 @@ class GroupTask(RoleEditingTask):
         roles = self.checked_roles()
         added, removed = diff_roles(self.derived, roles)
         name_type = NameType(fn_args.get("local_name_type") or self.name_type)
-        current = self.default.groups[self.group]
+        current = self.default.get_group(self.group)
         updated = current.model_copy(update={"local_name_type": name_type, "added": added, "removed": removed})
-        profile = self.default.model_copy(update={"groups": {**self.default.groups, self.group: updated}}, deep=True)
+        profile = self.default.with_replaced_group(updated)
         count = lambda r: len(role_elements(r))
         return profile, (f"Group {self.group}: local names {name_type.value}, "
                          f"{count(added)} elements added or overridden, {count(removed)} removed")

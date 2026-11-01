@@ -66,14 +66,14 @@ def kind_membership(kind: str, large: bool = False) -> str:
     return union_of(alternatives)
 
 
-def kind_partitions(kinds: Iterable[str] = KINDS, large: bool = False) -> dict[str, Partition]:
-    return {kind: Partition(membership_sparql=kind_membership(kind, large)) for kind in kinds}
+def kind_partitions(kinds: Iterable[str] = KINDS, large: bool = False) -> list[Partition]:
+    return [Partition(name=kind, membership_sparql=kind_membership(kind, large)) for kind in kinds]
 
 
-def partition_grouping(partitions: dict[str, Partition], rest: bool = True) -> Grouping:
+def partition_grouping(partitions: list[Partition], rest: bool = True) -> Grouping:
     """The partitions, exclusive; with rest, the subjects outside all of them as
     UNCATEGORIZED (not in a large KG, see grouping_subquery)."""
-    members = tuple((name, p.membership_sparql) for name, p in partitions.items())
+    members = tuple((p.name, p.membership_sparql) for p in partitions)
     return Grouping(members + (((UNCATEGORIZED, UNIVERSE),) if rest else ()), exclusive=True)
 
 
@@ -81,9 +81,9 @@ def kind_grouping(large: bool = False) -> Grouping:
     return partition_grouping(kind_partitions(large=large))
 
 
-def group_grouping(groups: dict[str, GroupDefinition]) -> Grouping:
+def group_grouping(groups: list[GroupDefinition]) -> Grouping:
     """The groups, overlapping."""
-    return Grouping(tuple((name, g.membership_sparql) for name, g in groups.items()), exclusive=False)
+    return Grouping(tuple((g.name, g.membership_sparql) for g in groups), exclusive=False)
 
 
 def grouping_subquery(manager: KgManager, grouping: Grouping | None,
