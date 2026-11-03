@@ -38,8 +38,11 @@ class PredicatePattern(BaseModel):
         return parts
 
     def alternatives(self) -> list[str]:
-        """The alternatives for querying: each pattern, and each predicate on
-        its own (a path <a>|<b> may be evaluated on the whole KG first)."""
+        """
+        The alternatives for querying: each pattern, and each predicate on
+        its own (not a path <a>|<b>, for a path like this may be evaluated
+        on the whole KG first in Qlever).
+        """
         return list(self.patterns) + [f"?s <{p}> ?o" for p in self.predicates]
 
     def predicates_to_sparql(self) -> str:

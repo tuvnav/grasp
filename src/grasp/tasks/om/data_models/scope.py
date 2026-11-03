@@ -1,5 +1,5 @@
 import re
-from typing import Literal, Self
+from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -7,13 +7,17 @@ from grasp.tasks.om.data_models.patterns import PredicatePattern
 from grasp.tasks.om.data_models.profile import GroupDefinition, RoleName
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
+    REGEX_REPLACE,
     STANDARD_LEVELS,
+    TRANSFORM_OPERATIONS,
+    NormalizationLevel,
+    TransformOperation,
+    regex_replace,
 )
 from grasp.tasks.om.foundation.types import Side
 
 # the entities of a side that are not matched yet
 REST = "rest"
-
 
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
@@ -40,30 +44,18 @@ class ValuePatterns(BaseModel):
         return self.source if side == Side.SOURCE or self.target is None else self.target
 
 
-# levels of the anchor normalization ladder (foundation/text_normalization.py), fine to coarse
-type LevelName = Literal[*NORMALIZATION_LEVELS]
-
-
-class Transform(BaseModel):
+class StringTransform(BaseModel):
     """A string transform applied to every value before the normalization
     ladder. Only what the ladder cannot do (case, word splitting, word sets,
     plural and inflection are levels)."""
     model_config = ConfigDict(extra="forbid")
-    op: Literal[
-        "strip_accents",    # é -> e
-        "remove_brackets",  # drop parenthesized parts: "Enterprise (NCC-1701)" -> "Enterprise"
-        "regex_replace",    # re.sub(pattern, replacement)
-        "digits_only",      # keep digits: "NCC-1701-D" -> "1701"
-        "year",             # first four-digit year, or nothing
-        "initials",         # "John Ronald Smith" -> "J R Smith"
-        "transliterate",    # to Latin script (e.g. Cyrillic, Greek)
-    ]
+    operation: TransformOperation
     pattern: str | None = None
     replacement: str = ""
 
     @model_validator(mode="after")
     def check_pattern(self) -> Self:
-        if self.op == "regex_replace":
+        if self.operation == REGEX_REPLACE:
             if not self.pattern:
                 raise ValueError("regex_replace needs a pattern")
             try:
@@ -71,16 +63,28 @@ class Transform(BaseModel):
             except re.error as e:
                 raise ValueError(f"invalid regex: {e}") from e
         elif self.pattern is not None:
-            raise ValueError(f"{self.op} takes no pattern")
+            raise ValueError(f"{self.operation} takes no pattern")
         return self
+
+    def apply(self, text: str) -> str:
+        if self.operation == REGEX_REPLACE:
+            assert self.pattern is not None  # checked by check_pattern
+            return regex_replace(text, self.pattern, self.replacement)
+        return TRANSFORM_OPERATIONS[self.operation](text)
+
+
+def apply_string_transforms(transforms: list[StringTransform], text: str) -> str:
+    for transform in transforms:
+        text = transform.apply(text)
+    return text
 
 
 class Normalization(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    transforms: list[Transform] = []
+    transforms: list[StringTransform] = []
     # levels tried from fine to coarse (the anchor rule records the finest level
     # on which a pair is unique); a single level for one fixed normalization
-    levels: list[LevelName] = Field(default=list(STANDARD_LEVELS), min_length=1)
+    levels: list[NormalizationLevel] = Field(default=list(STANDARD_LEVELS), min_length=1)
 
     @model_validator(mode="after")
     def levels_in_ladder_order(self) -> Self:

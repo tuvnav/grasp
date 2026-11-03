@@ -225,8 +225,11 @@ class KgProfile(BaseModel):
         """Whether entities of the two partitions of this KG compete with each other."""
         return all(pair.partitions() != {partition_a, partition_b} for pair in self.non_competing_pairs)
 
-    def excluded_groups(self) -> list[str]:
+    def excluded_group_names(self) -> list[str]:
         return [group.name for group in self.groups if group.excluded]
+
+    def excluded_group_membership_sparqls(self) -> list[str]:
+        return [group.definition.membership_sparql for group in self.groups if group.excluded]
 
     def with_group(self, group: GroupProfile | GroupDefinition) -> "KgProfile":
         """A copy with the group appended."""

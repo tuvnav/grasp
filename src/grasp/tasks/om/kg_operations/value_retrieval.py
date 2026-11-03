@@ -10,7 +10,7 @@ from grasp.tasks.om.data_models.profile import Roles
 from grasp.tasks.om.data_models.scope import ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.types import IRI, BindingType
-from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_query
+from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query
 from grasp.tasks.om.sparql_access.execution import stream_rows
 
 
@@ -21,14 +21,16 @@ def retrieve_value_rows(
         value_source: ValuePatternSource,
         roles: Roles
         ) -> Iterator[ValueRow] | None:
-    parts = value_parts(value_source, roles)
 
-    if not parts:
+    branches = value_branches(value_source, roles)
+
+    if not branches:
         return None
 
-    query_sparql = grouping_query(
+    query_sparql = grouping_to_sparql_query(
         manager, grouping, entity_space,
-        "?entity ?group ?o ?role", parts=parts
+        "?entity ?group ?o ?role",
+        branches=branches
         )
     rows = stream_rows(manager, query_sparql)
     for row in rows:
@@ -43,27 +45,31 @@ def retrieve_value_rows(
 
         yield ValueRow(
             entity=entity,
-            group=group,
-            role=role,
-            value=value,
-            language=language
+            group_name=group,
+            role_name=role,
+            raw_projection_value=value,
+            value_language=language
             )
 
 
-def value_parts(source: ValuePatternSource, roles: Roles) -> list[str]:
+def value_branches(
+        source: ValuePatternSource,
+        roles: Roles,
+        new_role_name: str = "own"
+        ) -> list[str]:
     """SPARQL alternatives over ?s (entity) and ?o (value), each binding ?role."""
     if isinstance(source, PredicatePattern):
         return [
-            f'{part} BIND("own" AS ?role)'
-            for part in source.alternatives()
+            f'{branch} BIND("{new_role_name}" AS ?role)'
+            for branch in source.alternatives()
             ]
     role_names = source
-    parts = []
+    branches = []
     for role_name in role_names:
-        pattern = getattr(roles, role_name)
+        pattern: PredicatePattern = getattr(roles, role_name)
         if pattern is not None:
-            parts += [
-                f'{part} BIND("{role_name}" AS ?role)'
-                for part in pattern.alternatives()
+            branches += [
+                f'{branch} BIND("{role_name}" AS ?role)'
+                for branch in pattern.alternatives()
                 ]
-    return parts
+    return branches

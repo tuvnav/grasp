@@ -117,15 +117,21 @@ def literal(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def union_with(group: str, parts: list[str], var: str | None = "s") -> str:
-    """The alternatives (UNION) of a pattern, each joined with group in its own
-    group, with ?var bound to ?entity (bind_entity). A server evaluates an
-    alternative in braces on its own, so it would scan the whole KG for it if
-    the group were outside."""
-    bound = [bind_entity(part, var) if var else part for part in parts]
+def down_pushed_union(
+        search_space_restriction: str,
+        branch_patterns: list[str],
+        var_to_replace: str | None = "s"
+        ) -> str:
+    """Builds a SPARQL query with the space restriction down pushed
+    into the branch patterns. ?var is bound to ?entity (bind_entity):
+    '{<restriction_condiction> <branch_1>} UNION {<restriction_condiction> <branch_2>}'
+    instead of '<restriction_condition> {branch_1} UNION {branch_2}'.
+    A Qlever server evaluates an alternative in braces on its own,
+    so it would scan the whole KG for it if the group were outside."""
+    bound = [bind_entity(part, var_to_replace) if var_to_replace else part for part in branch_patterns]
     if len(bound) == 1:
-        return f"{group}\n{bound[0]}"
-    return " UNION ".join(f"{{ {group}\n{part} }}" for part in bound)
+        return f"{search_space_restriction}\n{bound[0]}"
+    return " UNION ".join(f"{{ {search_space_restriction}\n{part} }}" for part in bound)
 
 
 def bind_entity(pattern: str, var: str = "s") -> str:

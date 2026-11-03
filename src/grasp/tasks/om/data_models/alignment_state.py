@@ -66,8 +66,8 @@ class SkippedScope(BaseModel):
 
 class AlignmentState(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: KgProfile
-    target: KgProfile
+    source_kg_profile: KgProfile
+    target_kg_profile: KgProfile
     correspondences: list[Correspondence] = []
     rejected: list[Correspondence] = []
     reviewed: list[ReviewedSource] = []
@@ -83,18 +83,18 @@ class AlignmentState(BaseModel):
     @classmethod
     def create(cls, source: KgProfile, target: KgProfile) -> "AlignmentState":
         """A new state with copies of the profiles; across the KGs, all partitions compete."""
-        return cls(source=source.model_copy(deep=True), target=target.model_copy(deep=True))
+        return cls(source_kg_profile=source.model_copy(deep=True), target_kg_profile=target.model_copy(deep=True))
 
     @property
-    def source_kg(self) -> str:
-        return self.source.kg_name
+    def source_kg_name(self) -> str:
+        return self.source_kg_profile.kg_name
 
     @property
-    def target_kg(self) -> str:
-        return self.target.kg_name
+    def target_kg_name(self) -> str:
+        return self.target_kg_profile.kg_name
 
     def profile(self, side: Side) -> KgProfile:
-        return self.source if Side(side) == Side.SOURCE else self.target
+        return self.source_kg_profile if Side(side) == Side.SOURCE else self.target_kg_profile
 
     def check_known_partitions(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> None:
         for side, partition in ((side_a, partition_a), (side_b, partition_b)):

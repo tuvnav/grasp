@@ -41,7 +41,7 @@ from grasp.tasks.om.foundation.configuration import (
 )
 from grasp.tasks.om.foundation.vocabulary import LABEL_PREDICATES
 from grasp.tasks.om.kg_operations.entity_rendering import clip
-from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_query
+from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.profile_statistics import Sides, element_usage
 from grasp.tasks.om.sparql_access.execution import select_rows
@@ -458,7 +458,7 @@ class RoleEditingTask(ProfileStageTask):
         if member is not None and member not in self.scope:
             raise FunctionCallException(f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}")
         sparql = pattern.predicates_to_sparql()
-        rows = run_rows(self.manager, grouping_query(
+        rows = run_rows(self.manager, grouping_to_sparql_query(
             self.manager, self.grouping, self.space,
             "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
             "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
@@ -484,7 +484,7 @@ class RoleEditingTask(ProfileStageTask):
         """Example matches with a name of ?s and of ?o (codes alone say little)."""
         names = self.roles.names.predicates if self.roles.names else []
         names_path = sparql_path(list(dict.fromkeys(names + LABEL_PREDICATES)))
-        rows = run_rows(self.manager, grouping_query(
+        rows = run_rows(self.manager, grouping_to_sparql_query(
             self.manager, self.grouping, self.space, "?s ?o ?s_name ?o_name",
             f'FILTER(?group = "{member}")\n'
             f"OPTIONAL {{ ?s {names_path} ?s_name }}\nOPTIONAL {{ ?o {names_path} ?o_name }}",

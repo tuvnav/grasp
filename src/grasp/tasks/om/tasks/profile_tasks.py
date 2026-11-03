@@ -42,12 +42,12 @@ from grasp.tasks.om.foundation.vocabulary import (
 from grasp.tasks.om.kg_operations.entity_rendering import clip
 from grasp.tasks.om.kg_operations.grouping import (
     Grouping,
-    estimated_sizes,
-    group_grouping,
+    estimated_group_sizes,
+    groups_to_grouping,
     group_sizes,
-    grouping_query,
+    grouping_to_sparql_query,
     kind_partitions,
-    partition_grouping,
+    partitions_to_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import (
     class_counts,
@@ -99,7 +99,7 @@ NUM_FEATURES = 10
 NUM_PREDICATES = 25
 NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # stage a counts entities per prefix by kind, without the subjects outside all kinds
-SPACE_GROUPING = partition_grouping(kind_partitions(), rest=False)
+SPACE_GROUPING = partitions_to_grouping(kind_partitions(), rest=False)
 # name of all entities of a grouping, to compare a group with the rest
 ALL = "_all"
 
@@ -107,7 +107,7 @@ ALL = "_all"
 def entity_examples(task: ProfileStageTask, grouping: Grouping, space: list[str], where: str, k: int) -> list[str]:
     """Up to k entities with a name and their partition or group."""
     names = sparql_path(LABEL_PREDICATES)
-    rows = run_rows(task.manager, grouping_query(
+    rows = run_rows(task.manager, grouping_to_sparql_query(
         task.manager, grouping, space, "?entity ?group ?name",
         f"{where}\nOPTIONAL {{ ?entity {names} ?name }}", f"LIMIT {k * 4}",
     ))
@@ -136,7 +136,7 @@ def default_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Pa
     that cannot be evaluated there)."""
     large = task.input_profile.large
     partitions = kind_partitions(large=large)
-    sizes = estimated_sizes(task.manager, partition_grouping(partitions, rest=False), space)
+    sizes = estimated_group_sizes(task.manager, partitions_to_grouping(partitions, rest=False), space)
     return {p.name: p for p in partitions if sizes.get(p.name)}
 
 
@@ -294,12 +294,12 @@ class SpaceTask(ProfileStageTask):
         sizes = run_sizes(self, SPACE_GROUPING, [prefix])
         if not sizes:
             return f"No entities with IRIs starting with {prefix}."
-        named = run_rows(self.manager, grouping_query(
+        named = run_rows(self.manager, grouping_to_sparql_query(
             self.manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?entity) AS ?n)",
             f"FILTER EXISTS {{ ?entity {sparql_path(LABEL_PREDICATES)} ?name }}",
         ))
         n_named = int(named[0]["n"].value) if named and "n" in named[0] else 0
-        types = run_rows(self.manager, grouping_query(
+        types = run_rows(self.manager, grouping_to_sparql_query(
             self.manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?entity) AS ?n)",
             f"?entity <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
         ))
@@ -415,7 +415,7 @@ class GroupingStageTask(ProfileStageTask):
         grouping = self.grouping()
         try:
             self.sizes = group_sizes(self.manager, grouping, self.space)
-            self.estimates = estimated_sizes(self.manager, grouping, self.space)
+            self.estimates = estimated_group_sizes(self.manager, grouping, self.space)
             self.predicates = {p: {k: c.entities for k, c in counts.items()}
                                for p, counts in predicate_coverage(self.manager, grouping, self.space).items()}
             self.types = type_coverage(self.manager, grouping, self.space)
@@ -544,7 +544,7 @@ class PartitionsTask(GroupingStageTask):
 
     def grouping(self) -> Grouping:
         # the subjects outside all partitions only in a small KG (a large one is not scanned)
-        return partition_grouping(list(self.definitions.values()), rest=not self.input_profile.large)
+        return partitions_to_grouping(list(self.definitions.values()), rest=not self.input_profile.large)
 
     def names(self) -> list[str]:
         return list(self.definitions)
@@ -732,10 +732,10 @@ class RolesTask(RoleEditingTask):
         profile = self.input_profile
         if not profile.partitions:
             profile = profile.model_copy(update={"partitions": list(ensure_partitions(self, self.space).values())})
-        self.grouping = partition_grouping(profile.partitions, rest=False)
+        self.grouping = partitions_to_grouping(profile.partitions, rest=False)
         self.scope = profile.partition_names()
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
-        self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
+        self.estimates = estimated_group_sizes(self.manager, self.grouping, self.space)
         sides: dict[str, Sides] = {}
         usage = element_usage(self.manager, self.grouping, self.space, canon_roles(), sides)
         default = default_roles(usage, self.sizes, self.scope)
@@ -804,7 +804,7 @@ class GroupsTask(GroupingStageTask):
         return "\n\n".join(sections)
 
     def grouping(self) -> Grouping:
-        return group_grouping(list(self.definitions.values()))
+        return groups_to_grouping(list(self.definitions.values()))
 
     def names(self) -> list[str]:
         return list(self.definitions)
@@ -944,7 +944,7 @@ class GroupsTask(GroupingStageTask):
         membership = self.definitions[name].membership_sparql
         remaining = {n: d for n, d in self.definitions.items() if n != name}
         try:
-            size, overlap = membership_overlap(self.manager, group_grouping(list(remaining.values())), self.space,
+            size, overlap = membership_overlap(self.manager, groups_to_grouping(list(remaining.values())), self.space,
                                                membership)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
@@ -977,7 +977,7 @@ def single_grouping(profile: KgProfile, group: str) -> Grouping:
     """The grouping of one group only, without the entities of excluded groups
     (they are not aligned): stage d looks at no other group."""
     excluded = tuple(profile.get_group(name).definition.membership_sparql
-                     for name in profile.excluded_groups() if name != group)
+                     for name in profile.excluded_group_names() if name != group)
     return Grouping(((group, profile.get_group(group).definition.membership_sparql),), exclusive=False, minus=excluded)
 
 
@@ -1052,7 +1052,7 @@ class GroupTask(RoleEditingTask):
         self.grouping = single_grouping(profile, self.group)
         self.scope = [self.group]
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
-        self.estimates = estimated_sizes(self.manager, self.grouping, self.space)
+        self.estimates = estimated_group_sizes(self.manager, self.grouping, self.space)
         current = profile.get_group(self.group)
         sides: dict[str, Sides] = {}
         kg_usage = element_usage(self.manager, self.grouping, self.space,

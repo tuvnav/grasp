@@ -14,12 +14,15 @@ class ValueRow:
     """One value of an entity. An entity in several groups of a population, or
     with several values, has several rows."""
     entity: IRI
-    group: str             # group of the population the entity was retrieved for
-    role: str              # role of the value: "names", "synonyms", ... or "own" (own pattern)
-    value: str             # the raw value; normalized keys are derived in key_comparison
-    language: str | None   # language tag of a literal, if any (multilingual tracks)
+    group_name: str             # group of the population the entity was retrieved for
+    role_name: str              # role of the value: "names", "synonyms", ... or "own" (own pattern)
+    raw_projection_value: str   # normalized keys are derived in key_comparison
+    value_language: str | None   # language tag of a literal, if any (multilingual tracks)
 
     @property
     def primary(self) -> bool:
-        """Whether the value is a name (the others only block ambiguous matches)."""
-        return self.role == "names"
+        """
+        Whether the value is a name (the others only block ambiguous matches).
+        Only for anchor task.
+        """
+        return self.role_name == "names"

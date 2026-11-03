@@ -46,8 +46,8 @@ from grasp.tasks.om.kg_operations.grouping import (
     Grouping,
     count_rows,
     counts_by_group,
-    grouping_query,
-    grouping_subquery,
+    grouping_to_sparql_query,
+    grouping_to_sparql_subquery,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import current_sample, values_block
 from grasp.tasks.om.sparql_access.execution import select_rows, stream_rows
@@ -55,7 +55,7 @@ from grasp.tasks.om.sparql_access.query_building import (
     prologue_of,
     space_filter,
     sparql_path,
-    union_with,
+    down_pushed_union,
 )
 from grasp.tasks.om.sparql_access.values import values_blocks
 
@@ -131,7 +131,7 @@ def prefix_counts(manager: KgManager, named_only: bool) -> dict[tuple[str, str],
     canon name or synonym (keeps out e.g. image files of wiki KGs)."""
     named = (f"FILTER EXISTS {{ ?entity {sparql_path(LABEL_PREDICATES + SYNONYM_PREDICATES)} ?name }}"
              if named_only else "")
-    sparql = grouping_query(
+    sparql = grouping_to_sparql_query(
         manager, None, (), "?prefix ?group (COUNT(DISTINCT ?entity) AS ?n)",
         f"{named}\nBIND({PREFIX_EXPRESSION} AS ?prefix)", "GROUP BY ?prefix ?group",
     )
@@ -171,7 +171,7 @@ def predicate_coverage(manager: KgManager, grouping: Grouping | None, space: Ite
                        ) -> dict[str, dict[IRI, Coverage]]:
     """group -> outgoing predicate (entities of the group as subject)
     -> coverage, with the kinds of its values (objects)."""
-    sparql = grouping_query(
+    sparql = grouping_to_sparql_query(
         manager, grouping, space,
         "?group ?p (COUNT(DISTINCT ?entity) AS ?n) (COUNT(?v) AS ?m) "
         "(SUM(IF(isLiteral(?v), 1, 0)) AS ?lit) (SUM(IF(isBlank(?v), 1, 0)) AS ?blank)",
@@ -191,7 +191,7 @@ def predicate_coverage(manager: KgManager, grouping: Grouping | None, space: Ite
 def type_coverage(manager: KgManager, grouping: Grouping | None, space: Iterable[str]
                   ) -> dict[str, dict[IRI, int]]:
     """group -> rdf:type value -> entities."""
-    sparql = grouping_query(
+    sparql = grouping_to_sparql_query(
         manager, grouping, space, "?group ?t (COUNT(DISTINCT ?entity) AS ?n)",
         f"?entity <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?group ?t",
     )
@@ -263,7 +263,7 @@ def membership_overlap(manager: KgManager, grouping: Grouping | None, space: Ite
         assigned = {e for e, _ in sample.assignments(grouping, matches)}
         counts[UNCATEGORIZED] += sum(e not in assigned for e in matches)
         return len(matches), {g: n for g, n in counts.items() if n}
-    prefixes, subquery = grouping_subquery(manager, grouping, space)
+    prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
     sparql = (f"{prologue_of(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?entity) AS ?n) WHERE {{\n"
               f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
               f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part')
@@ -324,7 +324,7 @@ def element_usage(manager: KgManager, grouping: Grouping | None, space: Iterable
     predicates = sorted({key[2] for key in elements if key[1] == "predicate"})
     if predicates:
         values = " ".join(f"<{p}>" for p in predicates)
-        sparql = grouping_query(manager, grouping, space, "?group ?p (COUNT(DISTINCT ?entity) AS ?n)",
+        sparql = grouping_to_sparql_query(manager, grouping, space, "?group ?p (COUNT(DISTINCT ?entity) AS ?n)",
                                  f"VALUES ?p {{ {values} }}\n?entity ?p ?value .", "GROUP BY ?group ?p")
         by_predicate = count_rows(select_rows(manager, sparql), "group", "p")
         for key in elements:
@@ -372,7 +372,7 @@ def sample_entities(manager: KgManager, grouping: Grouping | None, space: Iterab
     rng = random.Random(seed)
     samples: dict[str, list[IRI]] = defaultdict(list)
     seen: Counter[str] = Counter()
-    sparql = grouping_query(manager, grouping, space, "?entity ?group", where, "ORDER BY ?entity")
+    sparql = grouping_to_sparql_query(manager, grouping, space, "?entity ?group", where, "ORDER BY ?entity")
     for row in stream_rows(manager, sparql):
         entity, group = IRI(row["entity"]["value"]), row["group"]["value"]
         if INVALID_IRI_CHARACTERS.search(entity):
@@ -393,7 +393,7 @@ def retrieve_values(manager: KgManager, entities: Iterable[IRI], pattern: Predic
         return values
     literal = "FILTER(isLiteral(?o))" if literals_only else ""
     for block in values_blocks(entities):
-        sparql = f"SELECT ?s ?o WHERE {{ {union_with(f'VALUES ?s {{ {block} }}', pattern.alternatives(), None)} {literal} }}"
+        sparql = f"SELECT ?s ?o WHERE {{ {down_pushed_union(f'VALUES ?s {{ {block} }}', pattern.alternatives(), None)} {literal} }}"
         for row in select_rows(manager, sparql):
             if "s" in row and "o" in row:
                 values[IRI(row["s"].value)].append(row["o"].value)
