@@ -81,11 +81,11 @@ def kind_partitions(kinds: Iterable[str] = KINDS, large: bool = False) -> list[P
     return [Partition(name=kind, membership_sparql=kind_membership(kind, large)) for kind in kinds]
 
 
-def partitions_to_grouping(partitions: list[Partition], rest: bool = True) -> Grouping:
+def partitions_to_grouping(partitions: list[Partition], mark_uncategorized_as_rest: bool = True) -> Grouping:
     """The partitions, exclusive; with rest, the subjects outside all of them as
     UNCATEGORIZED (not in a large KG, see grouping_subquery)."""
     members = tuple((p.name, p.membership_sparql) for p in partitions)
-    return Grouping(members + (((UNCATEGORIZED, UNIVERSE),) if rest else ()), exclusive=True)
+    return Grouping(members + (((UNCATEGORIZED, UNIVERSE),) if mark_uncategorized_as_rest else ()), exclusive=True)
 
 
 def default_kinds_to_grouping(large: bool = False) -> Grouping:
@@ -165,7 +165,7 @@ def grouping_to_sparql_query(
     ?var is the entity (union_with).
     """
     # TODO: down push only cheap parts, not whole subquery for non large KGs.
-    # E. g. proceed as in large KGs (reach down only value-tables). 
+    # E. g. proceed as in large KGs (reach down only value-tables).
     prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
     body = (
         down_pushed_union(subquery, branches, var)
@@ -194,10 +194,18 @@ def group_sizes(manager: KgManager, grouping: Grouping | None, space: Iterable[s
 
 
 def profile_groups_to_grouping(
-        kg_profile: KgProfile, additional_groups: Sequence[GroupDefinition] = []
+        kg_profile: KgProfile, additional_groups: Sequence[GroupDefinition] = ()
         ) -> Grouping:
     return groups_to_grouping(kg_profile.groups).extended_by(
         additional_minus=kg_profile.excluded_group_membership_sparqls()
     ).extended_by(
         additional_members=tuple((g.name, g.membership_sparql) for g in additional_groups)
+        )
+
+
+def profile_partitions_to_grouping(
+        kg_profile: KgProfile
+        ) -> Grouping:
+    return partitions_to_grouping(
+        kg_profile.partitions, mark_uncategorized_as_rest=False
         )

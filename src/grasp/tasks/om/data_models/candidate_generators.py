@@ -12,6 +12,7 @@ generator produces, per source entity, a list of target candidates.
 Key and vector strategies compare values (scope.ValuePatterns), neighbour
 strategies the current alignment, so they change from round to round.
 """
+from enum import StrEnum, auto
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -20,11 +21,17 @@ from grasp.tasks.om.data_models.patterns import StructureRelation
 from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
 
 
+class CandidateStrategyType(StrEnum):
+    KEY = auto()
+    VECTOR = auto()
+    NEIGHBOURS = auto()
+
+
 class KeyStrategy(BaseModel):
     """Candidates share a normalized value (e.g. a code, a cross reference, a
     name). The anchor rule is a key strategy on names with a unique selection."""
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["key"] = "key"
+    kind: CandidateStrategyType = CandidateStrategyType.KEY
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
 
@@ -34,7 +41,7 @@ class VectorStrategy(BaseModel):
     (IDF-weighted word tokens, character 3-grams or an embedding model) and
     compared by cosine; the best score over the value pairs counts."""
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["vector"] = "vector"
+    kind: CandidateStrategyType = CandidateStrategyType.VECTOR
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization(levels=["words"])
     vectorizer: Literal["idf_tokens", "char_3grams", "embedding"] = "idf_tokens"
@@ -52,7 +59,7 @@ class NeighbourStrategy(BaseModel):
     (a, b) with x related to a and y related to b by the same kind of structure
     relation in the same direction."""
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["neighbours"] = "neighbours"
+    kind: CandidateStrategyType = CandidateStrategyType.NEIGHBOURS
     # structure relations of the profiles by name, or defined here; None: the
     # subsumption, partonomy and membership relations of the profiles
     relations: list[str | StructureRelation] | None = None
@@ -70,13 +77,18 @@ CandidateStrategy = Annotated[KeyStrategy | VectorStrategy | NeighbourStrategy, 
 
 
 class Selection(BaseModel):
-    """From scores to the candidate list of a source entity."""
+    """
+    From the collected candidates to the candidate list of an entity. Tied
+    candidates (key strategy: same finest level) are taken whole or not at all:
+    a tie group that does not fit into top_k is dropped and the entity counts as
+    ambiguous, so a value shared by more than top_k entities gives no candidates.
+    Whether a candidate is mutual, and the unique candidate, are always computed;
+    mutual and unique only decide whether they also filter the list.
+    """
     model_config = ConfigDict(extra="forbid")
     top_k: int = Field(default=5, ge=1)
-    mutual: bool = False  # only candidates for which the source is among the target's top_k too
-    unique: bool = False  # only sources with exactly one candidate, which has no other source (anchor rule)
-    # key strategies: drop values shared by more targets than this; None: no limit
-    max_ambiguity: int | None = Field(default=3, ge=1)
+    mutual: bool = False  # keep only candidates whose own list contains the entity too
+    unique: bool = False  # keep only the unique candidate: alone on the finest level and mutual (anchor rule)
 
 
 class Generator(BaseModel):

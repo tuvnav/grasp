@@ -12,6 +12,10 @@ class Side(StrEnum):
     SOURCE = "source"
     TARGET = "target"
 
+    @classmethod
+    def other_side(cls, side: "Side") -> "Side":
+        return cls.SOURCE if side == cls.TARGET else cls.TARGET
+
 
 SIDES = tuple(Side)
 

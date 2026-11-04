@@ -22,12 +22,25 @@ REST = "rest"
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
 
+def group_name_from_group_ref(group_ref: GroupRef):
+    match group_ref:
+        case str():
+            return group_ref
+        case GroupDefinition():
+            return group_ref.name
+
 
 class Population(BaseModel):
     """Source and target entities a strategy compares."""
     model_config = ConfigDict(extra="forbid")
-    source: list[GroupRef] = Field(default=[REST], min_length=1)
-    target: list[GroupRef] = Field(default=[REST], min_length=1)
+    source_group_refs: list[GroupRef] = Field(default=[REST], min_length=1)
+    target_group_refs: list[GroupRef] = Field(default=[REST], min_length=1)
+
+    def group_names(self) -> dict[Side, list[str]]:
+        return {
+            Side.SOURCE: [group_name_from_group_ref(gr) for gr in self.source_group_refs],
+            Side.TARGET: [group_name_from_group_ref(gr) for gr in self.target_group_refs]
+        }
 
 
 # values of an entity: one or more roles of its (effective) profile, or an own

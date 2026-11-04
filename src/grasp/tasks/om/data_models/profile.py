@@ -84,7 +84,7 @@ class Partition(BaseModel):
     features: str = ""      # what distinguishes its entities from the rest
 
 
-class WithinKgNonCompetingPair(BaseModel):
+class WithinKgNonCompetingPartitionPair(BaseModel):
     """Two partitions of one KG whose entities do not compete with each other
     (e.g. properties and classes): neither is a candidate or a rival for the
     other. Symmetric: the order of the two partitions does not matter."""
@@ -148,6 +148,14 @@ class Flag(BaseModel):
     group: str | None = None
 
 
+def unknown_name_message(kind: str, name: str, existing_names: list[str]) -> str:
+    """Error message for a partition or group (kind) name the profile does not have."""
+    message = f"{name} is not an existing {kind} name in this knowledge graph."
+    if not existing_names:
+        return message + f" No {kind}s defined in this knowledge graph yet."
+    return message + f" Choose between: {existing_names}"
+
+
 class KgProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kg_name: str
@@ -156,7 +164,7 @@ class KgProfile(BaseModel):
     large: bool = False
     entity_space: list[str] = []
     partitions: list[Partition] = []  # in order: the first match wins
-    non_competing_pairs: list[WithinKgNonCompetingPair] = []
+    non_competing_pairs: list[WithinKgNonCompetingPartitionPair] = []
     roles: Roles = Roles()
     groups: list[GroupProfile] = []
     findings: list[Finding] = []
@@ -188,38 +196,16 @@ class KgProfile(BaseModel):
         return [group.name for group in self.groups]
 
     def get_partition(self, partition_name: str) -> Partition:
-        partition_names = self.partition_names()
-        if partition_name not in partition_names:
-            error_message = (
-                f"{partition_name} is not an existing partition name "
-                f"in this knowledge graph."
-                )
-            if len(partition_names) == 0:
-                error_message += " No partitions defined in this knowledge graph yet."
-            else:
-                error_message += f" Choose between: {partition_names}"
-            raise ValueError(error_message)
-        try:
-            return next(p for p in self.partitions if p.name == partition_name)
-        except Exception as e:
-            raise ValueError from e
+        partition = next((partition for partition in self.partitions if partition.name == partition_name), None)
+        if partition is None:
+            raise ValueError(unknown_name_message("partition", partition_name, self.partition_names()))
+        return partition
 
     def get_group(self, group_name: str) -> GroupProfile:
-        group_names = self.group_names()
-        if group_name not in group_names:
-            error_message = (
-                f"{group_name} is not an existing group name "
-                f"in this knowledge graph."
-                )
-            if len(group_names) == 0:
-                error_message += " No groups defined in this knowledge graph yet."
-            else:
-                error_message += f" Choose between: {group_names}"
-            raise ValueError(error_message)
-        try:
-            return next(g for g in self.groups if g.name == group_name)
-        except Exception as e:
-            raise ValueError from e
+        group = next((group for group in self.groups if group.name == group_name), None)
+        if group is None:
+            raise ValueError(unknown_name_message("group", group_name, self.group_names()))
+        return group
 
     def competes(self, partition_a: str, partition_b: str) -> bool:
         """Whether entities of the two partitions of this KG compete with each other."""
@@ -243,8 +229,8 @@ class KgProfile(BaseModel):
         groups = [group if existing.name == group.name else existing for existing in self.groups]
         return self.model_copy(update={"groups": groups}, deep=True)
 
-    def group_name_already_exists(self, name: str) -> bool:
-        return name in self.group_names()
+    def has_group(self, group_name: str) -> bool:
+        return group_name in self.group_names()
 
     def append_group(self, group: GroupDefinition | GroupProfile):
         match group:
@@ -254,7 +240,7 @@ class KgProfile(BaseModel):
                 group_profile = group
             case _:
                 raise TypeError(f"Expected GroupDefinition or GroupProfile, got {type(group)}")
-        if self.group_name_already_exists(group_profile.name):
+        if self.has_group(group_profile.name):
             raise ValueError(
                 f"{group_profile.name} already exists in this knowledge graph."
                 f" Please choose a new name. Already existing: {self.group_names()}"

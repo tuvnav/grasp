@@ -3,7 +3,7 @@ The normalization ladder for comparing strings (raw, case, words, spaceless, wor
 """
 import re
 import unicodedata
-from typing import Callable, Literal, get_args
+from typing import Callable, Iterable, Literal, get_args
 
 from nltk.corpus import wordnet
 from nltk.stem import WordNetLemmatizer
@@ -24,6 +24,22 @@ STANDARD_LEVELS: list[NormalizationLevel] = ["raw", "case", "words", "spaceless"
 EXTENDED_LEVELS: list[NormalizationLevel] = ["wordset", "plural", "inflection"]
 
 
+def normalization_level_order(level: NormalizationLevel) -> int:
+    """Position of a level on the ladder (0 = raw, the finest); the order of
+    NORMALIZATION_LEVELS, as everywhere else (e.g. Normalization.levels)."""
+    return list(NORMALIZATION_LEVELS).index(level)
+
+
+def sort_normalization_levels(levels: Iterable[NormalizationLevel]) -> list[NormalizationLevel]:
+    """The distinct levels, from fine to coarse."""
+    return sorted(set(levels), key=normalization_level_order)
+
+
+def min_normalization_level(levels: Iterable[NormalizationLevel]) -> NormalizationLevel | None:
+    """The finest of the levels; None if there are none."""
+    return min(levels, key=normalization_level_order, default=None)
+
+
 NORMALIZATION_LEVELS: dict[NormalizationLevel, Callable[[str], str]] = {
     "raw": lambda w: w.strip(),
     "case": lambda w: " ".join(unicodedata.normalize("NFKC", w).casefold().split()),
@@ -33,6 +49,7 @@ NORMALIZATION_LEVELS: dict[NormalizationLevel, Callable[[str], str]] = {
     "plural": lambda k: " ".join(sorted({plural(w) for w in words(k)})),
     "inflection": lambda k: " ".join(sorted({lemma(w) for w in words(k)})),
 }
+
 assert list(NORMALIZATION_LEVELS) == list(get_args(NormalizationLevel.__value__)), \
     "NormalizationLevel and NORMALIZATION_LEVELS differ"
 

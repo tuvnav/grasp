@@ -21,7 +21,7 @@ from grasp.tasks.om.data_models.profile import (
     Partition,
     Roles,
     Stage,
-    WithinKgNonCompetingPair,
+    WithinKgNonCompetingPartitionPair,
     derived_roles,
     describe_profile,
     diff_roles,
@@ -99,7 +99,7 @@ NUM_FEATURES = 10
 NUM_PREDICATES = 25
 NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # stage a counts entities per prefix by kind, without the subjects outside all kinds
-SPACE_GROUPING = partitions_to_grouping(kind_partitions(), rest=False)
+SPACE_GROUPING = partitions_to_grouping(kind_partitions(), mark_uncategorized_as_rest=False)
 # name of all entities of a grouping, to compare a group with the rest
 ALL = "_all"
 
@@ -136,7 +136,7 @@ def default_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Pa
     that cannot be evaluated there)."""
     large = task.input_profile.large
     partitions = kind_partitions(large=large)
-    sizes = estimated_group_sizes(task.manager, partitions_to_grouping(partitions, rest=False), space)
+    sizes = estimated_group_sizes(task.manager, partitions_to_grouping(partitions, mark_uncategorized_as_rest=False), space)
     return {p.name: p for p in partitions if sizes.get(p.name)}
 
 
@@ -146,11 +146,11 @@ def ensure_partitions(task: ProfileStageTask, space: list[str]) -> dict[str, Par
     return default_partitions(task, space)
 
 
-def default_non_competing_pairs(partitions: dict[str, Partition]) -> list[WithinKgNonCompetingPair]:
+def default_non_competing_pairs(partitions: dict[str, Partition]) -> list[WithinKgNonCompetingPartitionPair]:
     """Properties do not compete with the other kinds (the default before stage b1 decides)."""
     if "property" not in partitions:
         return []
-    return [WithinKgNonCompetingPair(partition_a="property", partition_b=name,
+    return [WithinKgNonCompetingPartitionPair(partition_a="property", partition_b=name,
                                      reason="properties and entities are not equivalent")
             for name in partitions if name != "property"]
 
@@ -544,7 +544,7 @@ class PartitionsTask(GroupingStageTask):
 
     def grouping(self) -> Grouping:
         # the subjects outside all partitions only in a small KG (a large one is not scanned)
-        return partitions_to_grouping(list(self.definitions.values()), rest=not self.input_profile.large)
+        return partitions_to_grouping(list(self.definitions.values()), mark_uncategorized_as_rest=not self.input_profile.large)
 
     def names(self) -> list[str]:
         return list(self.definitions)
@@ -664,7 +664,7 @@ class PartitionsTask(GroupingStageTask):
         self.non_competing_pairs = [pair for pair in self.non_competing_pairs
                                     if pair.partitions() != {partition_a, partition_b}]
         if not fn_args.get("compete"):
-            self.non_competing_pairs.append(WithinKgNonCompetingPair(
+            self.non_competing_pairs.append(WithinKgNonCompetingPartitionPair(
                 partition_a=partition_a, partition_b=partition_b, reason=fn_args.get("reason") or ""))
         return self.format_non_competing_pairs()
 
@@ -732,7 +732,7 @@ class RolesTask(RoleEditingTask):
         profile = self.input_profile
         if not profile.partitions:
             profile = profile.model_copy(update={"partitions": list(ensure_partitions(self, self.space).values())})
-        self.grouping = partitions_to_grouping(profile.partitions, rest=False)
+        self.grouping = partitions_to_grouping(profile.partitions, mark_uncategorized_as_rest=False)
         self.scope = profile.partition_names()
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
         self.estimates = estimated_group_sizes(self.manager, self.grouping, self.space)

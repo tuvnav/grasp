@@ -6,11 +6,11 @@ from typing import Iterable, Iterator
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding
 from grasp.tasks.om.data_models.patterns import PredicatePattern
-from grasp.tasks.om.data_models.profile import Roles
+from grasp.tasks.om.data_models.profile import KgProfile, Roles
 from grasp.tasks.om.data_models.scope import ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
-from grasp.tasks.om.foundation.types import IRI, BindingType
-from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query
+from grasp.tasks.om.foundation.types import IRI, BindingType, Side
+from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query, profile_partitions_to_grouping
 from grasp.tasks.om.sparql_access.execution import stream_rows
 
 
@@ -20,12 +20,12 @@ def retrieve_value_rows(
         entity_space: Iterable[str],
         value_source: ValuePatternSource,
         roles: Roles
-        ) -> Iterator[ValueRow] | None:
+        ) -> Iterator[ValueRow]:
 
     branches = value_branches(value_source, roles)
 
     if not branches:
-        return None
+        return  # none of the roles is set in the profile: no values
 
     query_sparql = grouping_to_sparql_query(
         manager, grouping, entity_space,
@@ -73,3 +73,26 @@ def value_branches(
                 for branch in pattern.alternatives()
                 ]
     return branches
+
+
+def retrieve_partitions_by_entity(
+        manager: KgManager,
+        kg_profile: KgProfile,
+        entity_space: Iterable[str]
+        ) -> dict[IRI, str]:
+    partitions_grouping = profile_partitions_to_grouping(kg_profile)
+    query = grouping_to_sparql_query(
+        manager, partitions_grouping,
+        entity_space, "?entity ?group"
+    )
+
+    rows = stream_rows(manager, query)
+
+    partition_names_by_entity: dict[IRI, str] = {} 
+
+    for row in rows:
+        entity = IRI(Binding.from_dict(row["entity"]).identifier())
+        partition = Binding.from_dict(row["group"]).value
+        partition_names_by_entity[entity] = partition
+
+    return partition_names_by_entity

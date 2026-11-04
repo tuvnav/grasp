@@ -23,12 +23,12 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from grasp.tasks.om.data_models.correspondence import Correspondence
-from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPair
+from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPartitionPair
 from grasp.tasks.om.data_models.scope import Population
 from grasp.tasks.om.foundation.types import IRI, Side
 
 
-class CrossKgNonCompetingPair(BaseModel):
+class CrossKgNonCompetingPartitionPair(BaseModel):
     """A partition of the source KG and one of the target KG whose entities do
     not compete with each other."""
     model_config = ConfigDict(extra="forbid")
@@ -71,7 +71,7 @@ class AlignmentState(BaseModel):
     correspondences: list[Correspondence] = []
     rejected: list[Correspondence] = []
     reviewed: list[ReviewedSource] = []
-    cross_kg_non_competing_pairs: list[CrossKgNonCompetingPair] = []
+    cross_kg_non_competing_pairs: list[CrossKgNonCompetingPartitionPair] = []
     skipped: list[SkippedScope] = []
 
     @model_validator(mode="after")
@@ -93,14 +93,14 @@ class AlignmentState(BaseModel):
     def target_kg_name(self) -> str:
         return self.target_kg_profile.kg_name
 
-    def profile(self, side: Side) -> KgProfile:
+    def get_profile(self, side: Side) -> KgProfile:
         return self.source_kg_profile if Side(side) == Side.SOURCE else self.target_kg_profile
 
     def check_known_partitions(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> None:
         for side, partition in ((side_a, partition_a), (side_b, partition_b)):
-            if partition not in self.profile(side).partition_names():
+            if partition not in self.get_profile(side).partition_names():
                 raise ValueError(f"unknown partition {partition} of the {Side(side).value} KG; partitions: "
-                                 f"{', '.join(self.profile(side).partition_names()) or 'none'}")
+                                 f"{', '.join(self.get_profile(side).partition_names()) or 'none'}")
         if Side(side_a) == Side(side_b) and partition_a == partition_b:
             raise ValueError("entities of one partition always compete with each other")
 
@@ -110,18 +110,18 @@ class AlignmentState(BaseModel):
         pair of its profile, across the KGs as one of the state."""
         self.allow_competition(side_a, partition_a, side_b, partition_b)  # replaces an earlier reason
         if Side(side_a) == Side(side_b):
-            self.profile(side_a).non_competing_pairs.append(WithinKgNonCompetingPair(
+            self.get_profile(side_a).non_competing_pairs.append(WithinKgNonCompetingPartitionPair(
                 partition_a=partition_a, partition_b=partition_b, reason=reason, set_by=set_by))
             return
         source_partition, target_partition = self.by_side(side_a, partition_a, partition_b)
-        self.cross_kg_non_competing_pairs.append(CrossKgNonCompetingPair(
+        self.cross_kg_non_competing_pairs.append(CrossKgNonCompetingPartitionPair(
             source_partition=source_partition, target_partition=target_partition, reason=reason, set_by=set_by))
 
     def allow_competition(self, side_a: Side, partition_a: str, side_b: Side, partition_b: str) -> bool:
         """Lets the two partitions compete again; whether they did not before."""
         self.check_known_partitions(side_a, partition_a, side_b, partition_b)
         if Side(side_a) == Side(side_b):
-            profile = self.profile(side_a)
+            profile = self.get_profile(side_a)
             kept = [pair for pair in profile.non_competing_pairs if pair.partitions() != {partition_a, partition_b}]
             found = len(kept) < len(profile.non_competing_pairs)
             profile.non_competing_pairs = kept
@@ -143,7 +143,7 @@ class AlignmentState(BaseModel):
         rival for an entity of partition_a (side_a). Partitions, not entities:
         the caller looks up the partition of an entity first."""
         if Side(side_a) == Side(side_b):
-            return self.profile(side_a).competes(partition_a, partition_b)
+            return self.get_profile(side_a).competes(partition_a, partition_b)
         source_partition, target_partition = self.by_side(side_a, partition_a, partition_b)
         return all((pair.source_partition, pair.target_partition) != (source_partition, target_partition)
                    for pair in self.cross_kg_non_competing_pairs)
@@ -155,7 +155,7 @@ class AlignmentState(BaseModel):
         result = [
             NonCompetingPartition(side=side, partition=pair.partition_b if pair.partition_a == partition else pair.partition_a,
                                   reason=pair.reason, set_by=pair.set_by)
-            for pair in self.profile(side).non_competing_pairs if partition in pair.partitions()
+            for pair in self.get_profile(side).non_competing_pairs if partition in pair.partitions()
         ]
         for pair in self.cross_kg_non_competing_pairs:
             own, other = ((pair.source_partition, pair.target_partition) if side == Side.SOURCE
