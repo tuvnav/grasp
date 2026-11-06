@@ -105,8 +105,10 @@ class GroupOrigin(StrEnum):
 
 
 class GroupDefinition(BaseModel):
-    """Which entities form a group: its name and membership. Also the form in
-    which a stage defines a group inline (scope.Population)."""
+    """
+    Which entities form a group: its name and membership. Also the form in
+    which a stage defines a group inline (scope.Population).
+    """
     model_config = ConfigDict(extra="forbid")
     name: str
     membership_sparql: str  # SPARQL group pattern over ?entity

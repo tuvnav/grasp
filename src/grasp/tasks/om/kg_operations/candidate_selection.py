@@ -1,10 +1,10 @@
 """
-Selection of the collected key candidates (kg_operations/value_comparison.py)
-by the Selection settings, and its summary for the LLM. Every function returns
+Selection of the collected candidates (kg_operations/value_comparison.py)
+by the `Selection` settings, and its summary for the LLM. Every function returns
 new values and changes nothing it gets, so a selection can be repeated with
 other settings on the same collection.
 
-Order (select_key_candidates):
+Order (select_<...>_candidates):
     1. per entity, on both sides: whole tie groups that fit into top_k
     2. mutual: candidates that have the entity in their own selection too
     3. per entity: the unique candidate (the anchor rule: alone in front, seen
@@ -14,10 +14,12 @@ Order (select_key_candidates):
 from collections import defaultdict
 
 from grasp.tasks.om.data_models.candidate_generators import Selection
-from grasp.tasks.om.data_models.candidate_selection import KeyStrategySignals, SelectedCandidates
+from grasp.tasks.om.data_models.candidate_selection import StrategySignals, SelectedCandidates
 from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 
+# TODO: move to central place and use as central keying
+# method for indexing Entities>
 type EntityKey = tuple[Side, IRI]
 
 
@@ -91,7 +93,8 @@ def find_alone_candidate(
     candidate = tie_groups[0][0]
     rival_at_this_rank_or_better = any(
         count > 0 and rank <= candidate.rank_key
-        for rank, count in entity_candidates.rivals_outside_by_rank.items())
+        for rank, count in entity_candidates.rivals_outside_by_rank.items()
+        )
     return None if rival_at_this_rank_or_better else candidate.candidate_entity
 
 
@@ -103,18 +106,20 @@ def filter_tie_groups(
     The tie groups with only the candidates in 'keep'; empty groups are left out.
     """
     filtered = [
-        [candidate for candidate in tie_group 
+        [candidate for candidate in tie_group
          if candidate.candidate_entity in keep]
         for tie_group in tie_groups
         ]
     return [tie_group for tie_group in filtered if tie_group]
 
 
-def select_key_candidates(
+def select_candidates(
         candidates_by_entity: dict[EntityKey, EntityCandidates],
         selection: Selection,
         ) -> dict[EntityKey, SelectedCandidates]:
-    """The selection of every entity of both sides (see the module docstring)."""
+    """
+    The selection of every entity of both sides (see the module docstring).
+    """
     # 1. whole tie groups that fit into top_k, on both sides
     tie_groups_by_entity: dict[EntityKey, list[list[Candidate]]] = {}
     dropped_rank_by_entity: dict[EntityKey, float | None] = {}
@@ -127,7 +132,9 @@ def select_key_candidates(
 
     # 3. unique candidate: alone in front from both sides (the anchor rule; implies mutual)
     alone_by_entity = {
-        entity_key: find_alone_candidate(entity_candidates, tie_groups_by_entity[entity_key])
+        entity_key: find_alone_candidate(
+            entity_candidates, tie_groups_by_entity[entity_key]
+            )
         for entity_key, entity_candidates in candidates_by_entity.items()
     }
     selected_by_entity = {}
@@ -144,7 +151,7 @@ def select_key_candidates(
             tie_groups = filter_tie_groups(tie_groups, mutual_candidates)
         selected_by_entity[entity_key] = SelectedCandidates(
             collected=entity_candidates,
-            tie_groups=tie_groups,
+            tie_rank_groups=tie_groups,
             dropped_tie_group_rank=dropped_rank_by_entity[entity_key],
             mutual_candidates=mutual_candidates,
             unique_candidate=unique_candidate,
@@ -152,24 +159,44 @@ def select_key_candidates(
     return selected_by_entity
 
 
-def summarize_key_selection(
+def summarize_candidate_selection(
         selected_by_entity: dict[EntityKey, SelectedCandidates],
         population_sizes: dict[Side, int],
-        ) -> dict[Side, KeyStrategySignals]:
-    """The four signals per side. population_sizes: all entities of each side's
-    population, also those without any key match (they are not in selected_by_entity)."""
+        sampled_side: Side | None = None,
+        ) -> dict[Side, StrategySignals]:
+    """
+    Four signals per side. population_sizes: all entities of each side's
+    population, also those without any match (they are not in selected_by_entity);
+    for a sampled side the sample size. sampled_side: see StrategySignals.
+    """
     signals = {}
     for side in SIDES:
         entries = [selected for (entry_side, _), selected in selected_by_entity.items() if entry_side == side]
         list_lengths = [len(entry.selected_candidates) for entry in entries if entry.selected_candidates]
         population_size = population_sizes[side]
-        share = (lambda count: count / population_size) if population_size else (lambda count: 0.0)
-        signals[side] = KeyStrategySignals(
+        signals[side] = StrategySignals(
             side=side,
             population_size=population_size,
-            coverage=share(len(list_lengths)),
-            mean_list_length=sum(list_lengths) / len(list_lengths) if list_lengths else 0.0,
-            ambiguous_at_top_rank=share(sum(entry.collected.ambiguous_at_top_rank for entry in entries)),
-            unique=share(sum(entry.unique_candidate is not None for entry in entries)),
+            coverage=share(
+                len(list_lengths), population_size
+                ),
+            mean_list_length=(
+                sum(list_lengths) / len(list_lengths) if list_lengths else 0.0
+                ),
+            ambiguous_at_top_rank=share(
+                sum(entry.collected.ambiguous_at_top_rank for entry in entries),
+                population_size
+                ),
+            unique=share(
+                sum(entry.unique_candidate is not None for entry in entries),
+                population_size
+                ),
+            sampled_side=sampled_side,
         )
     return signals
+
+
+def share(count: int, population_size: int) -> float:
+    if population_size:
+        return count / population_size
+    return 0.0

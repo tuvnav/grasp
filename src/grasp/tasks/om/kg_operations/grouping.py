@@ -189,7 +189,9 @@ def counts_by_group(manager: KgManager, grouping: Grouping | None, space: Iterab
     return {group: n for (group,), n in count_rows(select_rows(manager, sparql), "group").items()}
 
 
-def group_sizes(manager: KgManager, grouping: Grouping | None, space: Iterable[str]) -> dict[str, int]:
+def group_sizes(
+        manager: KgManager, grouping: Grouping | None, space: Iterable[str]
+        ) -> dict[str, int]:
     return counts_by_group(manager, grouping, space, "")
 
 

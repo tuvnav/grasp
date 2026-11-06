@@ -7,7 +7,10 @@ and target text j (the positions of the texts in the two lists).
 Every vectorizer gives rows of length 1 (L2-normalized), so the dot product of
 two rows is their cosine, and the similarity matrix is one matrix product.
 """
+import os
+import pickle
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal, cast
 
 import numpy as np
@@ -62,16 +65,61 @@ def load_embedding_model(model_name: str):
     return SentenceTransformer(model_name, device="cpu")
 
 
+# Embeddings are cached per model (text -> vector): the trial runs of a strategy
+# embed the same texts again and again. In memory for the process; also on disk
+# (one file per model) if this environment variable names a directory.
+EMBEDDING_CACHE_DIRECTORY_VARIABLE = "GRASP_EMBEDDING_CACHE_DIR"
+_embedding_cache_by_model: dict[str, dict[str, np.ndarray]] = {}
+
+
+def embedding_cache_path(model_name: str) -> Path | None:
+    """The cache file of a model, None without a cache directory."""
+    directory = os.environ.get(EMBEDDING_CACHE_DIRECTORY_VARIABLE)
+    if not directory:
+        return None
+    return Path(directory) / f"{model_name.replace('/', '__')}.pkl"
+
+
+def load_embedding_cache(model_name: str) -> dict[str, np.ndarray]:
+    """The cache of a model: from memory, else from disk, else empty."""
+    if model_name not in _embedding_cache_by_model:
+        path = embedding_cache_path(model_name)
+        _embedding_cache_by_model[model_name] = (
+            pickle.loads(path.read_bytes()) if path is not None and path.exists() else {})
+    return _embedding_cache_by_model[model_name]
+
+
+def save_embedding_cache(model_name: str, cache: dict[str, np.ndarray]) -> None:
+    """Writes the cache of a model to disk (if a cache directory is set): to a
+    temporary file first, so that an interrupted write leaves the old file intact."""
+    path = embedding_cache_path(model_name)
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_bytes(pickle.dumps(cache))
+    temporary_path.replace(path)
+
+
 def embed_texts(texts: list[str], model_name: str) -> np.ndarray:
-    """Embedding vectors of the texts, one row each, L2-normalized."""
-    prefix = EMBEDDING_TEXT_PREFIXES.get(model_name, "")
-    model = load_embedding_model(model_name)
-    return model.encode(
-        [prefix + text for text in texts],
-        normalize_embeddings=True,
-        batch_size=256,
-        convert_to_numpy=True,
-    )
+    """Embedding vectors of the texts, one row each, L2-normalized. Only texts
+    not in the cache of the model are embedded."""
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    cache = load_embedding_cache(model_name)
+    missing_texts = [text for text in dict.fromkeys(texts) if text not in cache]  # once each, in order
+    if missing_texts:
+        prefix = EMBEDDING_TEXT_PREFIXES.get(model_name, "")
+        model = load_embedding_model(model_name)
+        vectors = model.encode(
+            [prefix + text for text in missing_texts],
+            normalize_embeddings=True,
+            batch_size=256,
+            convert_to_numpy=True,
+        )
+        cache.update(zip(missing_texts, vectors))
+        save_embedding_cache(model_name, cache)
+    return np.array([cache[text] for text in texts], dtype=np.float32)
 
 
 def vectorize_texts(

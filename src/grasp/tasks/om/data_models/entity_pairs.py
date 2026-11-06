@@ -157,19 +157,23 @@ class VectorEntityPair(EntityPair[VectorMatch]):
 
 
 @dataclass
-class KeyHub:
+class Hub(ABC):
+    num_source_entities: int
+    num_target_entities: int
+
+
+@dataclass
+class KeyHub(Hub):
     """
     A key whose entities would give too many entity pairs (source entities x
     target entities above max_entity_pairs_per_bucket), so it gives none.
     """
     level: NormalizationLevel
     key: str
-    num_source_entities: int
-    num_target_entities: int
 
 
 @dataclass
-class VectorHub:
+class VectorHub(Hub):
     """
     A pair of similar texts whose entities would give too many entity pairs
     (source entities x target entities above max_entity_pairs_per_bucket), so
@@ -177,8 +181,7 @@ class VectorHub:
     """
     source_text: str
     target_text: str
-    num_source_entities: int
-    num_target_entities: int
+
 
 
 @dataclass(frozen=True)

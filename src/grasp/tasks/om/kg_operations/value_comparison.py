@@ -10,7 +10,8 @@ from grasp.tasks.om.data_models.scope import Normalization, StringTransform, app
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.text_vectors import (
-    TEXT_BATCH_SIZE, TextDTM, Vectorizer, build_similarity_matrix, count_text_vectors, vectorize_texts,
+    TEXT_BATCH_SIZE, TextVectors, Vectorizer, build_similarity_matrix,
+    count_text_vectors, vectorize_texts,
 )
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 
@@ -202,8 +203,8 @@ def text_pairs_to_entity_pairs(
 
 
 def nearest_texts_per_row(
-        vectors_a: TextDTM,
-        vectors_b: TextDTM,
+        vectors_a: TextVectors,
+        vectors_b: TextVectors,
         neighbours_per_text: int
 ) -> list[tuple[int, int, float]]:
     """
@@ -229,8 +230,8 @@ def nearest_texts_per_row(
 
 
 def find_nearest_text_pairs(
-        source_vectors: TextDTM,
-        target_vectors: TextDTM,
+        source_vectors: TextVectors,
+        target_vectors: TextVectors,
         neighbours_per_text: int
         ) -> dict[tuple[int, int], float]:
     """

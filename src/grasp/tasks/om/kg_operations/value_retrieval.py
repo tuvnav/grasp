@@ -75,6 +75,17 @@ def value_branches(
     return branches
 
 
+def retrieve_entities(
+        manager: KgManager,
+        grouping: Grouping,
+        entity_space: Iterable[str],
+        ) -> list[IRI]:
+    """The entities of a grouping, each once, sorted (so that a sample drawn
+    from them with a fixed seed is the same in every run)."""
+    query = grouping_to_sparql_query(manager, grouping, entity_space, "DISTINCT ?entity")
+    return sorted({IRI(Binding.from_dict(row["entity"]).identifier()) for row in stream_rows(manager, query)})
+
+
 def retrieve_partitions_by_entity(
         manager: KgManager,
         kg_profile: KgProfile,

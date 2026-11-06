@@ -47,6 +47,8 @@ LARGE_TRIPLES = 100_000_000
 # sampled members per membership pattern, drawn in this many chunks at spread offsets
 SAMPLE_PER_MEMBERSHIP = 200
 SAMPLE_CHUNKS = 10
+# larger samples are drawn in chunks of about this many members
+MEMBERS_PER_CHUNK = 100
 # stage a: sampled members per class to tell its prefixes and named share
 CLASS_SAMPLE = 30
 # stage b2: classes with fewer estimated members in the entity space get no default group
@@ -121,10 +123,13 @@ class MembershipSample:
 
 @dataclass
 class KgSample:
-    """Samples of the membership patterns of one KG within its entity space."""
+    """Samples of the membership patterns of one KG within its entity space.
+    per_membership: the members drawn per pattern; size_by_membership: another
+    number for single patterns (e.g. in proportion to their sizes)."""
     manager: KgManager
     space: tuple[str, ...]
     per_membership: int = SAMPLE_PER_MEMBERSHIP
+    size_by_membership: dict[str, int] = field(default_factory=dict)
     samples: dict[str, MembershipSample] = field(default_factory=dict)
     # membership -> entity -> whether it matches (asked for sampled entities only)
     matched: dict[str, dict[IRI, bool]] = field(default_factory=dict)
@@ -132,12 +137,14 @@ class KgSample:
     def sample(self, membership: str) -> MembershipSample:
         membership = membership.strip()
         if membership not in self.samples:
-            key = (self.manager.kg, self.space, self.per_membership, membership)
+            size = self.size_by_membership.get(membership, self.per_membership)
+            key = (self.manager.kg, self.space, size, membership)
             if key not in _CACHE:
                 count = count_members(self.manager, membership)
+                # more chunks for larger samples, so that they spread over the members;
                 # without a count, draw from the beginning only
-                members = draw_members(self.manager, membership, count if count is not None else self.per_membership,
-                                       self.per_membership, SAMPLE_CHUNKS if count is not None else 1)
+                chunks = max(SAMPLE_CHUNKS, size // MEMBERS_PER_CHUNK) if count is not None else 1
+                members = draw_members(self.manager, membership, count if count is not None else size, size, chunks)
                 in_space = [m for m in members if not self.space or m.startswith(self.space)]
                 _CACHE[key] = MembershipSample(count, members, in_space)
             self.samples[membership] = _CACHE[key]

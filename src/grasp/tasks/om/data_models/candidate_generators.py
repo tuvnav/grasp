@@ -46,11 +46,11 @@ class VectorStrategy(BaseModel):
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization(levels=["words"])
     vectorizer: Vectorizer = "idf_tokens"
-    model: str | None = None  # embedding model; None: foundation.text_vectors.DEFAULT_EMBEDDING_MODEL
+    model_name: str | None = None  # embedding model; None: foundation.text_vectors.DEFAULT_EMBEDDING_MODEL
 
     @model_validator(mode="after")
     def model_only_for_embedding(self) -> Self:
-        if self.model is not None and self.vectorizer != "embedding":
+        if self.model_name is not None and self.vectorizer != "embedding":
             raise ValueError("model is only used with the embedding vectorizer")
         return self
 
