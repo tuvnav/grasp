@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from grasp.tasks.om.data_models.patterns import StructureRelation
 from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
+from grasp.tasks.om.foundation.text_vectors import Vectorizer
 
 
 class CandidateStrategyType(StrEnum):
@@ -31,7 +32,7 @@ class KeyStrategy(BaseModel):
     """Candidates share a normalized value (e.g. a code, a cross reference, a
     name). The anchor rule is a key strategy on names with a unique selection."""
     model_config = ConfigDict(extra="forbid")
-    kind: CandidateStrategyType = CandidateStrategyType.KEY
+    kind: Literal[CandidateStrategyType.KEY] = CandidateStrategyType.KEY
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
 
@@ -41,11 +42,11 @@ class VectorStrategy(BaseModel):
     (IDF-weighted word tokens, character 3-grams or an embedding model) and
     compared by cosine; the best score over the value pairs counts."""
     model_config = ConfigDict(extra="forbid")
-    kind: CandidateStrategyType = CandidateStrategyType.VECTOR
+    kind: Literal[CandidateStrategyType.VECTOR] = CandidateStrategyType.VECTOR
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization(levels=["words"])
-    vectorizer: Literal["idf_tokens", "char_3grams", "embedding"] = "idf_tokens"
-    model: str | None = None  # embedding model; None: the default model
+    vectorizer: Vectorizer = "idf_tokens"
+    model: str | None = None  # embedding model; None: foundation.text_vectors.DEFAULT_EMBEDDING_MODEL
 
     @model_validator(mode="after")
     def model_only_for_embedding(self) -> Self:
@@ -59,7 +60,7 @@ class NeighbourStrategy(BaseModel):
     (a, b) with x related to a and y related to b by the same kind of structure
     relation in the same direction."""
     model_config = ConfigDict(extra="forbid")
-    kind: CandidateStrategyType = CandidateStrategyType.NEIGHBOURS
+    kind: Literal[CandidateStrategyType.NEIGHBOURS] = CandidateStrategyType.NEIGHBOURS
     # structure relations of the profiles by name, or defined here; None: the
     # subsumption, partonomy and membership relations of the profiles
     relations: list[str | StructureRelation] | None = None

@@ -17,14 +17,14 @@ from grasp.manager import KgManager
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidate_generators import Generator, KeyStrategy
 from grasp.tasks.om.data_models.candidate_selection import KeyStrategyResult
-from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, OverfullKey
+from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, KeyHub
 from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile
 from grasp.tasks.om.data_models.scope import REST, GroupRef, Population
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import select_key_candidates, summarize_key_selection
 from grasp.tasks.om.kg_operations.grouping import Grouping, group_sizes, profile_groups_to_grouping
 from grasp.tasks.om.kg_operations.value_comparison import (
-    build_side_indices, intersect_level_indices, key_matches_to_candidates_and_statistics,
+    build_side_indices, intersect_level_indices, key_entity_pairs_to_candidates,
 )
 from grasp.tasks.om.kg_operations.value_retrieval import retrieve_partitions_by_entity, retrieve_value_rows
 from grasp.utils import FunctionCallException
@@ -115,11 +115,12 @@ def get_key_candidates(
         alignment_state: AlignmentState,
         generator: Generator,
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        max_bucket_entities: int | None = None,
-        ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[OverfullKey]]:
+        max_entity_pairs_per_bucket: int | None = None,
+        ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[KeyHub]]:
     """
     The candidates of a key strategy for every entity in its population, on both
-    sides, and the keys that were too ambiguous to pair (above max_bucket_entities).
+    sides, and the keys whose entities would give too many entity pairs
+    (above max_entity_pairs_per_bucket).
     Not yet ranked or cut by generator.selection.
     """
     strategy = generator.strategy
@@ -143,12 +144,15 @@ def get_key_candidates(
 
     # 2. intersect the two sides: entity pairs with their shared keys
     entity_pairs, overfull_keys = intersect_level_indices(
-        indices_by_side[Side.SOURCE], indices_by_side[Side.TARGET], max_bucket_entities)
+        indices_by_side[Side.SOURCE], indices_by_side[Side.TARGET], max_entity_pairs_per_bucket)
 
     # 3. per entity in its population: candidates, rivals, non-competing counterparts
-    candidates_by_entity = key_matches_to_candidates_and_statistics(
+    candidates_by_entity = key_entity_pairs_to_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity)
     return candidates_by_entity, overfull_keys
+
+
+def get_
 
 
 def run_key_strategy(
@@ -156,12 +160,12 @@ def run_key_strategy(
         alignment_state: AlignmentState,
         generator: Generator,
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        max_bucket_entities: int | None = None,
+        max_entity_pairs_per_bucket: int | None = None,
         ) -> KeyStrategyResult:
     """A key strategy from the KGs to the selected candidates and the signals."""
     # 1. collect
     collected, overfull_keys = get_key_candidates(
-        managers, alignment_state, generator, partition_names_by_entity, max_bucket_entities)
+        managers, alignment_state, generator, partition_names_by_entity, max_entity_pairs_per_bucket)
     # 2. select
     selected = select_key_candidates(collected, generator.selection)
     # 3. summarize over the whole population of each side

@@ -23,7 +23,9 @@ dependencies = [
   # utils
   "requests>=2.32.0",
   "tqdm>=4.65.0",
+  "numpy>=2.0",  # used directly, not only through scipy
   "scipy>=1.15.0",
+  "scikit-learn>=1.5",  # TF-IDF vectors of the vector candidate strategy
   "universal-ml-utils>=0.1.6",
   "grammar-utils>=0.1.6",
   "search-rdf>=0.5.2",
@@ -43,6 +45,8 @@ dependencies = [
 # scripts/extract_uniprot_examples.py, and scripts/fix_uniprot_examples.py
 data = ["datasets>=3.3.0", "beautifulsoup4>=4.12.0"]
 grisp = ["transformers>=5", "wandb>=0.24.0", "peft>=0.15.0"]
+# embedding vectorizer of the vector candidate strategy (pulls in PyTorch)
+embeddings = ["sentence-transformers>=3.0"]
 # streamlit app in apps/evaluation
 evaluation = ["streamlit>=1.50.0", "pandas>=2.0.0", "natsort>=8.0.0"]
 

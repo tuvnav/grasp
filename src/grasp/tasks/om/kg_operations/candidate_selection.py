@@ -15,49 +15,46 @@ from collections import defaultdict
 
 from grasp.tasks.om.data_models.candidate_generators import Selection
 from grasp.tasks.om.data_models.candidate_selection import KeyStrategySignals, SelectedCandidates
-from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, KeyCandidate
-from grasp.tasks.om.foundation.text_normalization import (
-    NormalizationLevel, normalization_level_order, sort_normalization_levels,
-)
+from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 
 type EntityKey = tuple[Side, IRI]
 
 
-def select_tie_groups(
+def select_tie_rank_groups(
         entity_candidates: EntityCandidates,
         top_k: int,
-        ) -> tuple[list[list[KeyCandidate]], NormalizationLevel | None]:
+        ) -> tuple[list[list[Candidate]], float | None]:
     """
-    The whole tie groups that fit into top_k, best first, and the level of a tie
-    group that was dropped although places were free: it would have been cut in
-    the middle at top_k, so the entity is ambiguous there (None: no such group;
-    a group that only finds no free place left is an ordinary cut by top_k). A
-    tie group: the candidates whose pair has the same finest level. The rivals
-    outside the population on that level take places too, but are not listed.
+    The whole tie groups that fit into top_k, best first, and the rank of a tie
+    group that was dropped although places were free: top_k would have cut it in
+    the middle (None: no such group; a group that only finds no free place left
+    is an ordinary cut by top_k). A
+    tie rank group: the candidates whose pair has the same best rank. The rivals
+    outside the population on that rank take places too, but are not listed.
     """
-    candidates_by_level: dict[NormalizationLevel, list[KeyCandidate]] = defaultdict(list)
+    candidates_by_rank: dict[float, list[Candidate]] = defaultdict(list)
     for candidate in entity_candidates.candidates:
-        candidates_by_level[candidate.entity_key_pair.finest_normalization_level()].append(candidate)
-    rivals_by_level = entity_candidates.rivals_outside_by_level
-    levels = sort_normalization_levels(set(candidates_by_level) | set(rivals_by_level))
+        candidates_by_rank[candidate.rank_key].append(candidate)
+    rivals_by_rank = entity_candidates.rivals_outside_by_rank
+    ranks = sorted(set(candidates_by_rank) | set(rivals_by_rank))
 
-    tie_groups: list[list[KeyCandidate]] = []
+    tie_rank_groups: list[list[Candidate]] = []
     places_used = 0
-    for level in levels:
-        tie_group = candidates_by_level.get(level, [])
-        group_size = len(tie_group) + rivals_by_level[level]
-        if places_used + group_size > top_k:
-            # this group and all coarser ones are dropped; ambiguous only if places were free
-            return tie_groups, (level if places_used < top_k else None)
-        if tie_group:
-            tie_groups.append(tie_group)
-        places_used += group_size
-    return tie_groups, None
+    for rank in ranks:
+        tie_rank_group = candidates_by_rank.get(rank, [])
+        rank_group_size = len(tie_rank_group) + rivals_by_rank[rank]
+        if places_used + rank_group_size > top_k:
+            # this rank group and all worse ones are dropped; ambiguous only if places were free
+            return tie_rank_groups, (rank if places_used < top_k else None)
+        if tie_rank_group:
+            tie_rank_groups.append(tie_rank_group)
+        places_used += rank_group_size
+    return tie_rank_groups, None
 
 
 def find_mutual_candidates(
-        tie_groups_by_entity: dict[EntityKey, list[list[KeyCandidate]]]
+        tie_groups_by_entity: dict[EntityKey, list[list[Candidate]]]
         ) -> dict[EntityKey, frozenset[IRI]]:
     """
     For each entity: its selected candidates whose own selection contains the
@@ -82,27 +79,26 @@ def find_mutual_candidates(
 
 def find_alone_candidate(
         entity_candidates: EntityCandidates,
-        tie_groups: list[list[KeyCandidate]],
+        tie_groups: list[list[Candidate]],
         ) -> IRI | None:
     """
     One direction of the anchor rule: the candidate that stands alone in front,
     i.e. the first tie group holds only it and no rival outside the population
-    matches on its level or a finer one. None otherwise.
+    has its rank or a better one. None otherwise.
     """
     if not tie_groups or len(tie_groups[0]) != 1:
         return None
     candidate = tie_groups[0][0]
-    candidate_level_order = normalization_level_order(candidate.entity_key_pair.finest_normalization_level())
-    rival_at_this_level_or_finer = any(
-        count > 0 and normalization_level_order(level) <= candidate_level_order
-        for level, count in entity_candidates.rivals_outside_by_level.items())
-    return None if rival_at_this_level_or_finer else candidate.candidate_entity
+    rival_at_this_rank_or_better = any(
+        count > 0 and rank <= candidate.rank_key
+        for rank, count in entity_candidates.rivals_outside_by_rank.items())
+    return None if rival_at_this_rank_or_better else candidate.candidate_entity
 
 
 def filter_tie_groups(
-        tie_groups: list[list[KeyCandidate]],
+        tie_groups: list[list[Candidate]],
         keep: frozenset[IRI],
-        ) -> list[list[KeyCandidate]]:
+        ) -> list[list[Candidate]]:
     """
     The tie groups with only the candidates in 'keep'; empty groups are left out.
     """
@@ -120,10 +116,10 @@ def select_key_candidates(
         ) -> dict[EntityKey, SelectedCandidates]:
     """The selection of every entity of both sides (see the module docstring)."""
     # 1. whole tie groups that fit into top_k, on both sides
-    tie_groups_by_entity: dict[EntityKey, list[list[KeyCandidate]]] = {}
-    dropped_level_by_entity: dict[EntityKey, NormalizationLevel | None] = {}
+    tie_groups_by_entity: dict[EntityKey, list[list[Candidate]]] = {}
+    dropped_rank_by_entity: dict[EntityKey, float | None] = {}
     for entity_key, entity_candidates in candidates_by_entity.items():
-        tie_groups_by_entity[entity_key], dropped_level_by_entity[entity_key] = select_tie_groups(
+        tie_groups_by_entity[entity_key], dropped_rank_by_entity[entity_key] = select_tie_rank_groups(
             entity_candidates, selection.top_k)
 
     # 2. mutual, from the selections of both sides
@@ -149,7 +145,7 @@ def select_key_candidates(
         selected_by_entity[entity_key] = SelectedCandidates(
             collected=entity_candidates,
             tie_groups=tie_groups,
-            dropped_tie_group_level=dropped_level_by_entity[entity_key],
+            dropped_tie_group_rank=dropped_rank_by_entity[entity_key],
             mutual_candidates=mutual_candidates,
             unique_candidate=unique_candidate,
         )
@@ -173,7 +169,7 @@ def summarize_key_selection(
             population_size=population_size,
             coverage=share(len(list_lengths)),
             mean_list_length=sum(list_lengths) / len(list_lengths) if list_lengths else 0.0,
-            ambiguous=share(sum(entry.dropped_tie_group_level is not None for entry in entries)),
+            ambiguous_at_top_rank=share(sum(entry.collected.ambiguous_at_top_rank for entry in entries)),
             unique=share(sum(entry.unique_candidate is not None for entry in entries)),
         )
     return signals
