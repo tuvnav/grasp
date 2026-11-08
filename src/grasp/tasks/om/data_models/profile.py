@@ -42,6 +42,8 @@ from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelat
 from grasp.tasks.om.foundation.types import IRI, NameType
 from grasp.tasks.om.foundation.vocabulary import VOCABULARY_PREFIXES
 
+INVERSE_PREFIX = "^"
+
 
 class Stage(StrEnum):
     SPACE = "space"
@@ -55,10 +57,12 @@ STAGES = list(Stage)  # in pipeline order
 
 
 class Roles(BaseModel):
-    """Roles of predicates and patterns, KG-wide or as a group's delta.
+    """
+    Roles of predicates and patterns, KG-wide or as a group's delta.
     Patterns read from ?s, the entity, to ?o, the value; a pattern may compute
     ?o (e.g. a code from the IRI with BIND), which replaces code_sparql and
-    definition_sparql of the old profile."""
+    definition_sparql of the old profile.
+    """
     model_config = ConfigDict(extra="forbid")
     names: PredicatePattern | None = None
     synonyms: PredicatePattern | None = None
@@ -67,6 +71,54 @@ class Roles(BaseModel):
     cross_references: PredicatePattern | None = None
     noise: PredicatePattern | None = None
     structure: list[StructureRelation] = []
+
+    @model_validator(mode="after")
+    def validate_structure_relation_names(self) -> Self:
+        clashing_structure_relation_names = [
+            name for name in self.structure_relation_names()
+            if name in ROLE_FIELDS or name.startswith(INVERSE_PREFIX)
+        ]
+        if (
+            clashing_structure_relation_names
+            or len(set(self.structure_relation_names())) != len(self.structure)
+                ):
+            raise ValueError(
+                f"structure relation names must be unique, no role name and not start with "
+                f"{INVERSE_PREFIX!r}: {
+                    clashing_structure_relation_names or self.structure_relation_names()
+                    }"
+            )
+
+        return self
+
+    def structure_relation_names(self) -> list[str]:
+        return [relation.name for relation in self.structure]
+
+    def predicate_pattern_by_name(self, name: str) -> PredicatePattern | None:
+        """
+        The pattern of a value source by name: a role ("names"), a structure
+        relation ("part_of") or its inverse ("^part_of"). 'None' means
+        a role is not set yet.
+        Raises ValueError for an unknown name.
+        """
+        if name in ROLE_FIELDS:
+            return getattr(self, name)  # my be 'None'
+        relation_name = name.removeprefix(INVERSE_PREFIX)
+        relation = next(
+            (relation for relation in self.structure if relation.name == relation_name),
+            None,
+            )
+        if relation is None:
+            raise ValueError(
+                f"{name!r} is neither a role {ROLE_FIELDS} nor a structure relation "
+                f"{self.structure_relation_names()} (prefix {INVERSE_PREFIX!r}: the "
+                "other direction)"
+            )
+        return (
+            relation.predicate_pattern.inverted()
+            if name.startswith(INVERSE_PREFIX)
+            else relation.predicate_pattern
+            )
 
 
 # the role fields of Roles; also used to refer to a role elsewhere (scope.ValuePatterns)
@@ -250,6 +302,7 @@ class KgProfile(BaseModel):
         self.groups.append(group_profile)
 
 # --- elements and deltas ------------------------------------------------------
+
 
 # an element of a Roles: (field, "predicate" | "pattern", IRI or pattern) for the
 # role fields, ("structure", "relation", name) for a structure relation

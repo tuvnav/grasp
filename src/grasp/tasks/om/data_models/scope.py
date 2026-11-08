@@ -3,7 +3,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.data_models.patterns import PredicatePattern
+from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
 from grasp.tasks.om.data_models.profile import GroupDefinition, RoleName
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
@@ -21,6 +21,7 @@ REST = "rest"
 
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
+
 
 def group_name_from_group_ref(group_ref: GroupRef):
     match group_ref:
@@ -45,7 +46,7 @@ class Population(BaseModel):
 
 # values of an entity: one or more roles of its (effective) profile, or an own
 # pattern over ?s (the entity) and ?o (the value); a pattern may compute ?o (BIND)
-type ValuePatternSource = list[RoleName] | PredicatePattern
+type ValuePatternSource = list[str | StructureRelation] | PredicatePattern
 
 
 class ValuePatterns(BaseModel):
@@ -53,7 +54,7 @@ class ValuePatterns(BaseModel):
     source: ValuePatternSource = ["names", "synonyms"]
     target: ValuePatternSource | None = None  # None: like the source
 
-    def side(self, side: Side) -> ValuePatternSource:
+    def by_side(self, side: Side) -> ValuePatternSource:
         return self.source if side == Side.SOURCE or self.target is None else self.target
 
 

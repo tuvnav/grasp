@@ -24,17 +24,19 @@ the sampled side, drawn per group at spread offsets (large_kg_sampling) in
 proportion to the estimated group sizes, and queried for the sampled entities
 only; two large KGs are not supported yet.
 """
+from collections import defaultdict
 import random
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
+from typing import Collection, Iterable, Iterator
 
 from grasp.manager import KgManager
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.candidate_generators import CandidateStrategy, CandidateStrategyType, Generator, KeyStrategy, VectorStrategy
+from grasp.tasks.om.data_models.candidate_generators import CandidateStrategy, CandidateStrategyType, Generator, KeyStrategy, NeighbourStrategy, VectorStrategy
 from grasp.tasks.om.data_models.candidate_selection import StrategyResult
-from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, KeyHub, VectorHub
+from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, KeyHub, NeighbourHub, VectorHub
 from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile
-from grasp.tasks.om.data_models.scope import REST, GroupRef, Population
+from grasp.tasks.om.data_models.relations import EQUIVALENCE
+from grasp.tasks.om.data_models.scope import REST, GroupRef, Population, ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import select_candidates, summarize_candidate_selection
@@ -43,7 +45,10 @@ from grasp.tasks.om.kg_operations.grouping import (
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.value_comparison import (
-    ValueIndex, build_side_indices, compare_value_indices_by_vectors, intersect_level_indices, key_entity_pairs_to_candidates, vector_entity_pairs_to_candidates,
+    NeighbourIndex, ValueIndex, build_side_indices, build_side_witness_index, build_witness_maps,
+    compare_value_indices_by_vectors, compare_witness_indices, intersect_level_indices,
+    key_entity_pairs_to_candidates, neighbour_entity_pairs_to_candidates, relation_keys_by_role_name,
+    vector_entity_pairs_to_candidates,
 )
 from grasp.tasks.om.kg_operations.value_retrieval import (
     retrieve_entities, retrieve_partitions_by_entity, retrieve_value_rows,
@@ -51,6 +56,7 @@ from grasp.tasks.om.kg_operations.value_retrieval import (
 from grasp.utils import FunctionCallException
 
 
+# TODO: Perhaps move to retrieve_values.py
 def group_refs_of_side(population: Population, side: Side) -> list[GroupRef]:
     return population.source_group_refs if side == Side.SOURCE else population.target_group_refs
 
@@ -106,8 +112,11 @@ POPULATION = "_population"
 
 
 def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """The groups of one side's population only (no rivals), without the entities
-    of excluded groups; also for a large KG."""
+    """
+    The groups of one side's population only 
+    (no rivals), without the entities
+    of excluded groups; also for a large KG.
+    """
     all_groups = profile_groups_to_grouping(kg_profile, inline_groups(population, side))
     group_names = population_group_names(kg_profile, population, side)
     return Grouping(
@@ -145,8 +154,9 @@ TRIAL_ENTITY_LIMITS: dict[str, int] = {
     "char_3grams": 20_000,
     "embedding": 5_000,
 }
-# a large KG is always sampled in a trial run, the key strategy with this limit
-KEY_TRIAL_ENTITY_LIMIT_IN_LARGE_KG = 20_000
+# a large KG is always sampled in a trial run; the key and neighbour strategies
+# (without a limit in a small KG) with this limit
+LARGE_KG_TRIAL_ENTITY_LIMIT = 20_000
 
 
 @dataclass(frozen=True)
@@ -166,7 +176,7 @@ def trial_entity_limit(strategy: CandidateStrategy, large: bool = False) -> int 
     which is always sampled."""
     if isinstance(strategy, VectorStrategy):
         return TRIAL_ENTITY_LIMITS.get(strategy.vectorizer)
-    return KEY_TRIAL_ENTITY_LIMIT_IN_LARGE_KG if large else None
+    return LARGE_KG_TRIAL_ENTITY_LIMIT if large else None
 
 
 def check_large_kgs(large_sides: set[Side], trial: bool) -> None:
@@ -261,19 +271,37 @@ def draw_trial_sample(
     return EntitySample(side=side, entities=draw_entity_sample(entities, min(limit, len(entities)), seed))
 
 
+def check_value_pattern_source(value_pattern_source: ValuePatternSource, kg_profile: KgProfile) -> None:
+    """Every name in the value source is a role or a structure relation of the
+    profile (checked before querying, for a message the LLM can act on)."""
+    if not isinstance(value_pattern_source, list):
+        return
+    for name in value_pattern_source:
+        if isinstance(name, str):
+            try:
+                kg_profile.roles.predicate_pattern_by_name(name)
+            except ValueError as error:
+                raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
+
+
 def retrieve_strategy_value_rows(
         manager: KgManager,
         kg_profile: KgProfile,
         generator: Generator,
         side: Side,
         entity_sample: EntitySample | None = None,
+        object_iris: Collection[IRI] | None = None,
         ) -> Iterator[ValueRow]:
-    """The values a key or vector strategy compares on one side: of the entities
-    of all groups (rivals outside the population included); on a sampled side
-    only those of the sampled entities (in a large KG: of the groups of the
-    population, queried for the sampled entities only)."""
-    strategy = generator.strategy
-    assert isinstance(strategy, KeyStrategy | VectorStrategy)
+    """
+    The values a strategy compares on one side (its value_pattern_source: roles,
+    or the structure relations of a neighbour strategy): of the entities of all
+    groups (rivals outside the population included); on a sampled side only
+    those of the sampled entities (in a large KG: of the groups of the
+    population, queried for the sampled entities only). object_iris: only values
+    among these (a neighbour strategy: the entities of the witnesses).
+    """
+    value_pattern_source = generator.strategy.value_pattern_source(side, kg_profile.roles)
+    check_value_pattern_source(value_pattern_source, kg_profile)
     side_sample = entity_sample if entity_sample is not None and entity_sample.side == side else None
     if side_sample is not None and side_sample.kg_sample is not None:
         use_sample(manager, side_sample.kg_sample)
@@ -282,18 +310,21 @@ def retrieve_strategy_value_rows(
                 manager,
                 generate_population_groups_grouping(kg_profile, generator.population, side),
                 kg_profile.entity_space,
-                strategy.values.side(side),
+                value_pattern_source,
                 kg_profile.roles,
+                object_iris,
             ))
         finally:
             use_sample(manager, None)
         return iter(value_rows)
+
     value_rows = retrieve_value_rows(
         manager,
         generate_group_grouping(kg_profile, generator.population, side),
         kg_profile.entity_space,
-        strategy.values.side(side),
+        value_pattern_source,
         kg_profile.roles,
+        object_iris,
     )
     if side_sample is None:
         return value_rows
@@ -301,8 +332,10 @@ def retrieve_strategy_value_rows(
 
 
 def sampled_partition_names(kg_profile: KgProfile, entity_sample: EntitySample) -> dict[IRI, str]:
-    """The partition of every sampled entity of a large KG, asked for these
-    entities only (the first matching partition, as in a small KG)."""
+    """
+    The partition of every sampled entity of a large KG, asked for these
+    entities only (the first matching partition, as in a small KG).
+    """
     assert entity_sample.kg_sample is not None
     assignments = entity_sample.kg_sample.assignments(
         profile_partitions_to_grouping(kg_profile), sorted(entity_sample.entities))
@@ -359,11 +392,16 @@ def get_key_candidates(
 
     # 2. intersect the two sides: entity pairs with their shared keys
     entity_pairs, overfull_keys = intersect_level_indices(
-        indices_by_side[Side.SOURCE], indices_by_side[Side.TARGET], max_entity_pairs_per_bucket)
+        indices_by_side[Side.SOURCE],
+        indices_by_side[Side.TARGET],
+        max_entity_pairs_per_bucket
+        )
 
     # 3. per entity in its population: candidates, rivals, non-competing counterparts
     candidates_by_entity = key_entity_pairs_to_candidates(
-        alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity)
+        alignment_state, entity_pairs,
+        group_names_by_side, partition_names_by_entity
+        )
     return candidates_by_entity, overfull_keys
 
 
@@ -380,14 +418,16 @@ def get_vector_candidates(
     The candidates of a vector strategy for every entity in its population, on
     both sides, and the text pairs whose entities would give too many entity
     pairs (above max_entity_pairs_per_bucket). The strategy compares the texts
-    of ONE normalization level. neighbours_per_text: how many nearest texts of
+    of one normalization level. neighbours_per_text: how many nearest texts of
     the other side each text keeps (a pre-cut before the selection, larger than
     any top_k). entity_sample: a trial run compares only these entities on their
     side. Not yet ranked or cut by generator.selection.
     """
     strategy = generator.strategy
     if not isinstance(strategy, VectorStrategy):
-        raise FunctionCallException(f"get_vector_candidates needs a vector strategy, not {strategy.kind!r}")
+        raise FunctionCallException(
+            f"get_vector_candidates needs a vector strategy, not {strategy.kind!r}"
+            )
 
     # 1. per side: the values of the entities in the groups -> index of the one level
     index_by_side: dict[Side, ValueIndex] = {}
@@ -417,6 +457,76 @@ def get_vector_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity
         )
     return candidates_by_entity, vector_hubs
+
+
+def get_neighbour_candidates(
+        managers: dict[Side, KgManager],
+        alignment_state: AlignmentState,
+        generator: Generator,
+        partition_names_by_entity: dict[Side, dict[IRI, str]],
+        max_entity_pairs_per_bucket: int | None = None,
+        entity_sample: EntitySample | None = None,
+        ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[NeighbourHub]]:
+    """
+    The candidates of a neighbour strategy for every entity in its population,
+    on both sides, and the witnesses whose entities would give too many entity
+    pairs (above max_entity_pairs_per_bucket: they create no pairs, but count
+    for the others). The witnesses are the equivalences of the alignment state,
+    so the candidates change from round to round. entity_sample: a trial run
+    compares only these entities on their side.
+    Not yet ranked or cut by generator.selection.
+    """
+    strategy = generator.strategy
+    if not isinstance(strategy, NeighbourStrategy):
+        raise FunctionCallException(
+            f"get_neighbour_candidates needs a neighbour strategy, not {strategy.kind!r}"
+            )
+
+    # 0. the witnesses: the equivalences found so far
+    witnesses_by_entity = build_witness_maps(alignment_state.correspondences)
+    if not witnesses_by_entity[Side.SOURCE]:
+        raise FunctionCallException(
+            "A neighbour strategy needs equivalences found before (its witnesses), "
+            "but there are none yet: run a key or vector strategy first."
+        )
+
+    # 1. per side: the neighbours that take part in a witness -> witness index
+    index_by_side: dict[Side, NeighbourIndex] = {}
+    group_names_by_side = {}
+    for side in SIDES:
+        kg_profile = alignment_state.get_profile(side)
+        group_names_by_side[side] = population_group_names(
+            kg_profile, generator.population, side
+            )
+        value_rows = retrieve_strategy_value_rows(
+            managers[side], kg_profile, generator,
+            side, entity_sample, witnesses_by_entity[side].keys()
+            )
+        relation_keys = relation_keys_by_role_name(
+            strategy.value_pattern_source(side, kg_profile.roles),
+            kg_profile.roles
+        )
+        index_by_side[side] = build_side_witness_index(
+            witnesses_by_entity[side],
+            value_rows,
+            relation_keys
+        )
+
+    # 2. compare the two sides: entity pairs with their shared witnesses (the
+    # hubs create no pairs, but add their witnesses to the pairs of the others)
+    entity_pairs, neighbour_hubs = compare_witness_indices(
+        index_by_side[Side.SOURCE],
+        index_by_side[Side.TARGET],
+        max_entity_pairs_per_bucket,
+        strategy.min_witnesses,
+        strategy.witness_weighting,
+    )
+
+    # 3. per entity in its population: candidates, rivals, non-competing counterparts
+    candidates_by_entity = neighbour_entity_pairs_to_candidates(
+        alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity
+        )
+    return candidates_by_entity, neighbour_hubs
 
 
 def run_strategy(
@@ -469,6 +579,12 @@ def run_strategy(
             )
         case CandidateStrategyType.VECTOR:
             collected, hubs = get_vector_candidates(
+                managers, alignment_state, generator,
+                partition_names_by_entity, max_entity_pairs_per_bucket,
+                entity_sample=entity_sample,
+            )
+        case CandidateStrategyType.NEIGHBOURS:
+            collected, hubs = get_neighbour_candidates(
                 managers, alignment_state, generator,
                 partition_names_by_entity, max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,

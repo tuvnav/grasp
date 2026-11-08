@@ -5,9 +5,10 @@ and the candidates built from them. Internal results of one computation, not sto
 """
 from abc import ABC, abstractmethod
 from collections import Counter
+import math
 from dataclasses import dataclass, field
 
-from grasp.tasks.om.data_models.candidate_generators import CandidateStrategyType
+from grasp.tasks.om.data_models.candidate_generators import CandidateStrategyType, WitnessWeighting
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, sort_normalization_levels
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
@@ -67,8 +68,32 @@ class VectorMatch(Match):
         return CandidateStrategyType.VECTOR
 
 
+@dataclass(frozen=True)
+class NeighbourMatch(Match):
+    """
+    One witness pair shared by one source 
+    and one target entity over corresponding relations,
+    with the rows of just these two entities.
+    """
+    relation_key: str                # e.g. "kind:partonomy"
+    witness: tuple[IRI, IRI]         # the equivalence (a, b) of the neighbours
+    # entities that share this witness over this relation (the bucket), per side
+    num_source_entities: int
+    num_target_entities: int
+
+    @property
+    def weight(self) -> float:
+        """1 / sqrt(source entities x target entities sharing the witness): 1 for a
+        witness of just these two entities, small for a hub."""
+        return 1 / math.sqrt(self.num_source_entities * self.num_target_entities)
+
+    @property
+    def kind(self) -> CandidateStrategyType:
+        return CandidateStrategyType.NEIGHBOURS
+
+
 @dataclass
-class EntityPair[T: (KeyMatch, VectorMatch)](ABC):
+class EntityPair[T: (KeyMatch, VectorMatch, NeighbourMatch)](ABC):
     """
     A source and a target entity with all their matches in the run.
     """
@@ -157,6 +182,35 @@ class VectorEntityPair(EntityPair[VectorMatch]):
 
 
 @dataclass
+class NeighbourEntityPair(EntityPair[NeighbourMatch]):
+    """
+    Entity pair with at least one witness. witness_weighting: how its witnesses
+    are scored (the same for all pairs of a run).
+    """
+    witness_weighting: WitnessWeighting = "count"
+
+    def witnesses(self) -> set[tuple[IRI, IRI]]:
+        return {match.witness for match in self.matches}
+
+    def witness_score(self) -> float:
+        """count: the distinct witnesses (one witness over two relations counts
+        once); inverse_degree: the sum of their weights (of a witness over two
+        relations: its larger weight)."""
+        if self.witness_weighting == "count":
+            return len(self.witnesses())
+        weight_by_witness: dict[tuple[IRI, IRI], float] = {}
+        for match in self.matches:
+            weight_by_witness[match.witness] = max(weight_by_witness.get(match.witness, 0.0), match.weight)
+        return sum(weight_by_witness.values())
+
+    @property
+    def rank_key(self) -> float:
+        """Smaller is better: the negative witness score; a weighted score rounded
+        to 6 places (only float noise: equal scores are ties)."""
+        return -round(self.witness_score(), 6)
+
+
+@dataclass
 class Hub(ABC):
     num_source_entities: int
     num_target_entities: int
@@ -182,6 +236,16 @@ class VectorHub(Hub):
     source_text: str
     target_text: str
 
+
+@dataclass
+class NeighbourHub(Hub):
+    """
+    A witness pair whose entities would give
+    too many entity pairs: it creates no pairs,
+    but counts for the pairs created by other witnesses.
+    """
+    relation_key: str
+    witness: tuple[IRI, IRI]
 
 
 @dataclass(frozen=True)
@@ -229,8 +293,14 @@ class KeyCandidate(Candidate):
             ]
 
 
+@dataclass(frozen=True)
 class VectorCandidate(Candidate):
     entity_pair: VectorEntityPair
+
+
+@dataclass(frozen=True)
+class NeighbourCandidate(Candidate):
+    entity_pair: NeighbourEntityPair
 
 
 @dataclass

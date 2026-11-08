@@ -296,7 +296,7 @@ def element_parts(key: ElementKey, value) -> list[str]:
     """Alternatives of the pattern over ?s and ?o of one element of a Roles."""
     _, kind, item = key
     if kind == "relation":
-        return value.predicate_pattern.alternatives()
+        return value.predicate_pattern.branches_for_union()
     if kind == "predicate":
         return [f"?s <{item}> ?o"]
     return [item]
@@ -393,7 +393,7 @@ def retrieve_values(manager: KgManager, entities: Iterable[IRI], pattern: Predic
         return values
     literal = "FILTER(isLiteral(?o))" if literals_only else ""
     for block in values_blocks(entities):
-        sparql = f"SELECT ?s ?o WHERE {{ {down_pushed_union(f'VALUES ?s {{ {block} }}', pattern.alternatives(), None)} {literal} }}"
+        sparql = f"SELECT ?s ?o WHERE {{ {down_pushed_union(f'VALUES ?s {{ {block} }}', pattern.branches_for_union(), None)} {literal} }}"
         for row in select_rows(manager, sparql):
             if "s" in row and "o" in row:
                 values[IRI(row["s"].value)].append(row["o"].value)

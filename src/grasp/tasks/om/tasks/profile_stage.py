@@ -462,7 +462,7 @@ class RoleEditingTask(ProfileStageTask):
             self.manager, self.grouping, self.space,
             "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
             "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
-            "", "GROUP BY ?group", pattern.alternatives(),
+            "", "GROUP BY ?group", pattern.branches_for_union(),
         ))
         counts = {row["group"].value: row for row in rows if "group" in row}
         value = lambda row, key: int(row[key].value) if key in row else 0
@@ -477,7 +477,7 @@ class RoleEditingTask(ProfileStageTask):
             member = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
         if member is not None and value(counts.get(member, {}), "subjects"):
             lines.append(f"Examples in {member} (?s -> ?o, with names in quotes):")
-            lines += self.format_examples(member, pattern.alternatives())
+            lines += self.format_examples(member, pattern.branches_for_union())
         return "\n".join(lines)
 
     def format_examples(self, member: str, parts: list[str]) -> list[str]:

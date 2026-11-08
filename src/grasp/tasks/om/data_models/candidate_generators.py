@@ -15,10 +15,12 @@ strategies the current alignment, so they change from round to round.
 from enum import StrEnum, auto
 from typing import Annotated, Literal, Self
 
+from grasp.tasks.om.foundation.types import Side
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.data_models.patterns import StructureRelation
-from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
+from grasp.tasks.om.data_models.patterns import StructureRelation, StructureRelationKind
+from grasp.tasks.om.data_models.profile import INVERSE_PREFIX, Roles
+from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatternSource, ValuePatterns
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 
 
@@ -29,12 +31,18 @@ class CandidateStrategyType(StrEnum):
 
 
 class KeyStrategy(BaseModel):
-    """Candidates share a normalized value (e.g. a code, a cross reference, a
-    name). The anchor rule is a key strategy on names with a unique selection."""
+    """
+    Candidates share a normalized value (e.g. a code, a cross reference, a
+    name). The anchor rule is a key strategy on names with a unique selection.
+    """
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.KEY] = CandidateStrategyType.KEY
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
+
+    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+        """The values compared on one side (roles: unused, all strategies take it)."""
+        return self.values.by_side(side)
 
 
 class VectorStrategy(BaseModel):
@@ -54,6 +62,16 @@ class VectorStrategy(BaseModel):
             raise ValueError("model is only used with the embedding vectorizer")
         return self
 
+    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+        """The values compared on one side (roles: unused, all strategies take it)."""
+        return self.values.by_side(side)
+
+
+# how the witnesses of a pair are scored: count (distinct witnesses; equal counts
+# are real ties) or inverse_degree (a witness counts 1 / sqrt(source entities x
+# target entities that share it), so rare witnesses decide; for instances with hubs)
+type WitnessWeighting = Literal["count", "inverse_degree"]
+
 
 class NeighbourStrategy(BaseModel):
     """Candidates have witnesses: a pair (x, y) is supported by a matched pair
@@ -61,17 +79,31 @@ class NeighbourStrategy(BaseModel):
     relation in the same direction."""
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.NEIGHBOURS] = CandidateStrategyType.NEIGHBOURS
-    # structure relations of the profiles by name, or defined here; None: the
-    # subsumption, partonomy and membership relations of the profiles
+    # the structure relations of these kinds in the profiles, in both directions ...
+    relation_kinds: list[StructureRelationKind] = [
+        StructureRelationKind.SUBSUMPTION,
+        StructureRelationKind.PARTONOMY,
+        StructureRelationKind.MEMBERSHIP
+        ]
+    # ... unless relations are named here, by name or defined inline, taken as
+    # written ("^part_of": the other direction)
     relations: list[str | StructureRelation] | None = None
     depth: int = Field(default=1, ge=1, le=3)
     min_witnesses: int = Field(default=1, ge=1)
-    # neighbours with more relations give no candidates (hubs make the
-    # candidates quadratic and say little)
-    max_degree: int = Field(default=50, ge=1)
+    witness_weighting: WitnessWeighting = "count"
     # generate: candidates from the neighbours of matched pairs; corroborate:
     # only count witnesses for the candidates of other generators
     mode: Literal["generate", "corroborate"] = "generate"
+
+    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+        """The structure relations whose neighbours are compared on one side: the
+        named relations as written, else those of relation_kinds in the profile
+        (roles), in both directions."""
+        if self.relations is not None:
+            return self.relations
+        names = [relation.name for relation in roles.structure if relation.kind in self.relation_kinds]
+        both_directions: list[str | StructureRelation] = [*names, *(INVERSE_PREFIX + name for name in names)]
+        return both_directions
 
 
 CandidateStrategy = Annotated[KeyStrategy | VectorStrategy | NeighbourStrategy, Field(discriminator="kind")]

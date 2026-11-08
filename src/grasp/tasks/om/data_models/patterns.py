@@ -3,6 +3,7 @@ Predicate patterns (predicates and SPARQL patterns over ?s and ?o) and
 structure relations, with the default structure relations.
 """
 from enum import StrEnum, auto
+import re
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -37,7 +38,7 @@ class PredicatePattern(BaseModel):
             parts.append(f"?s {sparql_path(self.predicates)} ?o")
         return parts
 
-    def alternatives(self) -> list[str]:
+    def branches_for_union(self) -> list[str]:
         """
         The alternatives for querying: each pattern, and each predicate on
         its own (not a path <a>|<b>, for a path like this may be evaluated
@@ -47,6 +48,25 @@ class PredicatePattern(BaseModel):
 
     def predicates_to_sparql(self) -> str:
         return " UNION ".join(f"{{ {p} }}" for p in self.parts())
+
+    def inverted(self) -> "PredicatePattern":
+        """
+        The pattern in the other direction: ?s and ?o 
+        swapped in every alternative (e.g. "the parts 
+        of ?s" from "?s is part of ?o").
+        """
+        return PredicatePattern(
+            patterns=[
+                swap(alternative) for alternative in self.branches_for_union()
+                ]
+            )
+
+
+def swap(pattern: str) -> str:
+    return re.sub(
+        r"\?(s|o)\b",
+        lambda match: "?o" if match.group(1) == "s" else "?s", pattern
+        )
 
 
 class StructureRelationKind(StrEnum):

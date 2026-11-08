@@ -3,10 +3,16 @@ from typing import Callable, Iterable
 import numpy as np
 
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.data_models.candidate_generators import WitnessWeighting
+from grasp.tasks.om.data_models.correspondence import Correspondence
+from grasp.tasks.om.data_models.relations import EQUIVALENCE
 from grasp.tasks.om.data_models.entity_pairs import (
-    Candidate, EntityCandidates, EntityPair, KeyCandidate, KeyEntityPair, KeyMatch, KeyHub, VectorCandidate, VectorEntityPair, VectorHub, VectorMatch,
+    Candidate, EntityCandidates, EntityPair, KeyCandidate, KeyEntityPair, KeyMatch, KeyHub, NeighbourCandidate,
+    NeighbourEntityPair, NeighbourHub, NeighbourMatch, VectorCandidate, VectorEntityPair, VectorHub, VectorMatch,
 )
-from grasp.tasks.om.data_models.scope import Normalization, StringTransform, apply_string_transforms
+from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation, StructureRelationKind
+from grasp.tasks.om.data_models.profile import INVERSE_PREFIX, Roles
+from grasp.tasks.om.data_models.scope import Normalization, StringTransform, ValuePatternSource, apply_string_transforms
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.text_vectors import (
@@ -15,7 +21,11 @@ from grasp.tasks.om.foundation.text_vectors import (
 )
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 
+# normalized value -> [retrieved rows]. For key and vector strategies
 type ValueIndex = dict[str, list[ValueRow]]
+# (relation key, (source_iri, target_iri)) -> [retrieved rows]; the relation key
+# is the same on both sides for corresponding relations (relation_keys_by_role_name)
+type NeighbourIndex = dict[tuple[str, tuple[IRI, IRI]], list[ValueRow]]
 # (source entity, target entity) -> their pair; P: the pair kind of the strategy
 type EntityPairIndex[P: EntityPair] = dict[tuple[IRI, IRI], P]
 
@@ -82,6 +92,86 @@ def build_side_indices(
     return indices_by_level
 
 
+# structure relations of these kinds correspond across the KGs by their kind and
+# direction (e.g. part_of and UNDEFINED_part_of, subclass_of and skos broader);
+# the others by their name (e.g. two inline relations "domain")
+RELATION_KINDS_MATCHED_BY_KIND = frozenset({
+    StructureRelationKind.SUBSUMPTION, StructureRelationKind.PARTONOMY, StructureRelationKind.MEMBERSHIP})
+
+
+def relation_key(relation: StructureRelation, inverse: bool) -> str:
+    """The key a relation is compared by across the KGs: "kind:partonomy",
+    "^kind:partonomy" (the other direction) or "name:domain" (prefixed, so that
+    a relation named like a kind cannot collide with it)."""
+    base = (
+        f"kind:{relation.kind.value}"
+        if relation.kind in RELATION_KINDS_MATCHED_BY_KIND
+        else f"name:{relation.name}"
+        )
+    return f"{INVERSE_PREFIX}{base}" if inverse else base
+
+
+def relation_keys_by_role_name(
+        value_pattern_source: ValuePatternSource, roles: Roles
+        ) -> dict[str, str]:
+    """
+    For each relation of a value source, by the role name of its rows
+    ("part_of", "^part_of", or the name of an inline relation): its relation
+    key. Roles (names, ...) and an own pattern have no relation key.
+    """
+    if isinstance(value_pattern_source, PredicatePattern):
+        return {}
+    keys: dict[str, str] = {}
+    for item in value_pattern_source:
+        if isinstance(item, StructureRelation):
+            keys[item.name] = relation_key(item, inverse=False)
+            continue
+        relation_name = item.removeprefix(INVERSE_PREFIX)
+        relation = next((relation for relation in roles.structure if relation.name == relation_name), None)
+        if relation is not None:
+            keys[item] = relation_key(relation, inverse=item.startswith(INVERSE_PREFIX))
+    return keys
+
+
+# per side: entity -> the equivalences (witnesses) it takes part in
+type WitnessesByEntity = dict[Side, dict[IRI, list[tuple[IRI, IRI]]]]
+
+
+def build_witness_maps(correspondences: Iterable[Correspondence]) -> WitnessesByEntity:
+    """The witnesses of a neighbour strategy: the equivalences among the
+    correspondences, per side by the entity of that side (an entity may take
+    part in several)."""
+    witnesses_by_entity: WitnessesByEntity = {Side.SOURCE: {}, Side.TARGET: {}}
+    for correspondence in correspondences:
+        if correspondence.relation != EQUIVALENCE.iri:
+            continue
+        witness = (IRI(correspondence.entity_source.identifier), IRI(correspondence.entity_target.identifier))
+        witnesses_by_entity[Side.SOURCE].setdefault(witness[0], []).append(witness)
+        witnesses_by_entity[Side.TARGET].setdefault(witness[1], []).append(witness)
+    return witnesses_by_entity
+
+
+def build_side_witness_index(
+        witnesses_by_entity: dict[IRI, list[tuple[IRI, IRI]]],
+        value_rows: Iterable[ValueRow],
+        relation_keys: dict[str, str],
+) -> NeighbourIndex:
+    """
+    (relation key, witness) → the rows whose neighbour takes part in the
+    witness; a row whose neighbour has no equivalence, or whose role has no
+    relation key (relation_keys_by_role_name), gives no entry.
+    """
+    index: NeighbourIndex = {}
+    for row in value_rows:
+        key_of_relation = relation_keys.get(row.role_name)
+        witness_pairs = witnesses_by_entity.get(IRI(row.raw_projection_value))
+        if key_of_relation is None or witness_pairs is None:
+            continue
+        for witness_pair in witness_pairs:
+            index.setdefault((key_of_relation, witness_pair), []).append(row)
+    return index
+
+
 # This method is for key candidates only
 def intersect_level_indices(
         source_indices: dict[NormalizationLevel, ValueIndex],
@@ -146,6 +236,102 @@ def intersect_level_indices(
 # (side, entity, level) -> the entity's counterparts on that level whose
 # partition competes with its own (in the population or not)
 type CompetingCounterparts = dict[tuple[Side, IRI, NormalizationLevel], set[IRI]]
+
+
+# a bucket of a witness index: (key, rows by source entity, rows by target entity)
+type WitnessBucket = tuple[tuple[str, tuple[IRI, IRI]], dict[IRI, list[ValueRow]], dict[IRI, list[ValueRow]]]
+
+
+def add_neighbour_match(
+        entity_pairs: EntityPairIndex[NeighbourEntityPair],
+        bucket: WitnessBucket,
+        source_entity: IRI,
+        target_entity: IRI,
+        witness_weighting: WitnessWeighting,
+        ) -> None:
+    """Adds the match of one bucket to the pair of two of its entities (creating the pair)."""
+    (relation_key, witness), rows_by_source_entity, rows_by_target_entity = bucket
+    entity_pairs.setdefault(
+        (source_entity, target_entity),
+        NeighbourEntityPair(source_entity=source_entity, target_entity=target_entity, matches=[],
+                            witness_weighting=witness_weighting),
+    ).append_match(
+        NeighbourMatch(
+            source_rows=tuple(rows_by_source_entity[source_entity]),
+            target_rows=tuple(rows_by_target_entity[target_entity]),
+            relation_key=relation_key,
+            witness=witness,
+            num_source_entities=len(rows_by_source_entity),
+            num_target_entities=len(rows_by_target_entity),
+        )
+    )
+
+
+def compare_witness_indices(
+        source_index: NeighbourIndex,
+        target_index: NeighbourIndex,
+        max_entity_pairs_per_bucket: int | None = None,
+        min_witnesses: int = 1,
+        witness_weighting: WitnessWeighting = "count",
+) -> tuple[EntityPairIndex[NeighbourEntityPair], list[NeighbourHub]]:
+    """
+    The entity pairs that share witnesses, in two passes:
+    1. every bucket (a key of both indices: relation key and witness) with at
+       most max_entity_pairs_per_bucket entity pairs creates its pairs; a larger
+       one (a hub) is set aside;
+    2. a hub creates no pairs, but adds its match to the pairs of pass 1 whose
+       two entities are both in it.
+    Pairs with fewer than min_witnesses distinct witnesses are left out. The
+    hubs are returned as NeighbourHubs.
+    """
+    entity_pairs: EntityPairIndex[NeighbourEntityPair] = {}
+    hub_buckets: list[WitnessBucket] = []
+
+    # 1. intersect: pairs from the buckets below the limit
+    for key, source_bucket_rows in source_index.items():
+        target_bucket_rows = target_index.get(key)
+        if not target_bucket_rows:
+            continue
+        bucket: WitnessBucket = (key, group_value_rows_by_entity(source_bucket_rows),
+                                 group_value_rows_by_entity(target_bucket_rows))
+        _, rows_by_source_entity, rows_by_target_entity = bucket
+        if (max_entity_pairs_per_bucket is not None
+                and len(rows_by_source_entity) * len(rows_by_target_entity) > max_entity_pairs_per_bucket):
+            hub_buckets.append(bucket)
+            continue
+        for source_entity in rows_by_source_entity:
+            for target_entity in rows_by_target_entity:
+                add_neighbour_match(entity_pairs, bucket, source_entity, target_entity, witness_weighting)
+
+    # 2. the hubs add their matches to the existing pairs: per entity, the
+    # numbers of the hub buckets it is in; a pair gets the hubs both its
+    # entities are in (looping over the pairs, not over the large buckets)
+    hub_numbers_by_source_entity: dict[IRI, set[int]] = defaultdict(set)
+    hub_numbers_by_target_entity: dict[IRI, set[int]] = defaultdict(set)
+    for hub_number, (_, rows_by_source_entity, rows_by_target_entity) in enumerate(hub_buckets):
+        for source_entity in rows_by_source_entity:
+            hub_numbers_by_source_entity[source_entity].add(hub_number)
+        for target_entity in rows_by_target_entity:
+            hub_numbers_by_target_entity[target_entity].add(hub_number)
+    for source_entity, target_entity in entity_pairs:
+        shared_hub_numbers = (hub_numbers_by_source_entity.get(source_entity, set())
+                              & hub_numbers_by_target_entity.get(target_entity, set()))
+        for hub_number in sorted(shared_hub_numbers):
+            add_neighbour_match(entity_pairs, hub_buckets[hub_number], source_entity, target_entity,
+                                witness_weighting)
+
+    # 3. at least min_witnesses distinct witnesses
+    entity_pairs = {
+        entity_keys: pair for entity_keys, pair in entity_pairs.items()
+        if len(pair.witnesses()) >= min_witnesses
+    }
+    hubs = [
+        NeighbourHub(num_source_entities=len(rows_by_source_entity),
+                     num_target_entities=len(rows_by_target_entity),
+                     relation_key=relation_key, witness=witness)
+        for (relation_key, witness), rows_by_source_entity, rows_by_target_entity in hub_buckets
+    ]
+    return entity_pairs, hubs
 
 
 def text_pairs_to_entity_pairs(
@@ -441,4 +627,26 @@ def vector_entity_pairs_to_candidates(
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
         partition_names_by_entity, build_vector_candidate
+    )
+
+
+def build_neighbour_candidate(
+        neighbour_entity_pair: NeighbourEntityPair,
+        side: Side
+) -> NeighbourCandidate:
+    return NeighbourCandidate(
+        side=side,
+        entity_pair=neighbour_entity_pair
+    )
+
+
+def neighbour_entity_pairs_to_candidates(
+        alignment_state: AlignmentState,
+        entity_pairs: EntityPairIndex[NeighbourEntityPair],
+        population_group_names: dict[Side, set[str]],
+        partition_names_by_entity: dict[Side, dict[IRI, str]],
+        ) -> dict[tuple[Side, IRI], EntityCandidates]:
+    return entity_pairs_to_candidates(
+        alignment_state, entity_pairs, population_group_names,
+        partition_names_by_entity, build_neighbour_candidate
     )
