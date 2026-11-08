@@ -445,10 +445,12 @@ def describe_roles(roles: Roles) -> list[str]:
 
 
 def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable[str] | None = None) -> list[str]:
-    """The profile as short notes for prompts.
+    """
+    The profile as short notes for prompts.
     Patterns read from ?s, the entity, to ?o; structure relations from the
     specific to the general entity. With groups, only the findings about the
-    whole KG and about these groups (or partitions)."""
+    whole KG and about these groups (or partitions).
+    """
     notes = []
     if profile.entity_space:
         notes.append("Entities to align have IRIs starting with " + " or ".join(profile.entity_space) + ".")

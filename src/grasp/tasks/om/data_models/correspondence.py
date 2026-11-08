@@ -1,6 +1,7 @@
 """
 Correspondences between entities of two KGs, with their provenance.
 """
+from grasp.tasks.om.foundation.types import IRI
 from pydantic import BaseModel
 
 from grasp.tasks.entities import Entity
@@ -16,14 +17,12 @@ class Provenance(BaseModel):
 
 
 class Correspondence(BaseModel):
-    # TODO: Enxtendable to handle complex patterns
-    # besides atomic components?
     """
     A singe correspondence between two entities
     from different ontologies.
     """
-    entity_source: Entity
-    entity_target: Entity
+    entity_source: IRI
+    entity_target: IRI
 
     # OAEI standard
     measure: float = 1.0
@@ -34,7 +33,7 @@ class Correspondence(BaseModel):
 
     @property
     def key(self) -> tuple[str, str, str]:
-        return (self.entity_source.identifier, self.entity_target.identifier, self.relation)
+        return (self.entity_source, self.entity_target, self.relation)
 
 
 class PotentialCorrespondences(BaseModel):

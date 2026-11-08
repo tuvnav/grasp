@@ -29,6 +29,7 @@ from grasp.manager import KgManager
 from grasp.model import Message, get_model
 from grasp.tasks import get_task
 from grasp.tasks.om.data_models.anchors import AnchorRecord, AnchorStageResult
+from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.data_models.verification import (
     CertificationParams,
     CertificationResult,
@@ -41,6 +42,7 @@ from grasp.tasks.om.data_models.verification import (
     VerdictOption,
     VerifyInput,
 )
+from grasp.tasks.om.foundation.types import Side
 from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"
@@ -247,6 +249,7 @@ def certify_stratum(
         anchors: list[AnchorRecord],
         source_kg: str,
         target_kg: str,
+        profiles: dict[Side, KgProfile],
         judge_fn: JudgeFn,
         params: CertificationParams,
         on_judgment: Callable[[Judgment], None] | None = None,
@@ -266,7 +269,10 @@ def certify_stratum(
         anchor = next(candidates, None)
         if anchor is None:
             break  # only possible if unsure verdicts are not counted
-        judgment = judge_fn(VerifyInput(source_kg=source_kg, target_kg=target_kg, anchor=anchor))
+        judgment = judge_fn(VerifyInput(
+            source_kg=source_kg, target_kg=target_kg, anchor=anchor,
+            source_profile=profiles[Side.SOURCE], target_profile=profiles[Side.TARGET],
+        ))
         judgments.append(judgment)
         if on_judgment is not None:
             on_judgment(judgment)
@@ -300,12 +306,14 @@ def certify_stratum(
 
 def certify(
         result: AnchorStageResult,
+        profiles: dict[Side, KgProfile],
         judge_fn: JudgeFn,
         variant: JudgeVariant,
         params: CertificationParams,
         on_judgment: Callable[[Judgment], None] | None = None,
         ) -> CertificationResult:
-    """Certifies every stratum (Venn cell) of an anchor stage result."""
+    """Certifies every stratum (Venn cell) of an anchor stage result; profiles:
+    of the two KGs, for showing their entities to the judge."""
     by_stratum: dict[str, list[AnchorRecord]] = {}
     for anchor in result.anchors:
         by_stratum.setdefault(anchor.stratum, []).append(anchor)
@@ -315,7 +323,7 @@ def certify(
     certified: list[AnchorRecord] = []
     for stratum, anchors in by_stratum.items():
         decision, stratum_judgments = certify_stratum(
-            stratum, anchors, result.source_kg, result.target_kg, judge_fn, params, on_judgment,
+            stratum, anchors, result.source_kg, result.target_kg, profiles, judge_fn, params, on_judgment,
         )
         decisions.append(decision)
         judgments.extend(stratum_judgments)

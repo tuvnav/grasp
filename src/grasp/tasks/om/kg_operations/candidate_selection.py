@@ -38,7 +38,7 @@ def select_tie_rank_groups(
     candidates_by_rank: dict[float, list[Candidate]] = defaultdict(list)
     for candidate in entity_candidates.candidates:
         candidates_by_rank[candidate.rank_key].append(candidate)
-    rivals_by_rank = entity_candidates.rivals_outside_by_rank
+    rivals_by_rank = entity_candidates.num_rivals_outside_by_rank
     ranks = sorted(set(candidates_by_rank) | set(rivals_by_rank))
 
     tie_rank_groups: list[list[Candidate]] = []
@@ -93,7 +93,7 @@ def find_alone_candidate(
     candidate = tie_groups[0][0]
     rival_at_this_rank_or_better = any(
         count > 0 and rank <= candidate.rank_key
-        for rank, count in entity_candidates.rivals_outside_by_rank.items()
+        for rank, count in entity_candidates.num_rivals_outside_by_rank.items()
         )
     return None if rival_at_this_rank_or_better else candidate.candidate_entity
 
@@ -189,6 +189,10 @@ def summarize_candidate_selection(
                 ),
             unique=share(
                 sum(entry.unique_candidate is not None for entry in entries),
+                population_size
+                ),
+            already_matched_at_top_rank=share(
+                sum(entry.collected.already_matched_at_top_rank for entry in entries),
                 population_size
                 ),
             sampled_side=sampled_side,

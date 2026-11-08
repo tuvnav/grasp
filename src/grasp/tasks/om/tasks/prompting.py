@@ -1,10 +1,12 @@
 """
-Prompts of the tasks (prompts/) and the equivalence condition inserted into them.
+Prompts of the tasks (prompts/), the equivalence condition inserted into them,
+and the layout of nested texts for the LLM (format_outline).
 """
 from pathlib import Path
 
 from grasp.configs import GraspConfig
 from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.utils import format_list
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
 
@@ -45,3 +47,30 @@ def add_equivalence_condition(text: str, config: GraspConfig) -> str:
     if EQUIVALENCE_PLACEHOLDER in text:
         return text.replace(EQUIVALENCE_PLACEHOLDER, injection)
     return text + "\n\n" + injection
+
+
+# An outline: items in order, each a line of text or a line with its sub-items.
+# The parts of a text for the LLM are built as an outline, and format_outline
+# alone decides how levels are shown (bullets, indentation), so no caller joins
+# with its own separators.
+type OutlineItem = str | tuple[str, Outline]
+type Outline = list[OutlineItem]
+
+OUTLINE_INDENT = 2  # spaces per level
+
+
+def format_outline(outline: Outline, indent: int = 0) -> str:
+    """
+    An outline as a nested bullet list, one line per item, sub-items indented
+    by OUTLINE_INDENT. E.g. ["a", ("b", ["c"])] ->
+        - a
+        - b
+          - c
+    """
+    lines: list[str] = []
+    for item in outline:
+        text, sub_items = (item, []) if isinstance(item, str) else item
+        lines.append(format_list([text], indent))
+        if sub_items:
+            lines.append(format_outline(sub_items, indent + OUTLINE_INDENT))
+    return "\n".join(lines)

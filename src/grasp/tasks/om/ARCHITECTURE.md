@@ -41,4 +41,4 @@ them).
   `data_models/candidate_generators.py`, values from `kg_operations/value_retrieval.py`
   as `data_models/value_rows.py`, competition from `data_models/alignment_state.py`.
 - **Verification and certification** (`tasks/verify_task.py`, `tasks/certification.py`):
-  entity context from `kg_operations/entity_context.py`, models in `data_models/verification.py`.
+  entity context from `kg_operations/entity_rendering.py` (EntityDisplay, LONG_VIEW), models in `data_models/verification.py`.

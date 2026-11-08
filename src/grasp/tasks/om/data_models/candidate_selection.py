@@ -15,6 +15,9 @@ independent of top_k.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from pydantic import BaseModel, ConfigDict
+
+from grasp.tasks.om.data_models.candidate_generators import Generator
 from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, Candidate, Hub, KeyHub
 from grasp.tasks.om.foundation.types import IRI, Side
 
@@ -51,8 +54,9 @@ class SelectedCandidates:
 class StrategySignals:
     """
     Summary of a strategy's selection on one side, for the LLM. All shares
-    are of the whole population of the side (entities without any match
-    count too: they are the ones the strategy does not cover).
+    are of the whole population of the side without the entities that already
+    have an equivalence (they get no candidates); entities without any match
+    count too: they are the ones the strategy does not cover.
 
     In a trial run, the entities of one side may be a random sample of its
     population (sampled_side; population_size is then the sample size). On the
@@ -68,6 +72,10 @@ class StrategySignals:
     mean_list_length: float  # selected candidates per entity, over those with at least one
     ambiguous_at_top_rank: float  # share with more than one entity on the best rank
     unique: float            # share with a unique candidate (the anchor rule)
+    # share whose best rank holds a candidate that already has an equivalence
+    # (with another entity): the strategy mostly finds the partners of others,
+    # noise or a second equivalence
+    already_matched_at_top_rank: float = 0.0
     sampled_side: Side | None = None  # trial run: the side whose population was sampled
 
 
@@ -82,4 +90,32 @@ class StrategyResult[H: Hub]:
     collected: dict[tuple[Side, IRI], EntityCandidates]  # what was found, per (side, entity)
     selected: dict[tuple[Side, IRI], SelectedCandidates]  # after the Selection settings
     signals: dict[Side, StrategySignals]
+    # the equivalences found so far that the strategy finds again (as entity
+    # pairs, before the selection), of existing_equivalences in all: an estimate
+    # of its recall on them
+    confirmed_equivalences: list[tuple[IRI, IRI]]
+    existing_equivalences: int
     hubs: Sequence[H]  # keys/texts with too many entity pairs to pair them (Sequence: a list of KeyHub or of VectorHub)
+
+
+class TriedRun(BaseModel):
+    """A run the LLM tried in the candidate stage, in summary (the candidates
+    stay in the task state)."""
+    model_config = ConfigDict(extra="forbid")
+    generator: Generator
+    signals: dict[Side, StrategySignals]
+    confirmed_equivalences: int  # existing equivalences found again, of existing_equivalences
+    existing_equivalences: int
+    num_hubs: int
+
+
+class CandidateStageResult(BaseModel):
+    """The output of the candidate stage: the runs selected for the full runs,
+    and all tried runs. finished: the LLM called finish (otherwise nothing is selected)."""
+    model_config = ConfigDict(extra="forbid")
+    source_kg: str
+    target_kg: str
+    finished: bool
+    rationale: str | None
+    selected_run_ids: list[str]
+    runs: dict[str, TriedRun]

@@ -256,16 +256,21 @@ class Candidate(ABC):
     (one per side) when both entities are in their population. Abstract: each
     strategy adds its own fields in a subclass (KeyCandidate, ...).
     """
-    side: Side                # side of the entity from whose perspective we are looking
+    own_side: Side                # side of the entity from whose perspective we are looking
     entity_pair: EntityPair
+    # the candidate entity already has an equivalence (with another entity): it
+    # stays a candidate at its rank (it may be a second equivalence), but cannot
+    # be unique (it gets no candidate list of its own). Keyword-only, so that the
+    # subclasses can add fields without defaults
+    candidate_already_matched: bool = field(default=False, kw_only=True)
 
     @property
     def own_entity(self) -> IRI:
-        return self.entity_pair.get_entity(self.side)
+        return self.entity_pair.get_entity(self.own_side)
 
     @property
     def candidate_entity(self) -> IRI:
-        return self.entity_pair.get_entity(Side.other_side(self.side))
+        return self.entity_pair.get_entity(Side.other_side(self.own_side))
 
     @property
     def rank_key(self) -> float:
@@ -316,18 +321,40 @@ class EntityCandidates:
     candidates: list[Candidate] = field(default_factory=list)
     # group -> competing counterparts outside the population (a counterpart in two
     # groups counts in both)
-    rivals_outside_population: Counter[str] = field(default_factory=Counter)
+    num_rivals_outside_population_by_group: Counter[str] = field(default_factory=Counter)
     # rank key of the pair -> competing counterparts outside the population
     # (each counted once); they take places in the tie groups of the selection
-    rivals_outside_by_rank: Counter[float] = field(default_factory=Counter)
+    num_rivals_outside_by_rank: Counter[float] = field(default_factory=Counter)
     # partition -> counterparts whose partition does not compete with the entity's
-    non_competing: Counter[str] = field(default_factory=Counter)
+    num_non_competing_rivals_by_partition: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def top_rank(self) -> float:
+        return min(candidate.rank_key for candidate in self.candidates)
+
+    @property
+    def already_matched_at_top_rank(self) -> bool:
+        """
+        A candidate on the best rank already has an equivalence (with another
+        entity), independent of the Selection settings.
+        """
+        if not self.candidates:
+            return False
+        return any(candidate.candidate_already_matched for candidate in self.candidates
+                   if candidate.rank_key == self.top_rank)
+
+    def entities_of_already_matched_at_top_rank(self) -> set[IRI]:
+        return set(
+            candidate.candidate_entity for candidate in self.candidates
+            if candidate.candidate_already_matched
+            and candidate.rank_key == self.top_rank
+            )
 
     @property
     def ambiguous_at_top_rank(self) -> bool:
         """More than one entity on the best rank: the strategy cannot tell which
         one is best. Rivals outside the population count too."""
         entries_by_rank = Counter(candidate.rank_key for candidate in self.candidates)
-        entries_by_rank.update(self.rivals_outside_by_rank)
+        entries_by_rank.update(self.num_rivals_outside_by_rank)
         entries_by_rank = +entries_by_rank          # drops ranks with count 0
         return bool(entries_by_rank) and entries_by_rank[min(entries_by_rank)] > 1

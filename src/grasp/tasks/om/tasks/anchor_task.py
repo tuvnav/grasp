@@ -568,9 +568,7 @@ class OMAnchorTask(GraspTask):
         )
 
     def system_information(self) -> str:
-        return system_information(
-            self.config
-        )
+        return system_information(self.config)
 
     def rules(self) -> list[str]:
         return [

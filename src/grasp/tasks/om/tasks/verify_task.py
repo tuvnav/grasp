@@ -13,10 +13,9 @@ from grasp.tasks.om.foundation.configuration import (
     get_om_task_config,
     load_task_instructions,
 )
-from grasp.tasks.om.foundation.types import IRI
+from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.foundation.vocabulary import local_name, namespace_of
-from grasp.tasks.om.kg_operations.entity_context import entity_context
-from grasp.tasks.om.kg_operations.entity_context_config import EntityContextConfig
+from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition
 from grasp.tasks.om.tasks.task_input import resolve_managers
@@ -30,6 +29,8 @@ class VerifyState:
     source_manager: KgManager
     target_manager: KgManager
     anchor: AnchorRecord
+    # how entities are shown, per side (the long view: the context of each entity)
+    entity_displays: dict[Side, EntityDisplay]
     verdict: Optional[Verdict] = None
     # entities shown to the LLM (with competitors: the pair plus similar entities)
     presented_source: list[IRI] = field(default_factory=list)
@@ -349,9 +350,10 @@ def input_instructions(
     else:
         input += "**Source entities:**\n"
 
-    cfg = EntityContextConfig()
+    for side, entities in ((Side.SOURCE, source_entities), (Side.TARGET, target_entities)):
+        state.entity_displays[side].prefetch(entities)
     for src_ent in source_entities:
-        input += entity_context(state.source_manager, src_ent, cfg) + "\n\n"
+        input += state.entity_displays[Side.SOURCE].show(src_ent) + "\n\n"
 
     if len(target_entities) == 1:
         input += "**Target entity**: "
@@ -359,7 +361,7 @@ def input_instructions(
         input += "**Target entities:**\n"
 
     for tgt_ent in target_entities:
-        input += entity_context(state.target_manager, tgt_ent, cfg) + "\n\n"
+        input += state.entity_displays[Side.TARGET].show(tgt_ent) + "\n\n"
 
     return input
 
@@ -430,6 +432,10 @@ class OMVerifyTask(GraspTask):
             target_manager=target_manager,
             # the model itself, not model_dump(): the verdict functions need an AnchorRecord
             anchor=input_as_class.anchor,
+            entity_displays={
+                Side.SOURCE: EntityDisplay.of_profile(source_manager, input_as_class.source_profile, LONG_VIEW),
+                Side.TARGET: EntityDisplay.of_profile(target_manager, input_as_class.target_profile, LONG_VIEW),
+            },
             )
 
         task_kwargs = get_verify_task_config(self.config)

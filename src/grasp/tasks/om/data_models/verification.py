@@ -6,6 +6,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict
 
 from grasp.tasks.om.data_models.anchors import AnchorRecord
+from grasp.tasks.om.data_models.profile import KgProfile
 
 
 class VerdictOption(StrEnum):
@@ -24,6 +25,9 @@ class VerifyInput(BaseModel):
     source_kg: str
     target_kg: str
     anchor: AnchorRecord
+    # how the entities of the two KGs are shown (names, synonyms, types, entity space)
+    source_profile: KgProfile
+    target_profile: KgProfile
 
 
 class JudgeMode(StrEnum):

@@ -1,3 +1,4 @@
+import dataclasses
 from collections import defaultdict
 from typing import Callable, Iterable
 import numpy as np
@@ -145,10 +146,22 @@ def build_witness_maps(correspondences: Iterable[Correspondence]) -> WitnessesBy
     for correspondence in correspondences:
         if correspondence.relation != EQUIVALENCE.iri:
             continue
-        witness = (IRI(correspondence.entity_source.identifier), IRI(correspondence.entity_target.identifier))
+        witness = (correspondence.entity_source, correspondence.entity_target)
         witnesses_by_entity[Side.SOURCE].setdefault(witness[0], []).append(witness)
         witnesses_by_entity[Side.TARGET].setdefault(witness[1], []).append(witness)
     return witnesses_by_entity
+
+
+def find_confirmed_equivalences(
+        entity_pairs: EntityPairIndex,
+        witnesses_by_entity: WitnessesByEntity,
+        ) -> list[tuple[IRI, IRI]]:
+    """The equivalences found so far that a strategy finds again (as an entity
+    pair): an estimate of its recall on them."""
+    return sorted(
+        entity_keys for entity_keys in entity_pairs
+        if entity_keys in witnesses_by_entity[Side.SOURCE].get(entity_keys[0], ())
+    )
 
 
 def build_side_witness_index(
@@ -530,7 +543,7 @@ def build_key_candidate(
         None,
     )
     return KeyCandidate(
-        side=side,
+        own_side=side,
         entity_pair=key_entity_pair,
         finest_unique_level=finest_unique_level,
         num_rivals_of_candidate_by_level=rivals_of_candidate_by_level,
@@ -542,7 +555,7 @@ def build_vector_candidate(
         side: Side
 ) -> VectorCandidate:
     return VectorCandidate(
-        side=side,
+        own_side=side,
         entity_pair=vector_entity_pair
     )
 
@@ -554,21 +567,28 @@ def entity_pairs_to_candidates[P: EntityPair](
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         build_candidate: Callable[[P, Side], Candidate],
+        witnesses_by_entity: "WitnessesByEntity | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     For each entity: the candidates and the summarized other counterparts in its
     population, on both sides, for any strategy. population_group_names: the
     names of the groups of each side's population, resolved (no REST). Each pair
-    is seen from both sides. Seen from an entity in its population, the other
+    is seen from both sides. An entity that already has an equivalence
+    (witnesses_by_entity: the equivalences found so far) gets no candidates.
+    Seen from an entity in its population without an equivalence, the other
     entity is
     - not counted at all if an entity has no partition (uncategorized),
     - non-competing (counted by its partition) if the partitions do not compete,
     - a candidate if it is in its own population (built by build_candidate from
       the pair and the side of the entity: the strategy's own candidate fields),
+      marked candidate_already_matched if it already has an equivalence (it
+      stays at its rank, so that the next one does not move to the front),
     - otherwise a rival outside the population (counted by its groups and by the
       rank key of the pair).
     Pairs with both entities outside their population are left out.
     """
+    matched_entities = {side: set(witnesses_by_entity[side]) if witnesses_by_entity else set()
+                        for side in SIDES}
     candidates_by_entity: dict[tuple[Side, IRI], EntityCandidates] = {}
 
     for entity_pair in entity_pairs.values():
@@ -579,20 +599,23 @@ def entity_pairs_to_candidates[P: EntityPair](
         in_population = {side: not population_group_names[side].isdisjoint(groups_by_side[side]) for side in SIDES}
 
         for side in SIDES:
-            if not in_population[side]:
-                continue  # only entities in population get candidates
             other_side = Side.other_side(side)
             entity = entity_pair.get_entity(side)
+            if not in_population[side] or entity in matched_entities[side]:
+                continue  # only entities in population without an equivalence get candidates
             entity_candidates = candidates_by_entity.setdefault(
                 (side, entity), EntityCandidates(side=side, entity=entity))
             if not competing:
                 other_partition = partition_names_by_entity[other_side][entity_pair.get_entity(other_side)]
-                entity_candidates.non_competing[other_partition] += 1
+                entity_candidates.num_non_competing_rivals_by_partition[other_partition] += 1
             elif in_population[other_side]:
-                entity_candidates.candidates.append(build_candidate(entity_pair, side))
+                candidate = build_candidate(entity_pair, side)
+                if entity_pair.get_entity(other_side) in matched_entities[other_side]:
+                    candidate = dataclasses.replace(candidate, candidate_already_matched=True)
+                entity_candidates.candidates.append(candidate)
             else:
-                entity_candidates.rivals_outside_population.update(groups_by_side[other_side])
-                entity_candidates.rivals_outside_by_rank[entity_pair.rank_key] += 1
+                entity_candidates.num_rivals_outside_population_by_group.update(groups_by_side[other_side])
+                entity_candidates.num_rivals_outside_by_rank[entity_pair.rank_key] += 1
 
     return candidates_by_entity
 
@@ -602,6 +625,7 @@ def key_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[KeyEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        witnesses_by_entity: "WitnessesByEntity | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     entity_pairs_to_candidates for the key strategy: 
@@ -615,6 +639,7 @@ def key_entity_pairs_to_candidates(
         build_candidate=lambda entity_pair, side: build_key_candidate(
             entity_pair, side, counterparts
             ),
+        witnesses_by_entity=witnesses_by_entity,
     )
 
 
@@ -623,10 +648,11 @@ def vector_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[VectorEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        witnesses_by_entity: "WitnessesByEntity | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
-        partition_names_by_entity, build_vector_candidate
+        partition_names_by_entity, build_vector_candidate, witnesses_by_entity
     )
 
 
@@ -635,7 +661,7 @@ def build_neighbour_candidate(
         side: Side
 ) -> NeighbourCandidate:
     return NeighbourCandidate(
-        side=side,
+        own_side=side,
         entity_pair=neighbour_entity_pair
     )
 
@@ -645,8 +671,9 @@ def neighbour_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[NeighbourEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        witnesses_by_entity: "WitnessesByEntity | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
-        partition_names_by_entity, build_neighbour_candidate
+        partition_names_by_entity, build_neighbour_candidate, witnesses_by_entity
     )

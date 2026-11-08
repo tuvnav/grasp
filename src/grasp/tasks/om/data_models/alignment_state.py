@@ -18,9 +18,10 @@ the non-competing pairs of its profile; across the KGs, the non-competing pairs
 here (none at the start: every partition competes until a stage of the pair
 forbids it).
 """
+from copy import deepcopy
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from grasp.tasks.om.data_models.correspondence import Correspondence
 from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPartitionPair
@@ -73,6 +74,7 @@ class AlignmentState(BaseModel):
     reviewed: list[ReviewedSource] = []
     cross_kg_non_competing_pairs: list[CrossKgNonCompetingPartitionPair] = []
     skipped: list[SkippedScope] = []
+    _aligned_entities: dict[Side, set[IRI]] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def cross_kg_pairs_name_partitions(self) -> Self:
@@ -92,6 +94,15 @@ class AlignmentState(BaseModel):
     @property
     def target_kg_name(self) -> str:
         return self.target_kg_profile.kg_name
+
+    @property
+    def aligned_entites(self) -> dict[Side, set[IRI]]:
+        return deepcopy(self._aligned_entities)
+
+    def add_correspondence(self, correspondence: Correspondence):
+        self.correspondences.append(correspondence)
+        self._aligned_entities.setdefault(Side.SOURCE, set()).add(correspondence.entity_source)
+        self._aligned_entities.setdefault(Side.TARGET, set()).add(correspondence.entity_target)
 
     def get_profile(self, side: Side) -> KgProfile:
         return self.source_kg_profile if Side(side) == Side.SOURCE else self.target_kg_profile

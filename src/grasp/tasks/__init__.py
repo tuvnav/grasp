@@ -19,8 +19,8 @@ from grasp.tasks.shapes_setup import ShapesSetupTask
 from grasp.tasks.sparql_qa import SparqlQaTask
 from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
-from grasp.tasks.om.tasks.agentic_search_verify import OmTask
 from grasp.tasks.om.tasks.anchor_task import OMAnchorTask
+from grasp.tasks.om.tasks.candidate_task import OMCandidateTask
 from grasp.tasks.om.tasks.profile_tasks import PROFILE_TASKS
 
 
@@ -33,8 +33,8 @@ class Task(StrEnum):
     WDQL = "wikidata-query-logs"
     S2Q = "sparql-to-question"
     ENTITY_LINKING = "entity-linking"
-    OM = "om"
     OM_ANCHORS = "om-anchors"
+    OM_CANDIDATES = "om-candidates"
     OM_VERIFY = "om-verify"
     OM_PROFILE_SPACE = "om-profile-space"
     OM_PROFILE_PARTITIONS = "om-profile-partitions"
@@ -58,8 +58,8 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         NotesFromTracesTask,
         NotesFromSamplesTask,
         AutoSetupTask,
-        OmTask,
         OMAnchorTask,
+        OMCandidateTask,
         OMVerifyTask,
         *PROFILE_TASKS,
         ShapesSetupTask,
