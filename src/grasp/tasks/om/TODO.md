@@ -1,0 +1,8 @@
+- SPARQL-Variablen einstellbar machen, "s", "o", "entity", "group" etc. überall aus dem Hartcode rausnehmen und dort auf Konstanten verweisen
+- Dateistruktur verständlicher machen: Dateien zusammenlegen/umbenennen
+- Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
+- Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
+- Zusätzliche Profile-Schicht am Ende: Notizen auflösen
+- Infos zwischen Kandidatstufen und vergangenen Stufen: Welche Strategien wurden bereits genutzt (mit Ergebnissen - z. B. wie viel Prozent Abnahme)
+- Funktion: in bestehende Äquivalenzen reinschauen (z. B. nach Partitionspaaren / Gruppenpaaren / random)
+- Erinnerung, dass LLM mehrere Tools pro Runde nutzen kann, wenn es viele Runden lang immer nur einen Tool Call tätigt?

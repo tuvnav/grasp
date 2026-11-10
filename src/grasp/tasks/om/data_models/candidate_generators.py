@@ -129,3 +129,5 @@ class Generator(BaseModel):
     population: Population = Population()
     strategy: CandidateStrategy = KeyStrategy()
     selection: Selection = Selection()
+
+

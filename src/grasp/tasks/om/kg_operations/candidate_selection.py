@@ -12,15 +12,25 @@ Order (select_<...>_candidates):
        selection.mutual
 """
 from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+import math
+from typing import Iterable, Literal
 
-from grasp.tasks.om.data_models.candidate_generators import Selection
-from grasp.tasks.om.data_models.candidate_selection import StrategySignals, SelectedCandidates
+from grasp.tasks.om.data_models.candidate_generators import CandidateStrategyType, Generator, Selection
+from grasp.tasks.om.data_models.candidate_selection import RunRole, SelectedCandidates, StrategyResult, StrategySignals
 from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
+from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 
 # TODO: move to central place and use as central keying
 # method for indexing Entities>
 type EntityKey = tuple[Side, IRI]
+
+# entity -> candidate IRI -> run id -> rank of the candidate in that run (1 = first tie group)
+type CandidateRankIndex = dict[EntityKey, dict[IRI, dict[str, int]]]
+
+type VennIndex = dict[frozenset[str], tuple[EntityKey, EntityKey]]
 
 
 def select_tie_rank_groups(
@@ -204,3 +214,196 @@ def share(count: int, population_size: int) -> float:
     if population_size:
         return count / population_size
     return 0.0
+
+
+@dataclass
+class RunEnsemble:
+    all_run_names: list[str]
+    selected_run_names: list[str]
+    belong_together: list[str]
+    __run_names_to_ids: dict[str, int] = field(init=False)
+    __ids_to_run_names: dict[int, str] = field(init=False)
+
+    def __post_init__(self):
+        names_to_ids, ids_to_names = translate_run_names_to_ints(
+            self.selected_run_names
+            )
+        self.__run_names_to_ids = names_to_ids
+        self.__ids_to_run_names = ids_to_names
+
+    @property
+    def run_names_to_ids(self) -> dict[str, int]:
+        return dict(self.__run_names_to_ids)
+
+    @property
+    def ids_to_run_names(self) -> dict[int, str]:
+        return dict(self.__ids_to_run_names)
+
+
+def translate_run_names_to_ints(
+    run_names: Iterable[str]
+) -> tuple[dict[str, int], dict[int, str]]:
+    run_name_to_int: dict[str, int] = {}
+    int_to_run_name: dict[int, str] = {}
+
+    seen = set()
+    for id, run_name in enumerate(run_names):
+        if run_name in seen:
+            run_names = list(run_names)
+            duplicates = set(run_name) | {
+                rn for rn in run_names if run_names.count(rn) > 1
+            }
+            raise ValueError(
+                f"Run names are not distinct: {list(duplicates)} "
+                "appear multiple times in run names."
+                )
+        run_name_to_int[run_name] = id
+        int_to_run_name[id] = run_name
+
+    return run_name_to_int, int_to_run_name
+
+
+def build_candidate_rank_index(
+        run_results: dict[str, tuple[Generator, StrategyResult]],
+        selected_run_ids: Iterable[str],
+        ) -> CandidateRankIndex:
+    """
+    Per entity of both sides: its selected candidates in the selected runs,
+    each with its rank in every run that selected it (1 = the run's first tie
+    group). Built from the selections only: what a run did not select (top_k)
+    has no rank.
+    """
+    candidate_rank_index: CandidateRankIndex = {}
+    for run_id in selected_run_ids:
+        _, result = run_results[run_id]
+        for entity_key, selected_candidates in result.selected.items():
+            for rank, tie_group in enumerate(
+                    selected_candidates.tie_rank_groups, start=1
+                    ):
+                for candidate in tie_group:
+                    candidate_rank_index.setdefault(
+                        entity_key, {}
+                        ).setdefault(
+                        candidate.candidate_entity, {}
+                        )[run_id] = rank
+    return candidate_rank_index
+
+
+def rank_tuple(
+        ranks_by_run: dict[str, int], 
+        run_ids: Sequence[str]
+        ) -> tuple[float, ...]:
+    """
+    The ranks of a candidate in the runs run_ids, in this order;
+    a run that did not select it gives inf.
+    """
+    return tuple(ranks_by_run.get(run_id, math.inf) for run_id in run_ids)
+
+
+def dominates(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
+    """
+    a is at least as good as b in every run and better in at least one
+    (smaller ranks are better).
+    """
+    return all(a_rank <= b_rank for a_rank, b_rank in zip(a, b)) and a != b
+
+
+def pareto_layers(
+        rank_tuples_by_candidate: dict[IRI, tuple[float, ...]]
+        ) -> list[list[IRI]]:
+    """
+    Non-dominated sorting: layer 1 holds the candidates no other candidate
+    dominates; without them, layer 2 the next ones, and so on. Candidates of
+    a layer are sorted by IRI (a fixed order, they are equal in rank).
+    E.g. a (1, 2), b (2, 3), c (5, 1) -> [[a, c], [b]]: b is dominated by a,
+    c by nobody.
+    """
+    remaining = dict(rank_tuples_by_candidate)
+    layers: list[list[IRI]] = []
+    while remaining:
+        layer = sorted(
+            candidate for candidate, own_ranks in remaining.items()
+            if not any(
+                dominates(other_ranks, own_ranks)
+                for other_ranks in remaining.values()
+                )
+        )
+        layers.append(layer)
+        for candidate in layer:
+            del remaining[candidate]
+    return layers
+
+
+def pareto_merge_entity_candidates(
+        ranks_by_candidate: dict[IRI, dict[str, int]],
+        generate_run_ids: Sequence[str],
+        corroborate_run_ids: Sequence[str],
+        ) -> list[list[IRI]]:
+    """
+    The merged candidates of one entity as layers, best first: the candidates
+    of the generate runs in Pareto layers by their ranks there; within a layer
+    ordered by their ranks in the corroborate runs (their own Pareto layers,
+    one after another). Corroborate runs add no candidates and move none to
+    another layer.
+    """
+    generated = {
+        candidate: rank_tuple(ranks_by_run_id, generate_run_ids)
+        for candidate, ranks_by_run_id in ranks_by_candidate.items()
+        if any(run_id in ranks_by_run_id for run_id in generate_run_ids)
+    }
+    return [
+        [
+            candidate
+            for sublayer in pareto_layers({
+                candidate: rank_tuple(ranks_by_candidate[candidate], corroborate_run_ids)
+                for candidate in layer
+            })
+            for candidate in sublayer
+        ]
+        for layer in pareto_layers(generated)
+    ]
+
+
+def pareto_merge_all_candidates(
+        candidate_rank_index: CandidateRankIndex,
+        roles_by_run: dict[str, RunRole],
+        ) -> dict[EntityKey, list[list[IRI]]]:
+    """
+    The merged candidate layers of every entity (pareto_merge_entity_candidates).
+    Entities whose candidates come only from corroborate runs get no entry.
+    """
+    # a fixed order of the runs: the positions in every rank tuple mean the same run
+    generate_run_ids = sorted(run_id for run_id, role in roles_by_run.items() if role == "generate")
+    corroborate_run_ids = sorted(run_id for run_id, role in roles_by_run.items() if role == "corroborate")
+    merged: dict[EntityKey, list[list[IRI]]] = {}
+    for entity_key, ranks_by_candidate in candidate_rank_index.items():
+        layers = pareto_merge_entity_candidates(ranks_by_candidate, generate_run_ids, corroborate_run_ids)
+        if layers:
+            merged[entity_key] = layers
+    return merged
+
+
+def run_ids_to_run_families(
+        run_ids: Iterable[str],
+        belong_together: Iterable[set[str]]
+        ) -> dict[str, str]:
+    """
+    Builds a dict mapping from run_id to the name of
+    it's run family.
+    """
+    res: dict[str, str] = {}
+    new_family_names = ...
+    for run_id in run_ids:
+        ...
+
+
+def run_suffix(run_id: str) -> int | None:
+    res = ""
+    for char in reversed(run_id):
+        if char.isdigit():
+            res = char + res
+        else:
+            break
+    if res == "":
+        return None
+    return int(res)

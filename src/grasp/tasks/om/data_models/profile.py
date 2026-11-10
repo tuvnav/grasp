@@ -444,7 +444,10 @@ def describe_roles(roles: Roles) -> list[str]:
     return lines
 
 
-def describe_profile(profile: KgProfile, findings: bool = True, groups: Iterable[str] | None = None) -> list[str]:
+def describe_profile(profile: KgProfile,
+                     findings: bool = True,
+                     groups: Iterable[str] | None = None
+                     ) -> list[str]:
     """
     The profile as short notes for prompts.
     Patterns read from ?s, the entity, to ?o; structure relations from the

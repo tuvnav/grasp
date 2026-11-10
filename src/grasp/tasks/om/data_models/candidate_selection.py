@@ -14,12 +14,19 @@ independent of top_k.
 """
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from grasp.tasks.om.data_models.candidate_generators import Generator
 from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, Candidate, Hub, KeyHub
 from grasp.tasks.om.foundation.types import IRI, Side
+
+
+# how a selected run takes part in the merge: generate (its candidates enter
+# the lists, its ranks form the Pareto layers) or corroborate (it only orders
+# the candidates within a layer)
+type RunRole = Literal["generate", "corroborate"]
 
 
 @dataclass(frozen=True)
@@ -119,3 +126,8 @@ class CandidateStageResult(BaseModel):
     rationale: str | None
     selected_run_ids: list[str]
     runs: dict[str, TriedRun]
+
+
+@dataclass
+class MergedCandidates:
+    ...

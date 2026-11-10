@@ -38,7 +38,7 @@ from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidate_generators import CandidateStrategy, CandidateStrategyType, Generator, KeyStrategy, NeighbourStrategy, Selection, VectorStrategy
 from grasp.tasks.om.data_models.candidate_selection import (
-    CandidateStageResult, SelectedCandidates, StrategyResult, StrategySignals, TriedRun,
+    CandidateStageResult, MergedCandidates, SelectedCandidates, StrategyResult, StrategySignals, TriedRun,
 )
 from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, Hub, KeyHub, KeyMatch, Match, NeighbourEntityPair, NeighbourHub, NeighbourMatch,
@@ -178,8 +178,8 @@ def count_population(
 # trial runs: the most entities of the larger population that are compared, per
 # vectorizer (in a small KG the key strategy is cheap and runs on the whole population)
 TRIAL_ENTITY_LIMITS: dict[str, int] = {
-    "idf_tokens": 20_000,
-    "char_3grams": 20_000,
+    "idf_tokens": 5000,
+    "char_3grams": 5000,
     "embedding": 5_000,
 }
 # a large KG is always sampled in a trial run; the key and neighbour strategies
@@ -656,10 +656,6 @@ def run_strategy(
         )
 
 
-@dataclass
-class MergedCandidates:
-    ...
-
 
 @dataclass
 class CandidateTaskState:
@@ -1089,15 +1085,15 @@ def format_strategy_result(
     the task state (show_candidates).
     """
     outline: Outline = [("signals", [format_signals(result.signals[side]) for side in SIDES])]
-    sampled = any(signals.sampled_side is not None for signals in result.signals.values())
-    if result.existing_equivalences and sampled:
-        # the sample holds no entity with an equivalence: none can be found again
-        outline.append("existing equivalences found again: not measured in a trial run on a sample")
-    elif result.existing_equivalences:
-        outline.append(
-            f"finds {len(result.confirmed_equivalences)} of {result.existing_equivalences} "
-            f"existing equivalences again (as entity pairs, before the selection)"
-        )
+    # sampled = any(signals.sampled_side is not None for signals in result.signals.values())
+    # if result.existing_equivalences and sampled:
+    #     # the sample holds no entity with an equivalence: none can be found again
+    #     outline.append("existing equivalences found again: not measured in a trial run on a sample")
+    # elif result.existing_equivalences:
+    #     outline.append(
+    #         f"finds {len(result.confirmed_equivalences)} of {result.existing_equivalences} "
+    #         f"existing equivalences again (as entity pairs, before the selection)"
+    #     )
     outline.extend(format_hubs(result.hubs, entity_displays))
     example_items: Outline = [format_selected_candidates(selected, entity_displays) for selected in examples]
     outline.append(("examples", example_items) if example_items else "no entity has a candidate")
@@ -1131,10 +1127,17 @@ def format_group_counts(state: CandidateTaskState, side: Side) -> OutlineItem:
     }
     counts = count_group_entities(state.kg_managers[side], kg_profile, matched_entities)
     excluded = set(kg_profile.excluded_group_names())
-    return ("entities per group (all / already matched / still to match)", [
+    return (
+        (
+            "entities per group (all / already matched / not matched). "
+            "Entities of excluded groups are left out everywhere: they get "
+            "no candidates and are no candidates or rivals, also when "
+            "they belong to other groups too. The counts are without them."
+            ), [
         f"{group_name}: {size} / {matched} / {size - matched}" + (" (excluded)" if group_name in excluded else "")
         for group_name, (size, matched) in sorted(counts.items(), key=lambda item: -item[1][0])
-    ])
+    ]
+    )
 
 
 def format_knowledge_graph(state: CandidateTaskState, side: Side) -> str:
@@ -1177,7 +1180,9 @@ def format_alignment_status(state: CandidateTaskState) -> str:
 
 
 def format_start_message(state: CandidateTaskState) -> str:
-    knowledge_graphs = "\n\n".join(format_knowledge_graph(state, side) for side in SIDES)
+    knowledge_graphs = "\n\n".join(
+        format_knowledge_graph(state, side) for side in SIDES
+        )
     return (
         format_section("Knowledge graphs", knowledge_graphs, level=2)
         + "\n\n" + format_alignment_status(state)
@@ -1198,7 +1203,8 @@ GROUP_REFS_SCHEMA = {
     ]},
     "description": (
         f"Groups of the profile by name, {REST!r} for all groups that are not excluded, or a group "
-        "defined inline for this strategy (a new name and a SPARQL pattern over ?entity)."
+        "defined inline for this strategy (a new name and a SPARQL pattern over ?entity). "
+        "Entities of excluded groups are never compared."
     ),
 }
 
