@@ -34,7 +34,7 @@ stages read them as unverified observations and report a contradiction as a
 flag instead of changing an earlier stage's result.
 """
 from enum import StrEnum
-from typing import Iterable, Literal, Self, get_args
+from typing import Any, Iterable, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -300,6 +300,17 @@ class KgProfile(BaseModel):
                 f" Please choose a new name. Already existing: {self.group_names()}"
                 )
         self.groups.append(group_profile)
+
+
+class ProfileStageOutput(BaseModel):
+    kg_name: str
+    stage: Stage
+    finished: bool
+    rationale: str | None
+    profile: KgProfile
+    default: KgProfile
+    stats: dict[str, Any]
+
 
 # --- elements and deltas ------------------------------------------------------
 

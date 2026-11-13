@@ -1,5 +1,9 @@
 - SPARQL-Variablen einstellbar machen, "s", "o", "entity", "group" etc. überall aus dem Hartcode rausnehmen und dort auf Konstanten verweisen
 - Dateistruktur verständlicher machen: Dateien zusammenlegen/umbenennen
+- Rules oder in anderen Promptteil in CandidateTask: Ergänzende Strategien suchen mit unterschiedlichen Fehlerkorrelationen
+- CandidateTask für große KGs pro Gruppe?
+- Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
+- partition_names_by_entity zentralisieren
 - Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
 - Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
 - Zusätzliche Profile-Schicht am Ende: Notizen auflösen

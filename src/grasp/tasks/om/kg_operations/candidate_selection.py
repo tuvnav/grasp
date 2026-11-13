@@ -11,26 +11,15 @@ Order (select_<...>_candidates):
        from both sides), then the optional filters selection.unique and
        selection.mutual
 """
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 import math
-from typing import Iterable, Literal
+import random
 
-from grasp.tasks.om.data_models.candidate_generators import CandidateStrategyType, Generator, Selection
-from grasp.tasks.om.data_models.candidate_selection import RunRole, SelectedCandidates, StrategyResult, StrategySignals
+from grasp.tasks.om.data_models.candidate_generators import Selection
+from grasp.tasks.om.data_models.candidate_selection import CandidateRankIndex, EnsembleEvaluation, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, StrategyResult, StrategySignals, Stratum, VennIndex
 from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
-from grasp.tasks.om.foundation.text_vectors import Vectorizer
-from grasp.tasks.om.foundation.types import IRI, SIDES, Side
-
-# TODO: move to central place and use as central keying
-# method for indexing Entities>
-type EntityKey = tuple[Side, IRI]
-
-# entity -> candidate IRI -> run id -> rank of the candidate in that run (1 = first tie group)
-type CandidateRankIndex = dict[EntityKey, dict[IRI, dict[str, int]]]
-
-type VennIndex = dict[frozenset[str], tuple[EntityKey, EntityKey]]
+from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
 
 def select_tie_rank_groups(
@@ -216,88 +205,35 @@ def share(count: int, population_size: int) -> float:
     return 0.0
 
 
-@dataclass
-class RunEnsemble:
-    all_run_names: list[str]
-    selected_run_names: list[str]
-    belong_together: list[str]
-    __run_names_to_ids: dict[str, int] = field(init=False)
-    __ids_to_run_names: dict[int, str] = field(init=False)
-
-    def __post_init__(self):
-        names_to_ids, ids_to_names = translate_run_names_to_ints(
-            self.selected_run_names
-            )
-        self.__run_names_to_ids = names_to_ids
-        self.__ids_to_run_names = ids_to_names
-
-    @property
-    def run_names_to_ids(self) -> dict[str, int]:
-        return dict(self.__run_names_to_ids)
-
-    @property
-    def ids_to_run_names(self) -> dict[int, str]:
-        return dict(self.__ids_to_run_names)
-
-
-def translate_run_names_to_ints(
-    run_names: Iterable[str]
-) -> tuple[dict[str, int], dict[int, str]]:
-    run_name_to_int: dict[str, int] = {}
-    int_to_run_name: dict[int, str] = {}
-
-    seen = set()
-    for id, run_name in enumerate(run_names):
-        if run_name in seen:
-            run_names = list(run_names)
-            duplicates = set(run_name) | {
-                rn for rn in run_names if run_names.count(rn) > 1
-            }
-            raise ValueError(
-                f"Run names are not distinct: {list(duplicates)} "
-                "appear multiple times in run names."
-                )
-        run_name_to_int[run_name] = id
-        int_to_run_name[id] = run_name
-
-    return run_name_to_int, int_to_run_name
-
-
 def build_candidate_rank_index(
-        run_results: dict[str, tuple[Generator, StrategyResult]],
-        selected_run_ids: Iterable[str],
+        ensemble: RunEnsemble,
+        strategy_results_by_run: dict[str, StrategyResult],
         ) -> CandidateRankIndex:
     """
-    Per entity of both sides: its selected candidates in the selected runs,
-    each with its rank in every run that selected it (1 = the run's first tie
-    group). Built from the selections only: what a run did not select (top_k)
-    has no rank.
+    Per entity of both sides: its selected candidates in the runs of the
+    ensemble, each with its rank in every run that selected it (1 = the run's
+    first tie group). Built from the selections only: what a run did not
+    select (top_k) has no rank.
     """
     candidate_rank_index: CandidateRankIndex = {}
-    for run_id in selected_run_ids:
-        _, result = run_results[run_id]
-        for entity_key, selected_candidates in result.selected.items():
-            for rank, tie_group in enumerate(
-                    selected_candidates.tie_rank_groups, start=1
-                    ):
+    for run_id in ensemble.run_ids():
+        for entity_key, selected in strategy_results_by_run[run_id].selected.items():
+            for rank, tie_group in enumerate(selected.tie_rank_groups, start=1):
                 for candidate in tie_group:
-                    candidate_rank_index.setdefault(
-                        entity_key, {}
-                        ).setdefault(
-                        candidate.candidate_entity, {}
-                        )[run_id] = rank
+                    candidate_rank_index.setdefault(entity_key, {}).setdefault(
+                        candidate.candidate_entity, {})[run_id] = rank
     return candidate_rank_index
 
 
-def rank_tuple(
-        ranks_by_run: dict[str, int], 
-        run_ids: Sequence[str]
+def generate_rank_tuple(
+        ranks_by_run: dict[str, int],
+        relevant_run_ids: Sequence[str]
         ) -> tuple[float, ...]:
     """
-    The ranks of a candidate in the runs run_ids, in this order;
-    a run that did not select it gives inf.
+    The ranks of a candidate in the runs run_ids, in this order; a run that
+    did not select it gives inf.
     """
-    return tuple(ranks_by_run.get(run_id, math.inf) for run_id in run_ids)
+    return tuple(ranks_by_run.get(run_id, math.inf) for run_id in relevant_run_ids)
 
 
 def dominates(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
@@ -305,10 +241,12 @@ def dominates(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
     a is at least as good as b in every run and better in at least one
     (smaller ranks are better).
     """
-    return all(a_rank <= b_rank for a_rank, b_rank in zip(a, b)) and a != b
+    return all(
+        a_element <= b_element for a_element, b_element in zip(a, b)
+        ) and a != b
 
 
-def pareto_layers(
+def build_pareto_layers(
         rank_tuples_by_candidate: dict[IRI, tuple[float, ...]]
         ) -> list[list[IRI]]:
     """
@@ -323,10 +261,7 @@ def pareto_layers(
     while remaining:
         layer = sorted(
             candidate for candidate, own_ranks in remaining.items()
-            if not any(
-                dominates(other_ranks, own_ranks)
-                for other_ranks in remaining.values()
-                )
+            if not any(dominates(other_ranks, own_ranks) for other_ranks in remaining.values())
         )
         layers.append(layer)
         for candidate in layer:
@@ -336,46 +271,46 @@ def pareto_layers(
 
 def pareto_merge_entity_candidates(
         ranks_by_candidate: dict[IRI, dict[str, int]],
-        generate_run_ids: Sequence[str],
-        corroborate_run_ids: Sequence[str],
-        ) -> list[list[IRI]]:
+        generating_run_ids: Sequence[str],
+        corroborating_run_ids: Sequence[str],
+        ) -> list[list[list[IRI]]]:
     """
     The merged candidates of one entity as layers, best first: the candidates
     of the generate runs in Pareto layers by their ranks there; within a layer
-    ordered by their ranks in the corroborate runs (their own Pareto layers,
-    one after another). Corroborate runs add no candidates and move none to
-    another layer.
+    sublayers by ranks in the corroborate runs. Corroborate runs add no
+    candidates and move none to another layer.
     """
-    generated = {
-        candidate: rank_tuple(ranks_by_run_id, generate_run_ids)
-        for candidate, ranks_by_run_id in ranks_by_candidate.items()
-        if any(run_id in ranks_by_run_id for run_id in generate_run_ids)
+    layer_tuples = {
+        candidate: generate_rank_tuple(ranks_by_run, generating_run_ids)
+        for candidate, ranks_by_run in ranks_by_candidate.items()
+        if any(run_id in generating_run_ids for run_id in ranks_by_run)
     }
-    return [
-        [
-            candidate
-            for sublayer in pareto_layers({
-                candidate: rank_tuple(ranks_by_candidate[candidate], corroborate_run_ids)
-                for candidate in layer
-            })
-            for candidate in sublayer
-        ]
-        for layer in pareto_layers(generated)
-    ]
+    pareto_layers = build_pareto_layers(layer_tuples)
+
+    res: list[list[list[IRI]]] = []
+    for layer in pareto_layers:
+        sublayer_tuples = {
+            candidate: generate_rank_tuple(
+                ranks_by_candidate[candidate], corroborating_run_ids
+                )
+            for candidate in layer
+            }
+        res.append(build_pareto_layers(sublayer_tuples))
+
+    return res
 
 
-def pareto_merge_all_candidates(
+def build_pareto_index(
         candidate_rank_index: CandidateRankIndex,
-        roles_by_run: dict[str, RunRole],
-        ) -> dict[EntityKey, list[list[IRI]]]:
+        ensemble: RunEnsemble,
+        ) -> ParetoIndex:
     """
     The merged candidate layers of every entity (pareto_merge_entity_candidates).
     Entities whose candidates come only from corroborate runs get no entry.
     """
-    # a fixed order of the runs: the positions in every rank tuple mean the same run
-    generate_run_ids = sorted(run_id for run_id, role in roles_by_run.items() if role == "generate")
-    corroborate_run_ids = sorted(run_id for run_id, role in roles_by_run.items() if role == "corroborate")
-    merged: dict[EntityKey, list[list[IRI]]] = {}
+    generate_run_ids = ensemble.run_ids("generate")
+    corroborate_run_ids = ensemble.run_ids("corroborate")
+    merged: ParetoIndex = {}
     for entity_key, ranks_by_candidate in candidate_rank_index.items():
         layers = pareto_merge_entity_candidates(ranks_by_candidate, generate_run_ids, corroborate_run_ids)
         if layers:
@@ -383,27 +318,251 @@ def pareto_merge_all_candidates(
     return merged
 
 
-def run_ids_to_run_families(
-        run_ids: Iterable[str],
-        belong_together: Iterable[set[str]]
-        ) -> dict[str, str]:
+def cut_pareto_layers_by_budget(
+        pareto_index: ParetoIndex,
+        budget: int,
+        max_first_sublayer_size: int
+) -> tuple[ParetoIndex, set[EntityKey]]:
     """
-    Builds a dict mapping from run_id to the name of
-    it's run family.
+    Per entity: whole sublayers in rank order while they fit into the budget;
+    no worse sublayer follows one that did not fit. The first sublayer is
+    always taken, up to max_first_sublayer_size; an entity whose first sublayer
+    is larger gets no list and is returned as too ambiguous.
     """
-    res: dict[str, str] = {}
-    new_family_names = ...
-    for run_id in run_ids:
-        ...
+    new_index: ParetoIndex = {}
+    too_ambiguous_entities: set[EntityKey] = set()
+
+    for entity_key, pareto_layers in pareto_index.items():
+        # avoid index error
+        if not pareto_layers or not pareto_layers[0]:
+            continue
+
+        if len(pareto_layers[0][0]) > max_first_sublayer_size:
+            too_ambiguous_entities.add(entity_key)
+            continue
+
+        new_layers: list[list[list[IRI]]] = []
+        remaining_budget = budget
+        out_of_budget = False
+        is_first_sublayer = True
+
+        for layer in pareto_layers:
+            new_layer: list[list[IRI]] = []
+            for sublayer in layer:
+                if not is_first_sublayer and len(sublayer) > remaining_budget:
+                    out_of_budget = True
+                    break
+
+                new_layer.append(sublayer)
+                remaining_budget -= len(sublayer)
+                is_first_sublayer = False
+
+            if new_layer:
+                new_layers.append(new_layer)
+
+            if out_of_budget:
+                break
+
+        new_index[entity_key] = new_layers
+
+    return new_index, too_ambiguous_entities
 
 
-def run_suffix(run_id: str) -> int | None:
-    res = ""
-    for char in reversed(run_id):
-        if char.isdigit():
-            res = char + res
-        else:
-            break
-    if res == "":
+def build_venn_index(
+    pareto_index: ParetoIndex,
+    candidate_rank_index: CandidateRankIndex,
+    run_ensemble: RunEnsemble
+) -> VennIndex:
+
+    venn_index: VennIndex = {}
+    entity_pairs: set[tuple[IRI, IRI]] = set()
+
+    for (side, entity), pareto_layers in pareto_index.items():
+        for layer in pareto_layers:
+            for sublayer in layer:
+                for candidate_entity in sublayer:
+                    entity_pairs.add(
+                        (entity, candidate_entity) if side == Side.SOURCE
+                        else (candidate_entity, entity)
+                    )
+
+    for (source_entity, target_entity) in sorted(entity_pairs):
+        runs_finding_source_to_target = candidate_rank_index.get(
+            (Side.SOURCE, source_entity), {}
+            ).get(target_entity, {}).keys()
+        runs_finding_target_to_source = candidate_rank_index.get(
+            (Side.TARGET, target_entity), {}
+            ).get(source_entity, {}).keys()
+        all_evidence_runs = runs_finding_source_to_target | runs_finding_target_to_source
+
+        run_families = frozenset(run_ensemble.family(run) for run in all_evidence_runs)
+
+        venn_index.setdefault(run_families, []).append((source_entity, target_entity))
+
+    return venn_index
+
+
+def evaluable_entities(
+        ensemble: RunEnsemble,
+        strategy_results_by_run: dict[str, StrategyResult],
+        side: Side,
+        ) -> frozenset[IRI] | None:
+    """
+    The entities of one side on which the merge of the (trial) runs equals the
+    merge of full runs: those that every run whose population holds them has
+    compared. An entity a run did not draw into its sample would miss that
+    run's candidates. Of full runs: all entities of the populations.
+    None: the side is not measurable, because a run compared only a sample of
+    the other side (the lists of this side then lack counterparts) or the side
+    is a large KG (no population retrieved).
+    """
+    results = [strategy_results_by_run[run_id] for run_id in ensemble.run_ids()]
+    other_side = Side.other_side(side)
+    if any(result.signals[side].sampled_side == other_side for result in results):
         return None
-    return int(res)
+    populations_and_compared: list[tuple[frozenset[IRI], frozenset[IRI]]] = []
+    for result in results:
+        population = result.population[side]
+        if population is None:
+            return None
+        populations_and_compared.append((population, result.compared_entities[side]))
+    union_of_populations = frozenset().union(*(population for population, _ in populations_and_compared))
+    return frozenset(
+        entity for entity in union_of_populations
+        if all(entity in compared for population, compared in populations_and_compared if entity in population)
+        )
+
+
+def merge_runs(
+        run_ensemble: RunEnsemble,
+        strategy_results_by_run: dict[str, StrategyResult],
+        budget: int,
+        max_first_sublayer_size: int,
+        ) -> MergedCandidates:
+    """
+    The candidate lists of the ensemble per entity: Pareto layers of the generate
+    runs, sublayers by the corroborate runs, cut by the budget; the Venn index
+    of the pairs in the cut lists; and the entities on which the merge can be
+    evaluated.
+    """
+    candidate_rank_index = build_candidate_rank_index(run_ensemble, strategy_results_by_run)
+    uncut_pareto_index = build_pareto_index(candidate_rank_index, run_ensemble)
+    cut_pareto_index, too_ambiguous_entities = cut_pareto_layers_by_budget(
+        uncut_pareto_index, budget, max_first_sublayer_size
+        )
+    return MergedCandidates(
+        run_ensemble=run_ensemble,
+        candidate_rank_index=candidate_rank_index,
+        uncut_pareto_layers_by_entity=uncut_pareto_index,
+        pareto_layers_by_entity=cut_pareto_index,
+        venn_index=build_venn_index(cut_pareto_index, candidate_rank_index, run_ensemble),
+        too_ambiguous_entities=frozenset(too_ambiguous_entities),
+        evaluable_entities={
+            side: evaluable_entities(run_ensemble, strategy_results_by_run, side) for side in SIDES
+            },
+        )
+
+
+# list length classes of the evaluation: (smallest, largest length, name)
+LIST_LENGTH_CLASSES: list[tuple[int, float, str]] = [
+    (1, 1, "1"), (2, 3, "2-3"), (4, 10, "4-10"), (11, math.inf, "more than 10"),
+]
+
+
+def list_length_class(length: int) -> str:
+    return next(name for smallest, largest, name in LIST_LENGTH_CLASSES if smallest <= length <= largest)
+
+
+def flatten_layers(layers: list[list[list[IRI]]]) -> list[IRI]:
+    """The candidates of an entity's layers in rank order."""
+    return [candidate for layer in layers for sublayer in layer for candidate in sublayer]
+
+
+def to_entity_pair(side: Side, entity: IRI, candidate: IRI) -> tuple[IRI, IRI]:
+    """(source IRI, target IRI) of an entity of the side and its candidate."""
+    return (entity, candidate) if side == Side.SOURCE else (candidate, entity)
+
+
+def evaluate_merged_candidates(
+        merged: MergedCandidates,
+        side: Side,
+        num_cell_examples: int,
+        num_too_ambiguous_examples: int,
+        num_shown_tied_candidates: int,
+        seed: int = 0,
+        ) -> EnsembleEvaluation | None:
+    """
+    The merge on the evaluable entities of one side (None: not measurable):
+    how many get a list, how long the lists are, what the budget cuts, the
+    pairs of the lists per Venn cell (only pairs of evaluable entities: the
+    whole Venn index also holds pairs of entities whose lists are incomplete),
+    a random pair of each of the largest cells and random too ambiguous
+    entities with the first candidates of their first sublayer.
+    """
+    evaluable = merged.evaluable_entities[side]
+    if evaluable is None:
+        return None
+    cell_by_pair = {pair: cell for cell, pairs in merged.venn_index.items() for pair in pairs}
+    pairs_by_cell: dict[frozenset[str], list[tuple[IRI, IRI]]] = {}
+    list_length_counter: Counter[str] = Counter()
+    too_ambiguous: list[IRI] = []
+    num_with_list = 0
+    num_cut_by_budget = 0
+    for entity in sorted(evaluable):
+        entity_key = (side, entity)
+        if entity_key in merged.too_ambiguous_entities:
+            too_ambiguous.append(entity)
+            continue
+        candidates = flatten_layers(merged.pareto_layers_by_entity.get(entity_key, []))
+        if not candidates:
+            continue
+        num_with_list += 1
+        list_length_counter[list_length_class(len(candidates))] += 1
+        if len(candidates) < len(flatten_layers(merged.uncut_pareto_layers_by_entity[entity_key])):
+            num_cut_by_budget += 1
+        for candidate in candidates:
+            cell = cell_by_pair[to_entity_pair(side, entity, candidate)]
+            pairs_by_cell.setdefault(cell, []).append((entity, candidate))
+
+    cells_largest_first = sorted(pairs_by_cell, key=lambda cell: (-len(pairs_by_cell[cell]), sorted(cell)))
+    random_generator = random.Random(seed)
+    cell_examples = [
+        (cell, *random_generator.choice(pairs_by_cell[cell]))
+        for cell in cells_largest_first[:num_cell_examples]
+    ]
+    too_ambiguous_examples = []
+    for entity in random_generator.sample(too_ambiguous, min(num_too_ambiguous_examples, len(too_ambiguous))):
+        first_sublayer = merged.uncut_pareto_layers_by_entity[(side, entity)][0][0]
+        too_ambiguous_examples.append((entity, len(first_sublayer), first_sublayer[:num_shown_tied_candidates]))
+    return EnsembleEvaluation(
+        side=side,
+        num_evaluated=len(evaluable),
+        num_with_list=num_with_list,
+        num_too_ambiguous=len(too_ambiguous),
+        num_cut_by_budget=num_cut_by_budget,
+        list_length_counts={
+            name: list_length_counter[name] for _, _, name in LIST_LENGTH_CLASSES if list_length_counter[name]
+        },
+        pairs_by_cell=[(cell, len(pairs_by_cell[cell])) for cell in cells_largest_first],
+        cell_examples=cell_examples,
+        too_ambiguous_examples=too_ambiguous_examples,
+    )
+
+
+def strata_of(venn_index: VennIndex) -> list[Stratum]:
+    """
+    Output sorted by size of stratum.
+    """
+    return sorted([
+        Stratum(
+            families=families, pairs=pairs
+            ) for families, pairs in venn_index.items()
+        ],
+        key=lambda stratum: len(stratum.pairs)
+        )
+
+
+def build_verification_strata(
+        merged_candidates: MergedCandidates
+        ) -> list[Stratum]:
+    return strata_of(merged_candidates.venn_index)

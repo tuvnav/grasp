@@ -14,19 +14,71 @@ independent of top_k.
 """
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from grasp.tasks.om.data_models.candidate_generators import Generator
-from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, Candidate, Hub, KeyHub
-from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.data_models.entity_pairs import EntityCandidates, Candidate, Hub
+from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
 # how a selected run takes part in the merge: generate (its candidates enter
 # the lists, its ranks form the Pareto layers) or corroborate (it only orders
 # the candidates within a layer)
 type RunRole = Literal["generate", "corroborate"]
+
+# entity -> candidate IRI -> run id -> rank of the candidate in that run (1 = first tie group)
+type CandidateRankIndex = dict[EntityKey, dict[IRI, dict[str, int]]]
+type ParetoIndex = dict[EntityKey, list[list[list[IRI]]]]
+type VennIndex = dict[frozenset[str], list[tuple[IRI, IRI]]]
+
+
+class EnsembleRun(BaseModel):
+    """
+    A tried run in an ensemble of runs to merge. family: the kind of its
+    evidence, named by the LLM: runs of one family count as one source of
+    evidence for a pair (a Venn cell is a set of families), whatever their
+    roles; None: a family of its own.
+    """
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    role: RunRole = "generate"
+    family: str | None = None
+
+    @property
+    def family_name(self) -> str:
+        return self.family or self.run_id
+
+
+class RunEnsemble(BaseModel):
+    """
+    The runs whose candidates are merged, each with its role and family.
+    """
+    model_config = ConfigDict(extra="forbid")
+    runs: list[EnsembleRun]
+
+    @model_validator(mode="after")
+    def runs_distinct_and_one_generating(self) -> Self:
+        run_ids = [run.run_id for run in self.runs]
+        duplicates = sorted({run_id for run_id in run_ids if run_ids.count(run_id) > 1})
+        if duplicates:
+            raise ValueError(f"runs named more than once: {duplicates}")
+        if not self.run_ids("generate"):
+            raise ValueError("an ensemble needs at least one run with the role generate")
+        return self
+
+    def run_ids(self, role: RunRole | None = None) -> list[str]:
+        """
+        The ids of the runs (of a role), sorted: the fixed order of the
+        positions in every rank tuple.
+        """
+        return sorted(
+            run.run_id for run in self.runs if role is None or run.role == role
+            )
+
+    def family(self, run_id: str) -> str:
+        return next(run.family_name for run in self.runs if run.run_id == run_id)
 
 
 @dataclass(frozen=True)
@@ -94,6 +146,13 @@ class StrategyResult[H: Hub]:
     `collected`) without retrieving and comparing again. H: the hub kind of the
     strategy (KeyHub, VectorHub).
     """
+    # per side the entities of the run's population (generator.population),
+    # without those that already have an equivalence; None: a large KG, whose
+    # population is not retrieved
+    population: dict[Side, frozenset[IRI] | None]
+    # per side the entities the run compared: the population, or on the side
+    # sampled in a trial run the sample
+    compared_entities: dict[Side, frozenset[IRI]]
     collected: dict[tuple[Side, IRI], EntityCandidates]  # what was found, per (side, entity)
     selected: dict[tuple[Side, IRI], SelectedCandidates]  # after the Selection settings
     signals: dict[Side, StrategySignals]
@@ -102,7 +161,10 @@ class StrategyResult[H: Hub]:
     # of its recall on them
     confirmed_equivalences: list[tuple[IRI, IRI]]
     existing_equivalences: int
-    hubs: Sequence[H]  # keys/texts with too many entity pairs to pair them (Sequence: a list of KeyHub or of VectorHub)
+    # keys/texts with too many entity pairs to pair them
+    # (a list of KeyHub, VectorHub or NeighbourHub)
+    hubs: Sequence[H]  # make Pyright happy: list not covariant
+    # 1.0: side compared whole population; None: large KG
 
 
 class TriedRun(BaseModel):
@@ -117,17 +179,70 @@ class TriedRun(BaseModel):
 
 
 class CandidateStageResult(BaseModel):
-    """The output of the candidate stage: the runs selected for the full runs,
-    and all tried runs. finished: the LLM called finish (otherwise nothing is selected)."""
+    """The output of the candidate stage: the ensemble of runs selected for the
+    full runs, and all tried runs. finished: the LLM called finish (otherwise
+    nothing is selected)."""
     model_config = ConfigDict(extra="forbid")
     source_kg: str
     target_kg: str
     finished: bool
     rationale: str | None
-    selected_run_ids: list[str]
+    run_ensemble: RunEnsemble | None  # the selected runs; None: none
     runs: dict[str, TriedRun]
 
 
-@dataclass
+@dataclass(frozen=True)
 class MergedCandidates:
-    ...
+    """
+    The candidate lists of an ensemble of runs, merged per entity
+    (kg_operations/candidate_selection.py: merge_runs).
+    """
+    run_ensemble: RunEnsemble
+    candidate_rank_index: CandidateRankIndex
+    # per entity: Pareto layers of the generate runs, each in sublayers by the
+    # corroborate runs; before and after the budget
+    uncut_pareto_layers_by_entity: ParetoIndex
+    pareto_layers_by_entity: ParetoIndex
+    # the pairs of the cut lists by the families of the runs that selected them
+    venn_index: VennIndex
+    # entities whose first sublayer is larger than allowed: no list
+    too_ambiguous_entities: frozenset[EntityKey]
+    # per side the entities on which the merge equals a merge of full runs
+    # (evaluable_entities); None: the side is not measurable
+    evaluable_entities: dict[Side, frozenset[IRI] | None]
+
+
+@dataclass(frozen=True)
+class EnsembleEvaluation:
+    """
+    The merge of an ensemble of trial runs on the evaluable entities of one
+    side, for the LLM (evaluate_merged_candidates). Pairs are (entity of the
+    side, candidate).
+    """
+    side: Side
+    num_evaluated: int
+    num_with_list: int
+    num_too_ambiguous: int
+    num_cut_by_budget: int  # lists that lost candidates to the budget
+    list_length_counts: dict[str, int]  # lists per length class ("1", "2-3", ...)
+    pairs_by_cell: list[tuple[frozenset[str], int]]  # number of pairs per Venn cell, largest first
+    cell_examples: list[tuple[frozenset[str], IRI, IRI]]  # cell, entity, its candidate in the cell
+    # entity, size of its first sublayer, the first candidates of it
+    too_ambiguous_examples: list[tuple[IRI, int, list[IRI]]]
+
+    @property
+    def num_without_candidates(self) -> int:
+        return self.num_evaluated - self.num_with_list - self.num_too_ambiguous
+
+
+class Stratum(BaseModel):
+    """
+    The pairs of one Venn cell: found by exactly these run families.
+    """
+    families: frozenset[str]
+    pairs: list[tuple[IRI, IRI]]
+
+    @property
+    def name(self) -> str:
+        return "+".join(sorted(self.families))
+

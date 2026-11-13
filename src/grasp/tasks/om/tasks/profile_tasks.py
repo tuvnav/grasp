@@ -104,6 +104,7 @@ SPACE_GROUPING = partitions_to_grouping(kind_partitions(), mark_uncategorized_as
 ALL = "_all"
 
 
+
 def entity_examples(task: ProfileStageTask, grouping: Grouping, space: list[str], where: str, k: int) -> list[str]:
     """Up to k entities with a name and their partition or group."""
     names = sparql_path(LABEL_PREDICATES)
@@ -151,7 +152,7 @@ def default_non_competing_pairs(partitions: dict[str, Partition]) -> list[Within
     if "property" not in partitions:
         return []
     return [WithinKgNonCompetingPartitionPair(partition_a="property", partition_b=name,
-                                     reason="properties and entities are not equivalent")
+                                              reason="properties and entities are not equivalent")
             for name in partitions if name != "property"]
 
 
@@ -528,8 +529,11 @@ class PartitionsTask(GroupingStageTask):
     def prepare(self, input: dict) -> str:
         self.space = ensure_space(self)
         self.definitions = ensure_partitions(self, self.space)
-        self.non_competing_pairs = (list(self.input_profile.non_competing_pairs) if self.input_profile.partitions
-                                    else default_non_competing_pairs(self.definitions))
+        self.non_competing_pairs = (
+            list(self.input_profile.non_competing_pairs)
+            if self.input_profile.partitions
+            else default_non_competing_pairs(self.definitions)
+            )
         self.tested = set()
         self.update_statistics()
         self.stats = size_stats(self)
@@ -731,7 +735,9 @@ class RolesTask(RoleEditingTask):
         self.space = ensure_space(self)
         profile = self.input_profile
         if not profile.partitions:
-            profile = profile.model_copy(update={"partitions": list(ensure_partitions(self, self.space).values())})
+            profile = profile.model_copy(
+                update={"partitions": list(ensure_partitions(self, self.space).values())}
+                )
         self.grouping = partitions_to_grouping(profile.partitions, mark_uncategorized_as_rest=False)
         self.scope = profile.partition_names()
         self.sizes = group_sizes(self.manager, self.grouping, self.space)
@@ -786,7 +792,10 @@ class GroupsTask(GroupingStageTask):
         self.space = ensure_space(self)
         self.definitions = ensure_groups(self, self.space)
         # name of an excluded group -> reason
-        self.exclusions = {group.name: group.exclusion_reason for group in self.input_profile.groups if group.excluded}
+        self.exclusions = {
+            group.name: group.exclusion_reason 
+            for group in self.input_profile.groups if group.excluded
+            }
         self.tested = set()
         self.update_statistics()
         self.stats = size_stats(self)
@@ -1009,6 +1018,8 @@ class GroupMode(StrEnum):
     FULL = "full"    # roles of the group, findings
     LIGHT = "light"  # mainly matching pitfalls of the group as findings
 
+MIN_GROUP_SIZE_FOR_GROUP_STAGE = 50
+MAX_GROUP_TASK_STEPS_BY_MODE = {GroupMode.FULL: 30, GroupMode.LIGHT: 12}
 
 def unassigned_predicates(roles: Roles, coverage: dict[str, Coverage]) -> list[tuple[str, Coverage]]:
     """Predicates of a group in no element of its roles (as predicate or
@@ -1038,7 +1049,10 @@ class GroupTask(RoleEditingTask):
     name = "om-profile-group"
     stage = Stage.GROUP
     prompt_file = "profile_group.txt"
-    prompt_files = {GroupMode.FULL: "profile_group.txt", GroupMode.LIGHT: "profile_group_light.txt"}
+    prompt_files = {
+        GroupMode.FULL: "profile_group.txt",
+        GroupMode.LIGHT: "profile_group_light.txt"
+        }
     unit = "group"
 
     def prepare(self, input: dict) -> str:

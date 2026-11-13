@@ -418,7 +418,9 @@ class OMVerifyTask(GraspTask):
         return prompt
 
     def setup(self, input: Any) -> str:
-        """Input must be a serialized VerifyInput"""
+        """
+        Input must be a serialized VerifyInput
+        """
         try:
             input_as_class = VerifyInput(**input)
         except Exception as e:

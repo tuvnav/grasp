@@ -5,6 +5,7 @@ You can try three kinds of strategies: candidates over shared keys (e.g. a code,
 Steps:
 1. Look at the descriptions of the knowledge graphs and at examples of existing equivalences. Which parts of the knowledge graphs could still be lacking equivalence mappings? 
 2. Try strategies out. To check whether a strategy works, call try_strategy: it computes the results, shows examples and yields useful statistics.
-3. Call finish with the runs to use and a short rationale: which strategies for which groups, why, and which candidates you expect to be risky. Select nothing else if no strategy seems good.
+3. Combine runs: the selected runs are merged into one short candidate list per entity. Call evaluate_run_ensemble to see a combination of runs merged: how many entities get a list, how long the lists are and what each family of runs adds. A run that only orders candidates (e.g. a vector run that tells apart tied key candidates) can take the role corroborate.
+4. Call finish with the ensemble of runs to use and a short rxationale: which strategies for which groups, why, and which candidates you expect to be risky. Select nothing if no strategy seems good.
 
 __EQUIVALENCE_CONDITION__

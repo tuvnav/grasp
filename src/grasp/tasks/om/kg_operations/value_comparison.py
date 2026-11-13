@@ -135,14 +135,16 @@ def relation_keys_by_role_name(
 
 
 # per side: entity -> the equivalences (witnesses) it takes part in
-type WitnessesByEntity = dict[Side, dict[IRI, list[tuple[IRI, IRI]]]]
+type ExistingEquivalences = dict[Side, dict[IRI, list[tuple[IRI, IRI]]]]
 
 
-def build_witness_maps(correspondences: Iterable[Correspondence]) -> WitnessesByEntity:
-    """The witnesses of a neighbour strategy: the equivalences among the
+def build_existing_equivalences_index(correspondences: Iterable[Correspondence]) -> ExistingEquivalences:
+    """
+    The witnesses of a neighbour strategy: the equivalences among the
     correspondences, per side by the entity of that side (an entity may take
-    part in several)."""
-    witnesses_by_entity: WitnessesByEntity = {Side.SOURCE: {}, Side.TARGET: {}}
+    part in several).
+    """
+    witnesses_by_entity: ExistingEquivalences = {Side.SOURCE: {}, Side.TARGET: {}}
     for correspondence in correspondences:
         if correspondence.relation != EQUIVALENCE.iri:
             continue
@@ -154,7 +156,7 @@ def build_witness_maps(correspondences: Iterable[Correspondence]) -> WitnessesBy
 
 def find_confirmed_equivalences(
         entity_pairs: EntityPairIndex,
-        witnesses_by_entity: WitnessesByEntity,
+        witnesses_by_entity: ExistingEquivalences,
         ) -> list[tuple[IRI, IRI]]:
     """The equivalences found so far that a strategy finds again (as an entity
     pair): an estimate of its recall on them."""
@@ -560,14 +562,14 @@ def build_vector_candidate(
     )
 
 
-# generich method for all candidate types
+# generic method for all candidate types
 def entity_pairs_to_candidates[P: EntityPair](
         alignment_state: AlignmentState,
         entity_pairs: EntityPairIndex[P],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         build_candidate: Callable[[P, Side], Candidate],
-        witnesses_by_entity: "WitnessesByEntity | None" = None,
+        witnesses_by_entity: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     For each entity: the candidates and the summarized other counterparts in its
@@ -625,7 +627,7 @@ def key_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[KeyEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        witnesses_by_entity: "WitnessesByEntity | None" = None,
+        witnesses_by_entity: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     entity_pairs_to_candidates for the key strategy: 
@@ -648,7 +650,7 @@ def vector_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[VectorEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        witnesses_by_entity: "WitnessesByEntity | None" = None,
+        witnesses_by_entity: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
@@ -671,7 +673,7 @@ def neighbour_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[NeighbourEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        witnesses_by_entity: "WitnessesByEntity | None" = None,
+        witnesses_by_entity: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,

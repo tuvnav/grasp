@@ -25,6 +25,7 @@ from grasp.tasks.om.data_models.profile import (
     Finding,
     Flag,
     KgProfile,
+    ProfileStageOutput,
     Roles,
     Stage,
     Usage,
@@ -100,10 +101,12 @@ def run_rows(manager: KgManager, sparql: str) -> list[dict]:
 
 
 class ProfileStageTask(GraspTask):
-    """One stage of the KG profile. Input: a dict with kg (name of a configured
+    """
+    One stage of the KG profile. Input: a dict with kg (name of a configured
     KG; may be omitted if exactly one KG is configured), profile (output
     profile of the stage before; omitted for the first stage) and, for the
-    group stage, group."""
+    group stage, group.
+    """
     stage: Stage
     prompt_file: str
 
@@ -119,7 +122,10 @@ class ProfileStageTask(GraspTask):
 
     @abstractmethod
     def prepare(self, input: dict) -> str:
-        """Computes default and statistics, sets self.default, returns the stage's input text."""
+        """
+        Computes default and statistics, sets self.default, 
+        returns the stage's input text.
+        """
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return []
@@ -148,31 +154,50 @@ class ProfileStageTask(GraspTask):
         elif len(self.managers) == 1:
             self.manager = self.managers[0]
         else:
-            raise ValueError("Input must name the kg unless exactly one KG is configured")
+            raise ValueError(
+                "Input must name the kg unless exactly one KG is configured"
+                )
         profile = input.get("profile")
-        self.input_profile = (KgProfile.model_validate(profile) if profile
-                              else KgProfile(kg_name=self.manager.kg))
+        self.input_profile = (
+            KgProfile.model_validate(profile) if profile
+            else KgProfile(kg_name=self.manager.kg)
+            )
         if self.input_profile.kg_name != self.manager.kg:
-            raise ValueError(f"Profile of {self.input_profile.kg_name} given for {self.manager.kg}")
+            raise ValueError(
+                f"Profile of {self.input_profile.kg_name} given for {self.manager.kg}"
+                )
         self.finished, self.rationale, self.stats = False, None, {}
-        # a large KG is profiled on samples of the partitions and groups (large_kg_sampling); the
-        # space stage decides whether the KG is large
+        # a large KG is profiled on samples of the partitions
+        # and groups (large_kg_sampling); the space stage
+        # decides whether the KG is large
         large = self.input_profile.large and self.stage != Stage.SPACE
-        use_sample(self.manager, KgSample(self.manager, tuple(self.input_profile.entity_space)) if large else None)
+        use_sample(
+            self.manager,
+            KgSample(
+                self.manager, tuple(self.input_profile.entity_space)
+                ) if large else None
+            )
         body = self.prepare(input)
         self.profile = self.default.model_copy(deep=True)
         head = f"Knowledge graph: {self.manager.kg}" + (
             f" ({self.manager.description})" if self.manager.description else "")
         if large:
             head += "\n\n" + LARGE_KG_NOTE
-        return "\n\n".join(part for part in (head, self.format_earlier_results(), body) if part)
+        return "\n\n".join(
+            part for part in (
+                head, self.format_earlier_results(), body
+                ) if part
+            )
 
     def format_earlier_results(self) -> str:
         profile = self.input_profile
         parts = []
         notes = describe_profile(profile, findings=False)
         if notes:
-            parts.append(format_section("Results of earlier stages", format_enumerate(notes)))
+            parts.append(
+                format_section("Results of earlier stages",
+                               format_enumerate(notes))
+                )
         if profile.findings:
             findings = [f"[{f.stage.value}{', ' + f.group if f.group else ''}] {f.text}"
                         for f in profile.findings]
@@ -301,17 +326,16 @@ class ProfileStageTask(GraspTask):
     def done(self, fn_name: str) -> bool:
         return fn_name == FINISH and self.finished
 
-    def output(self, messages: list[Message]) -> dict:
-        return {
-            "kg": self.manager.kg,
-            "stage": self.stage.value,
-            "finished": self.finished,
-            "fallback": None if self.finished else "default",
-            "rationale": self.rationale,
-            "profile": (self.profile if self.finished else self.default).model_dump(mode="json"),
-            "default": self.default.model_dump(mode="json"),
-            "stats": self.stats,
-        }
+    def output(self, messages: list[Message]) -> dict[str, Any]:
+        return ProfileStageOutput(
+            kg_name=self.manager.kg,
+            stage=self.stage,
+            finished=self.finished,
+            rationale=self.rationale,
+            profile=(self.profile if self.finished else self.default),
+            default=self.default,
+            stats=self.stats
+        ).model_dump(mode="json")
 
 
 ROLE_DESCRIPTIONS = {
@@ -569,4 +593,3 @@ class RoleEditingTask(ProfileStageTask):
         self.usage = {p: dict(counts) for p, counts in usage.items()}
         self.sides = {p: dict(counts) for p, counts in sides.items()}
         self.counted = set(role_elements(counted))
-

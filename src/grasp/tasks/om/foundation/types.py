@@ -23,6 +23,7 @@ SIDES = tuple(Side)
 # an IRI as such, e.g. http://human.owl#NCI_C12432
 IRI = NewType("IRI", str)
 
+type EntityKey = tuple[Side, IRI]
 
 # an IRI or literal prepared for insertion into SPARQL text, e.g. <http://human.owl#NCI_C12432>
 SparqlTerm = NewType("SparqlTerm", str)

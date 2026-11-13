@@ -18,7 +18,11 @@ does not depend on the strategy.
 Trial runs (run_strategy with trial=True), while the LLM tries strategies: if
 the larger population is above the limit of the vectorizer
 (TRIAL_ENTITY_LIMITS), only a random sample of it is compared, against the
-whole other side (draw_trial_sample). Only one side is sampled: sampling both
+whole other side (draw_trial_sample). The sample is consistent across runs
+(draw_entity_sample): an entity is drawn when its fixed sample position lies
+below the sampling share, so an entity in the populations of two runs is in
+both samples if it is in the one with the smaller share, and the trial runs of
+an ensemble can be merged on the same entities. Only one side is sampled: sampling both
 would lose the true counterparts and distort every signal. A large KG is always
 the sampled side, drawn per group at spread offsets (large_kg_sampling) in
 proportion to the estimated group sizes, and queried for the sampled entities
@@ -27,6 +31,7 @@ only; two large KGs are not supported yet.
 from collections import Counter, defaultdict
 import dataclasses
 from enum import StrEnum, auto
+import hashlib
 import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Iterable, Iterator, Sequence, get_args
@@ -38,7 +43,7 @@ from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidate_generators import CandidateStrategy, CandidateStrategyType, Generator, KeyStrategy, NeighbourStrategy, Selection, VectorStrategy
 from grasp.tasks.om.data_models.candidate_selection import (
-    CandidateStageResult, MergedCandidates, SelectedCandidates, StrategyResult, StrategySignals, TriedRun,
+    CandidateStageResult, EnsembleEvaluation, MergedCandidates, RunEnsemble, RunRole, SelectedCandidates, StrategyResult, StrategySignals, TriedRun,
 )
 from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, Hub, KeyHub, KeyMatch, Match, NeighbourEntityPair, NeighbourHub, NeighbourMatch,
@@ -53,15 +58,17 @@ from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, TRANSFORM_OPERATIONS
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
-from grasp.tasks.om.kg_operations.candidate_selection import select_candidates, summarize_candidate_selection
-from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
+from grasp.tasks.om.kg_operations.candidate_selection import (
+    evaluate_merged_candidates, flatten_layers, merge_runs, select_candidates, summarize_candidate_selection,
+)
+from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
     Grouping, counts_by_group, group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.value_comparison import (
-    NeighbourIndex, ValueIndex, WitnessesByEntity, build_side_indices, build_side_witness_index,
-    build_witness_maps, compare_value_indices_by_vectors, compare_witness_indices, find_confirmed_equivalences,
+    NeighbourIndex, ValueIndex, ExistingEquivalences, build_side_indices, build_side_witness_index,
+    build_existing_equivalences_index, compare_value_indices_by_vectors, compare_witness_indices, find_confirmed_equivalences,
     intersect_level_indices,
     key_entity_pairs_to_candidates, neighbour_entity_pairs_to_candidates, relation_keys_by_role_name,
     vector_entity_pairs_to_candidates,
@@ -152,27 +159,24 @@ def generate_population_grouping(kg_profile: KgProfile, population: Population, 
     return generate_population_groups_grouping(kg_profile, population, side).merged(POPULATION)
 
 
-# TODO: Move to central place?
-def count_population(
+def retrieve_population(
         manager: KgManager,
         kg_profile: KgProfile,
         population: Population,
         side: Side,
-        matched_entities: Collection[IRI] = (),
-        ) -> int:
+        leave_out_entities: Collection[IRI] = ()
+) -> frozenset[IRI]:
     """
     The entities of one side's population, each once (also those without any
     value of the strategy: the denominator of the signals), without the
-    matched_entities (those with an equivalence: they get no candidates).
+    leave_out_entities (those with an equivalence: they get no candidates).
     """
-    population_grouping = generate_population_grouping(kg_profile, population, side)
-    size = group_sizes(manager, population_grouping, kg_profile.entity_space).get(POPULATION, 0)
-    if not matched_entities:
-        return size
-    matched_in_population = counts_by_group(
-        manager, population_grouping, kg_profile.entity_space, values_clause("entity", matched_entities)
-        ).get(POPULATION, 0)
-    return size - matched_in_population
+    retrieved = retrieve_entities(
+        manager,
+        generate_population_grouping(kg_profile, population, side),
+        kg_profile.entity_space
+        )
+    return frozenset(retrieved) - frozenset(leave_out_entities)
 
 
 # trial runs: the most entities of the larger population that are compared, per
@@ -189,11 +193,13 @@ LARGE_KG_TRIAL_ENTITY_LIMIT = 20_000
 
 @dataclass(frozen=True)
 class EntitySample:
-    """The entities of one side's population that a trial run compares; the
+    """
+    The entities of one side's population that a trial run compares; the
     other side is compared whole. kg_sample: in a large KG, the sample of the
     membership patterns the entities come from; while it is in use
     (large_kg_sampling.use_sample) the queries over the groups of that KG see
-    only these entities."""
+    only these entities.
+    """
     side: Side
     entities: frozenset[IRI]
     kg_sample: KgSample | None = field(default=None, compare=False)
@@ -230,9 +236,27 @@ def choose_sampled_side(population_sizes: dict[Side, int], limit: int | None) ->
     return larger_side
 
 
+def sample_position(entity: IRI, seed: int) -> float:
+    """The fixed position of an entity in [0, 1) for a seed: a stable hash of
+    both (not Python's hash, which changes between processes), so it is the
+    same in every run and every population."""
+    digest = hashlib.blake2b(f"{seed}|{entity}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest) / 2**64
+
+
 def draw_entity_sample(entities: Iterable[IRI], size: int, seed: int) -> frozenset[IRI]:
-    """A random sample of `size` entities, the same for the same entities and seed."""
-    return frozenset(random.Random(seed).sample(sorted(entities), size))
+    """
+    A random sample of about `size` entities: those whose sample position
+    lies below the share size / number of entities. Consistent across runs:
+    the same entities and seed give the same sample, and of two populations
+    an entity in both is in both samples if it is in the one with the smaller
+    share (nested samples, the most overlap two samples can have).
+    """
+    distinct_entities = set(entities)
+    if not distinct_entities:
+        return frozenset()
+    sampling_share = size / len(distinct_entities)
+    return frozenset(entity for entity in distinct_entities if sample_position(entity, seed) < sampling_share)
 
 
 def allocate_sample_sizes(estimated_sizes: dict[str, int | None], limit: int) -> dict[str, int]:
@@ -275,33 +299,52 @@ def draw_trial_sample(
         managers: dict[Side, KgManager],
         alignment_state: AlignmentState,
         generator: Generator,
-        population_sizes: dict[Side, int],
+        populations_by_side: dict[Side, frozenset[IRI]],
         seed: int,
-        witnesses_by_entity: WitnessesByEntity | None = None,
+        existing_equivalences: ExistingEquivalences | None = None,
         ) -> EntitySample | None:
-    """The sample of a trial run (see the module docstring); None: no sampling
-    needed. A large KG is always the sampled side (its population is not counted:
-    population_sizes holds only the sides that are not large); seed: only for KGs
-    that are not large. Entities that already have an equivalence
-    (witnesses_by_entity) are not drawn: they get no candidates."""
-    matched_entities = {side: set(witnesses_by_entity[side]) if witnesses_by_entity else set() for side in SIDES}
-    large_side = next((side for side in SIDES if alignment_state.get_profile(side).large), None)
+    """
+    The sample of a trial run (see the module docstring); None: no sampling
+    needed. populations_by_side: the populations of the sides that are not
+    large, already without the entities that have an equivalence. A large KG
+    is always the sampled side (its population is not retrieved); its entities
+    with an equivalence (existing_equivalences) are taken out of its sample.
+    seed: only for KGs that are not large.
+    """
+    matched_entities = {
+        side: set(existing_equivalences[side])
+        if existing_equivalences else set() for side in SIDES
+        }
+    large_side = next(
+        (side for side in SIDES if alignment_state.get_kg_profile(side).large),
+        None
+        )
     if large_side is not None:
         limit = trial_entity_limit(generator.strategy, large=True)
         assert limit is not None
         large_kg_sample = draw_large_kg_sample(
-            managers[large_side], alignment_state.get_profile(large_side), generator, large_side, limit)
-        return dataclasses.replace(large_kg_sample,
-                                   entities=large_kg_sample.entities - matched_entities[large_side])
+            managers[large_side],
+            alignment_state.get_kg_profile(large_side),
+            generator,
+            large_side,
+            limit
+            )
+        return dataclasses.replace(
+            large_kg_sample,
+            entities=large_kg_sample.entities - matched_entities[large_side]
+            )
     limit = trial_entity_limit(generator.strategy)
-    side = choose_sampled_side(population_sizes, limit)
+    side = choose_sampled_side(
+        {side: len(population) for side, population in populations_by_side.items()},
+        limit
+        )
     if side is None or limit is None:
         return None
-    kg_profile = alignment_state.get_profile(side)
-    entities = [entity for entity in retrieve_entities(
-        managers[side], generate_population_grouping(kg_profile, generator.population, side),
-        kg_profile.entity_space) if entity not in matched_entities[side]]
-    return EntitySample(side=side, entities=draw_entity_sample(entities, min(limit, len(entities)), seed))
+    population = populations_by_side[side]
+    return EntitySample(
+        side=side,
+        entities=draw_entity_sample(population, min(limit, len(population)), seed)
+        )
 
 
 def check_value_pattern_source(value_pattern_source: ValuePatternSource, kg_profile: KgProfile) -> None:
@@ -384,13 +427,22 @@ def retrieve_partition_names(
     empty here: a trial run asks for the partitions of its sampled entities only."""
     partition_names_by_entity = {}
     for side in SIDES:
-        kg_profile = alignment_state.get_profile(side)
+        kg_profile = alignment_state.get_kg_profile(side)
         if kg_profile.large:
             partition_names_by_entity[side] = {}
             continue
         partition_names_by_entity[side] = retrieve_partitions_by_entity(
             managers[side], kg_profile, kg_profile.entity_space)
     return partition_names_by_entity
+
+# TODO:
+# ------------------------------------------------------------------
+# From here functions really belong in this file
+# ------------------------------------------------------------------
+
+
+CANDIDATE_BUDGET_PER_ENTITY = 8
+MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER = 30
 
 
 def get_key_candidates(
@@ -416,7 +468,7 @@ def get_key_candidates(
     indices_by_side = {}
     group_names_by_side = {}
     for side in SIDES:
-        kg_profile = alignment_state.get_profile(side)
+        kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(
             kg_profile, generator.population, side
             )
@@ -432,7 +484,7 @@ def get_key_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = build_witness_maps(alignment_state.correspondences)
+    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
     candidates_by_entity = key_entity_pairs_to_candidates(
         alignment_state, entity_pairs,
         group_names_by_side, partition_names_by_entity, witnesses_by_entity
@@ -468,7 +520,7 @@ def get_vector_candidates(
     index_by_side: dict[Side, ValueIndex] = {}
     group_names_by_side = {}
     for side in SIDES:
-        kg_profile = alignment_state.get_profile(side)
+        kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(kg_profile, generator.population, side)
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
         # exactly one level: the unpacking fails otherwise
@@ -489,7 +541,7 @@ def get_vector_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = build_witness_maps(alignment_state.correspondences)
+    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
     candidates_by_entity = vector_entity_pairs_to_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, witnesses_by_entity
         )
@@ -520,7 +572,7 @@ def get_neighbour_candidates(
             )
 
     # 0. the witnesses: the equivalences found so far
-    witnesses_by_entity = build_witness_maps(alignment_state.correspondences)
+    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
     if not witnesses_by_entity[Side.SOURCE]:
         raise FunctionCallException(
             "A neighbour strategy needs equivalences found before (its witnesses), "
@@ -531,7 +583,7 @@ def get_neighbour_candidates(
     index_by_side: dict[Side, NeighbourIndex] = {}
     group_names_by_side = {}
     for side in SIDES:
-        kg_profile = alignment_state.get_profile(side)
+        kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(
             kg_profile, generator.population, side
             )
@@ -567,6 +619,25 @@ def get_neighbour_candidates(
     return candidates_by_entity, neighbour_hubs, find_confirmed_equivalences(entity_pairs, witnesses_by_entity)
 
 
+def compared_entities_by_side(
+        population_by_side: dict[Side, frozenset[IRI] | None],
+        entity_sample: EntitySample | None,
+        ) -> dict[Side, frozenset[IRI]]:
+    """
+    The entities a run compares per side: on the sampled side the sample,
+    otherwise the population (a large KG is always the sampled side).
+    """
+    compared_entities: dict[Side, frozenset[IRI]] = {}
+    for side in SIDES:
+        if entity_sample is not None and entity_sample.side == side:
+            compared_entities[side] = entity_sample.entities
+        else:
+            population = population_by_side[side]
+            assert population is not None, "a large KG is always the sampled side"
+            compared_entities[side] = population
+    return compared_entities
+
+
 def run_strategy(
     managers: dict[Side, KgManager],
     alignment_state: AlignmentState,
@@ -581,35 +652,47 @@ def run_strategy(
     and the signals. Entities that already have an equivalence get no
     candidates, but stay candidates of the others (marked candidate_already_matched). trial: a trial run, which may compare only a sample of the larger
     population (see the module docstring); sample_seed: the seed of the sample,
-    so that trials of different strategies see the same entities. A large KG
+    consistent across runs (draw_entity_sample), so that trials of different
+    strategies see the same entities as far as their populations and shares allow. A large KG
     only in a trial run, and only against a KG that is not large.
     """
     # 0. the populations without the entities that already have an equivalence,
-    # and in a trial run the sample of the larger one (a large KG is not counted:
-    # it is always the sampled side)
-    large_sides = {side for side in SIDES if alignment_state.get_profile(side).large}
+    # and in a trial run the sample of the larger one. A large KG is not counted
+    # and it is always the sampled side
+    large_sides = {side for side in SIDES if alignment_state.get_kg_profile(side).large}
     check_large_kgs(large_sides, trial)
-    witnesses_by_entity = build_witness_maps(alignment_state.correspondences)
-    population_sizes = {
-        side: count_population(
+    existing_equivalences_by_entity = build_existing_equivalences_index(
+        alignment_state.correspondences
+        )
+    population_by_side: dict[Side, frozenset[IRI] | None] = {
+        side: retrieve_population(
             managers[side],
-            alignment_state.get_profile(side),
+            alignment_state.get_kg_profile(side),
             generator.population,
             side,
-            witnesses_by_entity[side].keys(),
+            existing_equivalences_by_entity[side].keys()
             )
-        for side in SIDES if side not in large_sides
-    }
+        if side not in large_sides else None
+        for side in SIDES
+        }
+    retrieved_populations = {
+        side: entities for side, entities in population_by_side.items() if entities is not None
+        }
+    population_sizes = {side: len(entities) for side, entities in retrieved_populations.items()}
     entity_sample = (
-        draw_trial_sample(managers, alignment_state, generator, population_sizes, sample_seed,
-                          witnesses_by_entity)
+        draw_trial_sample(
+            managers, alignment_state, generator,
+            retrieved_populations, sample_seed,
+            existing_equivalences_by_entity
+            )
         if trial else None
         )
+    compared_entities = compared_entities_by_side(population_by_side, entity_sample)
     if entity_sample is not None and entity_sample.kg_sample is not None:
         partition_names_by_entity = {
             **partition_names_by_entity,
             entity_sample.side: sampled_partition_names(
-                alignment_state.get_profile(entity_sample.side), entity_sample),
+                alignment_state.get_kg_profile(entity_sample.side), entity_sample),
         }
 
     # 1. collect
@@ -647,14 +730,42 @@ def run_strategy(
     signals = summarize_candidate_selection(selected, population_sizes, sampled_side)
 
     return StrategyResult(
+        population=population_by_side,
+        compared_entities=compared_entities,
         collected=collected,
         selected=selected,
         signals=signals,
         confirmed_equivalences=confirmed_equivalences,
-        existing_equivalences=sum(len(witnesses) for witnesses in witnesses_by_entity[Side.SOURCE].values()),
+        existing_equivalences=sum(len(witnesses) for witnesses in existing_equivalences_by_entity[Side.SOURCE].values()),
         hubs=hubs
         )
 
+
+def run_full_ensemble(
+        managers: dict[Side, KgManager],
+        alignment_state: AlignmentState,
+        run_ensemble: RunEnsemble,
+        generators_by_run: dict[str, Generator]
+        ) -> MergedCandidates:
+    partition_names_by_entity = retrieve_partition_names(
+        managers, alignment_state
+        )
+    strategy_results_by_run = {
+        run_name: run_strategy(
+            managers,
+            alignment_state,
+            generators_by_run[run_name],
+            partition_names_by_entity
+            )
+        for run_name in run_ensemble.run_ids()
+    }
+
+    return merge_runs(
+        run_ensemble,
+        strategy_results_by_run,
+        CANDIDATE_BUDGET_PER_ENTITY,
+        MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER
+        )
 
 
 @dataclass
@@ -665,9 +776,12 @@ class CandidateTaskState:
     runs: dict[str, tuple[Generator, StrategyResult]] = field(default_factory=dict)
     # how entities are shown, per side; keeps the names retrieved so far
     entity_displays: dict[Side, EntityDisplay] = field(default_factory=dict)
-    selection: list[str] | None = None
+    finished: bool = False
+    # the runs selected by finish, with roles and families; None: none selected
+    run_ensemble: RunEnsemble | None = None
     rationale: str | None = None
-    merged: MergedCandidates | None = None
+    # the last ensemble evaluated (evaluate_run_ensemble)
+    merged_candidates: MergedCandidates | None = None
 
     def add_run(self, generator: Generator, result: StrategyResult) -> str:
         run_id = f"run-{len(self.runs)}"
@@ -679,6 +793,7 @@ class TaskFunctionName(StrEnum):
     TRY_STRATEGY = auto()
     RESELECT = auto()
     SHOW_CANDIDATES = auto()
+    EVALUATE_RUN_ENSEMBLE = auto()
     # COMPARE_RUNS = auto()
     FINISH = auto()
 
@@ -775,25 +890,65 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
     )])
 
 
+def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
+    """The ensemble of the function arguments, with run ids of tried runs."""
+    try:
+        run_ensemble = RunEnsemble.model_validate({"runs": runs})
+    except ValidationError as error:
+        raise FunctionCallException(f"Invalid runs: {error}") from error
+    unknown_run_ids = [run_id for run_id in run_ensemble.run_ids() if run_id not in state.runs]
+    if unknown_run_ids:
+        raise FunctionCallException(f"Unknown run ids {unknown_run_ids}; existing runs: {list(state.runs)}")
+    return run_ensemble
+
+
+@func_reg.register(TaskFunctionName.EVALUATE_RUN_ENSEMBLE)
+def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
+    """Merges the candidate lists of tried runs and shows the merge on the
+    entities where it equals a merge of full runs."""
+    run_ensemble = parse_run_ensemble(state, fn_args.get("runs"))
+    merged = merge_runs(
+        run_ensemble,
+        {run_id: result for run_id, (_, result) in state.runs.items()},
+        CANDIDATE_BUDGET_PER_ENTITY,
+        MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
+        )
+    state.merged_candidates = merged
+    evaluations = {
+        side: evaluate_merged_candidates(
+            merged, side, NUM_CELL_EXAMPLES, NUM_TOO_AMBIGUOUS_EXAMPLES, NUM_SHOWN_TIED_CANDIDATES
+            )
+        for side in SIDES
+    }
+    prefetch_evaluation_entities(evaluations, merged, state.entity_displays)
+    return format_outline([(
+        f"Ensemble {format_run_ensemble(run_ensemble)}",
+        [format_ensemble_evaluation(side, evaluations[side], merged, state.entity_displays) for side in SIDES],
+    )])
+
+
 @func_reg.register(TaskFunctionName.FINISH)
 def finish(state: CandidateTaskState, fn_args: dict) -> str:
-    """Selects the runs whose generators are run in full later, with a rationale."""
-    run_ids = fn_args.get("run_ids")
+    """Selects the ensemble of runs whose generators are run in full later,
+    with a rationale; no runs: no strategy is good."""
+    runs = fn_args.get("runs")
     rationale = fn_args.get("rationale")
-    if not isinstance(run_ids, list) or not all(isinstance(run_id, str) for run_id in run_ids):
-        raise FunctionCallException("run_ids must be a list of run ids (it may be empty)")
+    if not isinstance(runs, list):
+        raise FunctionCallException("runs must be a list of runs (it may be empty)")
     if not rationale:
         raise FunctionCallException("A rationale is required")
-    unknown = [run_id for run_id in run_ids if run_id not in state.runs]
-    if unknown:
-        raise FunctionCallException(f"Unknown run ids {unknown}; existing runs: {list(state.runs)}")
-    state.selection = list(dict.fromkeys(run_ids))  # each once, in order
+    state.run_ensemble = parse_run_ensemble(state, runs) if runs else None
     state.rationale = rationale
-    return f"Selected runs: {', '.join(state.selection) or 'none'}."
+    state.finished = True
+    if state.run_ensemble is None:
+        return "Selected runs: none."
+    return f"Selected runs: {format_run_ensemble(state.run_ensemble)}."
 
 
 class CandidateListKind(StrEnum):
-    """Which candidate lists show_candidates picks, matching the signals."""
+    """
+    Which candidate lists show_candidates picks, matching the signals.
+    """
     RANDOM = "random"                    # any entity with a selected candidate
     AMBIGUOUS = "ambiguous"              # more than one entity on the best rank
     UNIQUE = "unique"                    # a unique candidate (the anchor rule)
@@ -814,10 +969,15 @@ MAX_SHOWN_LISTS = 20
 
 
 def choose_listed_entities(
-        result: StrategyResult, side: Side, kind: CandidateListKind, num_entities: int,
+        result: StrategyResult,
+        side: Side,
+        kind: CandidateListKind,
+        num_entities: int,
         ) -> tuple[list[SelectedCandidates], int]:
-    """A random sample (fixed seed: the same call shows the same entities) of
-    the entities of the side whose list is of the kind, and how many there are."""
+    """
+    A random sample (fixed seed: the same call shows the same entities) of
+    the entities of the side whose list is of the kind, and how many there are.
+    """
     keep = CANDIDATE_LIST_FILTERS[kind]
     matching = sorted(
         entity for (entity_side, entity), selected in result.selected.items()
@@ -1066,10 +1226,14 @@ def prefetch_shown_entities(
 
 
 def choose_examples(result: StrategyResult) -> list[SelectedCandidates]:
-    """The example entities of a result: per side a few with a selected candidate."""
+    """
+    The example entities of a result: per side a few with a selected candidate.
+    """
     return [
         selected for side in SIDES
-        for selected in choose_listed_entities(result, side, CandidateListKind.RANDOM, NUM_EXAMPLE_ENTITIES)[0]
+        for selected in choose_listed_entities(
+            result, side, CandidateListKind.RANDOM, NUM_EXAMPLE_ENTITIES
+            )[0]
     ]
 
 
@@ -1100,6 +1264,118 @@ def format_strategy_result(
     return outline
 
 
+# ---------------------------------------------------------------- ensemble evaluation
+
+NUM_CELL_EXAMPLES = 8           # largest Venn cells shown with an example pair
+NUM_TOO_AMBIGUOUS_EXAMPLES = 5  # too ambiguous entities shown
+NUM_SHOWN_TIED_CANDIDATES = 3   # candidates of their first sublayer shown
+
+
+def format_run_ensemble(run_ensemble: RunEnsemble) -> str:
+    return ", ".join(
+        f"{run.run_id} ({run.role}, family {run.family_name})"
+        for run in sorted(run_ensemble.runs, key=lambda run: run.run_id)
+    )
+
+
+def format_families(cell: frozenset[str]) -> str:
+    return "{" + ", ".join(sorted(cell)) + "}"
+
+
+def evaluation_entities(evaluation: EnsembleEvaluation, merged: MergedCandidates) -> dict[Side, set[IRI]]:
+    """The entities an evaluation shows, per side: the example entities, the
+    candidates of their lists and the shown tied candidates."""
+    other_side = Side.other_side(evaluation.side)
+    entities_by_side: dict[Side, set[IRI]] = {side: set() for side in SIDES}
+    for _, entity, _ in evaluation.cell_examples:
+        entities_by_side[evaluation.side].add(entity)
+        entities_by_side[other_side].update(
+            flatten_layers(merged.pareto_layers_by_entity[(evaluation.side, entity)]))
+    for entity, _, tied_candidates in evaluation.too_ambiguous_examples:
+        entities_by_side[evaluation.side].add(entity)
+        entities_by_side[other_side].update(tied_candidates)
+    return entities_by_side
+
+
+def prefetch_evaluation_entities(
+        evaluations: dict[Side, EnsembleEvaluation | None], merged: MergedCandidates,
+        entity_displays: dict[Side, EntityDisplay],
+        ) -> None:
+    """Retrieves the names of all entities the evaluations show, one query per side."""
+    entities_by_side: dict[Side, set[IRI]] = {side: set() for side in SIDES}
+    for evaluation in evaluations.values():
+        if evaluation is not None:
+            for side, entities in evaluation_entities(evaluation, merged).items():
+                entities_by_side[side].update(entities)
+    for side, entities in entities_by_side.items():
+        entity_displays[side].prefetch(entities, SHORT_VIEW)
+
+
+def format_merged_list(
+        side: Side, entity: IRI, marked_candidate: IRI, merged: MergedCandidates,
+        entity_displays: dict[Side, EntityDisplay],
+        ) -> Outline:
+    """The merged list of an entity: per candidate its rank in the list (tied
+    candidates of a sublayer share it) and its ranks in the runs; the
+    candidate of the example pair is marked."""
+    other_side = Side.other_side(side)
+    ranks_by_candidate = merged.candidate_rank_index[(side, entity)]
+    items: Outline = []
+    list_rank = 0
+    for layer in merged.pareto_layers_by_entity[(side, entity)]:
+        for sublayer in layer:
+            list_rank += 1
+            for candidate in sublayer:
+                run_ranks = ", ".join(
+                    f"{run_id}: {rank}" for run_id, rank in sorted(ranks_by_candidate[candidate].items()))
+                mark = "  <- the example pair" if candidate == marked_candidate else ""
+                items.append(f"{list_rank}. {entity_displays[other_side].show(candidate, SHORT_VIEW)} "
+                             f"(ranks {run_ranks}){mark}")
+    return items
+
+
+def format_ensemble_evaluation(
+        side: Side, evaluation: EnsembleEvaluation | None, merged: MergedCandidates,
+        entity_displays: dict[Side, EntityDisplay],
+        ) -> OutlineItem:
+    """The LLM view of the merge on one side (prefetch_evaluation_entities first)."""
+    if evaluation is None:
+        return (f"{side}: not measurable (a run compared only a sample of the other side, so the lists "
+                f"of this side lack candidates; or the side is a large KG)")
+    if evaluation.num_evaluated == 0:
+        return f"{side}: no entity was compared by every run whose population holds it"
+
+    def of_evaluated(count: int) -> str:
+        return format_share(count / evaluation.num_evaluated)
+
+    outline: Outline = [
+        f"with a candidate list {of_evaluated(evaluation.num_with_list)}, too ambiguous "
+        f"{of_evaluated(evaluation.num_too_ambiguous)} (more than {MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER} "
+        f"candidates tied on the first rank: no list), without candidates "
+        f"{of_evaluated(evaluation.num_without_candidates)}; lists cut by the budget of "
+        f"{CANDIDATE_BUDGET_PER_ENTITY}: {of_evaluated(evaluation.num_cut_by_budget)}",
+    ]
+    if evaluation.num_with_list:
+        outline.append("list length: " + " · ".join(
+            f"{name}: {format_share(count / evaluation.num_with_list)}"
+            for name, count in evaluation.list_length_counts.items()))
+        outline.append(("pairs by the families of the runs that selected them (Venn cells)", [
+            f"{format_families(cell)}: {num_pairs}" for cell, num_pairs in evaluation.pairs_by_cell]))
+        outline.append(("examples, a random pair of each of the largest cells", [
+            (f"{format_families(cell)}: {entity_displays[side].show(entity, SHORT_VIEW)}",
+             format_merged_list(side, entity, candidate, merged, entity_displays))
+            for cell, entity, candidate in evaluation.cell_examples]))
+    if evaluation.too_ambiguous_examples:
+        other_side = Side.other_side(side)
+        outline.append(("too ambiguous, e.g.", [
+            f"{entity_displays[side].show(entity, SHORT_VIEW)}: {num_tied} candidates tied on the first "
+            f"rank, e.g. " + ", ".join(entity_displays[other_side].show(candidate, SHORT_VIEW)
+                                       for candidate in tied_candidates)
+            for entity, num_tied, tied_candidates in evaluation.too_ambiguous_examples]))
+    return (f"{side}: {evaluation.num_evaluated} entities evaluated (those compared by every run "
+            f"whose population holds them)", outline)
+
+
 # ---------------------------------------------------------------- start message
 
 NUM_EXAMPLE_EQUIVALENCES = 5
@@ -1118,7 +1394,7 @@ def count_group_entities(
 
 
 def format_group_counts(state: CandidateTaskState, side: Side) -> OutlineItem:
-    kg_profile = state.alignment_state.get_profile(side)
+    kg_profile = state.alignment_state.get_kg_profile(side)
     if kg_profile.large:
         return "groups not counted (large KG)"
     matched_entities = {
@@ -1134,14 +1410,14 @@ def format_group_counts(state: CandidateTaskState, side: Side) -> OutlineItem:
             "no candidates and are no candidates or rivals, also when "
             "they belong to other groups too. The counts are without them."
             ), [
-        f"{group_name}: {size} / {matched} / {size - matched}" + (" (excluded)" if group_name in excluded else "")
-        for group_name, (size, matched) in sorted(counts.items(), key=lambda item: -item[1][0])
-    ]
+            f"{group_name}: {size} / {matched} / {size - matched}" + (" (excluded)" if group_name in excluded else "")
+            for group_name, (size, matched) in sorted(counts.items(), key=lambda item: -item[1][0])
+            ]
     )
 
 
 def format_knowledge_graph(state: CandidateTaskState, side: Side) -> str:
-    kg_profile = state.alignment_state.get_profile(side)
+    kg_profile = state.alignment_state.get_kg_profile(side)
     manager = state.kg_managers[side]
     profile_notes: Outline = list(describe_profile(kg_profile, findings=False))
     outline: Outline = [("profile", profile_notes), format_group_counts(state, side)]
@@ -1303,19 +1579,39 @@ GENERATOR_SCHEMA = {
     },
 }
 
+ENSEMBLE_RUNS_SCHEMA = {
+    "type": "array",
+    "description": "Tried runs whose candidate lists are merged per entity. The candidates of the generate "
+                   "runs form the lists (a candidate ranked better than another in every generate run comes "
+                   "first); corroborate runs add no candidates, they only order tied candidates. Runs of one "
+                   "family count as one kind of evidence when the pairs are grouped (e.g. two key runs on "
+                   "different groups).",
+    "items": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string"},
+            "role": {"type": "string", "enum": list(get_args(RunRole.__value__)),
+                     "description": "generate (default) or corroborate."},
+            "family": {"type": "string",
+                       "description": "Name of the kind of evidence of the run; default: the run id."},
+        },
+        "required": ["run_id"],
+    },
+}
+
 FINISH_DEFINITION = {
     "name": TaskFunctionName.FINISH,
-    "description": "Ends the task: selects the tried runs whose strategies are run in full later "
-                   "(on all entities, not a sample). Call it exactly once, at the end.",
+    "description": "Ends the task: selects the ensemble of tried runs whose strategies are run in full later "
+                   "(on all entities, not a sample) and merged. Call it exactly once, at the end.",
     "parameters": {
         "type": "object",
         "properties": {
-            "run_ids": {"type": "array", "items": {"type": "string"},
-                        "description": "The selected runs; empty if no strategy is good."},
+            "runs": {**ENSEMBLE_RUNS_SCHEMA, "description": "The selected runs; empty if no strategy is good. "
+                     + ENSEMBLE_RUNS_SCHEMA["description"]},
             "rationale": {"type": "string",
                           "description": "Which strategies for which groups, why, and which candidates are risky."},
         },
-        "required": ["run_ids", "rationale"],
+        "required": ["runs", "rationale"],
     },
 }
 
@@ -1356,6 +1652,16 @@ def candidate_functions() -> list[dict]:
                              "description": "IRIs of entities of the side, instead of kind and n."},
             }, "required": ["run_id"]},
         },
+        {
+            "name": TaskFunctionName.EVALUATE_RUN_ENSEMBLE,
+            "description": (
+                f"Merges the candidate lists of tried runs per entity (at most {CANDIDATE_BUDGET_PER_ENTITY} "
+                f"candidates, more only if more than that are tied on the first rank) and shows the merge "
+                f"on the entities every run of their population compared: how many get a list, how long "
+                f"the lists are, the pairs per combination of families that selected them, and examples."
+            ),
+            "parameters": {"type": "object", "properties": {"runs": ENSEMBLE_RUNS_SCHEMA}, "required": ["runs"]},
+        },
         FINISH_DEFINITION,
     ]
 
@@ -1384,6 +1690,8 @@ class OMCandidateTask(GraspTask):
     state: CandidateTaskState
 
     def setup(self, input: Any) -> str:
+        # TODO: source and target KG should be resolved out of alignment-state
+        # and not be separate fields in input
         source_manager, target_manager = resolve_managers(self, input)
         kg_managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
         alignment_state = resolve_alignment_state(input)
@@ -1392,7 +1700,7 @@ class OMCandidateTask(GraspTask):
             alignment_state=alignment_state,
             partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
             entity_displays={
-                side: EntityDisplay.of_profile(kg_managers[side], alignment_state.get_profile(side))
+                side: EntityDisplay.of_profile(kg_managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES
             },
         )
@@ -1424,7 +1732,7 @@ class OMCandidateTask(GraspTask):
         return function(self.state, fn_args)
 
     def done(self, fn_name: str) -> bool:
-        return fn_name == TaskFunctionName.FINISH and self.state.selection is not None
+        return fn_name == TaskFunctionName.FINISH and self.state.finished
 
     @property
     def default_input_field(self) -> str | None:
@@ -1435,9 +1743,9 @@ class OMCandidateTask(GraspTask):
         return CandidateStageResult(
             source_kg=state.kg_managers[Side.SOURCE].kg,
             target_kg=state.kg_managers[Side.TARGET].kg,
-            finished=state.selection is not None,
+            finished=state.finished,
             rationale=state.rationale,
-            selected_run_ids=state.selection or [],
+            run_ensemble=state.run_ensemble,
             runs={
                 run_id: TriedRun(
                     generator=generator,
