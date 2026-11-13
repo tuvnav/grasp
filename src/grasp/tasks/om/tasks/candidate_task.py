@@ -51,7 +51,6 @@ from grasp.tasks.om.data_models.entity_pairs import (
 )
 from grasp.tasks.om.data_models.patterns import StructureRelationKind
 from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile, describe_profile
-from grasp.tasks.om.data_models.relations import EQUIVALENCE
 from grasp.tasks.om.data_models.scope import REST, GroupRef, Population, ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.configuration import load_task_instructions
@@ -68,7 +67,7 @@ from grasp.tasks.om.kg_operations.grouping import (
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.value_comparison import (
     NeighbourIndex, ValueIndex, ExistingEquivalences, build_side_indices, build_side_witness_index,
-    build_existing_equivalences_index, compare_value_indices_by_vectors, compare_witness_indices, find_confirmed_equivalences,
+    compare_value_indices_by_vectors, compare_witness_indices, find_confirmed_equivalences,
     intersect_level_indices,
     key_entity_pairs_to_candidates, neighbour_entity_pairs_to_candidates, relation_keys_by_role_name,
     vector_entity_pairs_to_candidates,
@@ -98,7 +97,7 @@ def population_group_names(kg_profile: KgProfile, population: Population, side: 
     """
     The names of the groups of one side's population. REST stands for all groups
     of the profile that are not excluded (for now; later: only the entities that
-    have no correspondence yet). Raises FunctionCallException for a name that is
+    have no equivalence yet). Raises FunctionCallException for a name that is
     neither a group of the profile nor defined inline, and for an inline group
     named like a group of the profile.
     """
@@ -484,7 +483,7 @@ def get_key_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
+    witnesses_by_entity = alignment_state.existing_equivalences()
     candidates_by_entity = key_entity_pairs_to_candidates(
         alignment_state, entity_pairs,
         group_names_by_side, partition_names_by_entity, witnesses_by_entity
@@ -541,7 +540,7 @@ def get_vector_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
+    witnesses_by_entity = alignment_state.existing_equivalences()
     candidates_by_entity = vector_entity_pairs_to_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, witnesses_by_entity
         )
@@ -572,7 +571,7 @@ def get_neighbour_candidates(
             )
 
     # 0. the witnesses: the equivalences found so far
-    witnesses_by_entity = build_existing_equivalences_index(alignment_state.correspondences)
+    witnesses_by_entity = alignment_state.existing_equivalences()
     if not witnesses_by_entity[Side.SOURCE]:
         raise FunctionCallException(
             "A neighbour strategy needs equivalences found before (its witnesses), "
@@ -661,9 +660,7 @@ def run_strategy(
     # and it is always the sampled side
     large_sides = {side for side in SIDES if alignment_state.get_kg_profile(side).large}
     check_large_kgs(large_sides, trial)
-    existing_equivalences_by_entity = build_existing_equivalences_index(
-        alignment_state.correspondences
-        )
+    existing_equivalences_by_entity = alignment_state.existing_equivalences()
     population_by_side: dict[Side, frozenset[IRI] | None] = {
         side: retrieve_population(
             managers[side],
@@ -1397,10 +1394,7 @@ def format_group_counts(state: CandidateTaskState, side: Side) -> OutlineItem:
     kg_profile = state.alignment_state.get_kg_profile(side)
     if kg_profile.large:
         return "groups not counted (large KG)"
-    matched_entities = {
-        correspondence.entity_source if side == Side.SOURCE else correspondence.entity_target
-        for correspondence in state.alignment_state.correspondences
-    }
+    matched_entities = state.alignment_state.aligned_entities[side]
     counts = count_group_entities(state.kg_managers[side], kg_profile, matched_entities)
     excluded = set(kg_profile.excluded_group_names())
     return (
@@ -1426,30 +1420,30 @@ def format_knowledge_graph(state: CandidateTaskState, side: Side) -> str:
 
 
 def format_alignment_status(state: CandidateTaskState) -> str:
-    correspondences = state.alignment_state.correspondences
-    if not correspondences:
+    equivalences = state.alignment_state.equivalences
+    if not equivalences:
         return format_section("Equivalences found so far", "none", level=2)
     partitions = state.partition_names_by_entity
     by_partition_pair = Counter(
-        (partitions[Side.SOURCE].get(correspondence.entity_source, "?"),
-         partitions[Side.TARGET].get(correspondence.entity_target, "?"))
-        for correspondence in correspondences
+        (partitions[Side.SOURCE].get(equivalence.entity_source, "?"),
+         partitions[Side.TARGET].get(equivalence.entity_target, "?"))
+        for equivalence in equivalences
     )
-    examples = random.Random(0).sample(correspondences, min(NUM_EXAMPLE_EQUIVALENCES, len(correspondences)))
+    examples = random.Random(0).sample(equivalences, min(NUM_EXAMPLE_EQUIVALENCES, len(equivalences)))
     for side in SIDES:
         state.entity_displays[side].prefetch(
-            correspondence.entity_source if side == Side.SOURCE else correspondence.entity_target
-            for correspondence in examples
+            equivalence.entity_source if side == Side.SOURCE else equivalence.entity_target
+            for equivalence in examples
         )
     outline: Outline = [
-        (f"{len(correspondences)} equivalences, by partition pair (source - target)", [
+        (f"{len(equivalences)} equivalences, by partition pair (source - target)", [
             f"{source_partition} - {target_partition}: {count}"
             for (source_partition, target_partition), count in by_partition_pair.most_common()
         ]),
         ("examples", [
-            f"{state.entity_displays[Side.SOURCE].show(correspondence.entity_source)} = "
-            f"{state.entity_displays[Side.TARGET].show(correspondence.entity_target)}"
-            for correspondence in examples
+            f"{state.entity_displays[Side.SOURCE].show(equivalence.entity_source)} = "
+            f"{state.entity_displays[Side.TARGET].show(equivalence.entity_target)}"
+            for equivalence in examples
         ]),
     ]
     return format_section("Equivalences found so far", format_outline(outline), level=2)

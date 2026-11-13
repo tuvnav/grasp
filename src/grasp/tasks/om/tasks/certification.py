@@ -7,6 +7,8 @@ task, which judges one pair per run.
 - run_one_shot: the one-shot judge, a single model call outside the GRASP loop
 - certify_stratum: fixed random order, counting, stop rule, certified pairs
 - certify: all strata of an alignment state
+- recall estimation: strata of the unmatched source entities, sample
+  allocation and drawing, the estimate and the stop criterion
 
 The judge itself (one-shot, agentic, escalating), its logs and the resumption
 are up to the caller: certify only gets a judge function per stratum. Every
@@ -30,10 +32,14 @@ from grasp.tasks import get_task
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidate_selection import ParetoIndex, Stratum
 from grasp.tasks.om.data_models.verification import (
+    RECALL_STRATA,
     CertificationParams,
     CertificationResult,
     JudgeVariant,
     Judgment,
+    RecallEstimate,
+    RecallParams,
+    RecallStratumEstimate,
     StopDecision,
     StopRule,
     StratumCertification,
@@ -42,7 +48,12 @@ from grasp.tasks.om.data_models.verification import (
     VerdictOption,
     VerifyInput,
 )
+from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.kg_operations.grouping import groups_to_grouping, profile_partitions_to_grouping
+from grasp.tasks.om.kg_operations.value_retrieval import retrieve_entities, retrieve_linked_entities
+from grasp.tasks.om.tasks.candidate_task import sample_position
+from grasp.tasks.om.kg_operations.candidate_selection import flatten_layers
 from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"
@@ -394,13 +405,7 @@ def ranked_candidates(
     The candidates of an entity in rank order (Pareto layers, then sublayers);
     within a sublayer (tied) sorted, so that the choice is the same in every run.
     """
-    layers = pareto_index.get((side, entity), [])
-    return [
-        candidate
-        for layer in layers
-        for sublayer in layer
-        for candidate in sorted(sublayer)
-        ]
+    return flatten_layers(pareto_index.get((side, entity), []))
 
 
 def choose_competitors(
@@ -489,3 +494,158 @@ def certify(
         params=certification_params,
         strata=certified_strata
         )
+
+
+# ---------------------------------------------------------------- recall estimation
+
+def retrieve_recall_strata(
+        manager: KgManager,
+        kg_profile: KgProfile,
+        matched_entities: set[IRI]
+        ) -> dict[str, frozenset[IRI]]:
+    """
+    The unmatched entities of the KG (all partitions, excluded groups
+    included) in the recall strata, disjoint, in the order of RECALL_STRATA:
+    neighbours of matched entities, members of excluded groups, the rest.
+    Not for a large KG (its entities cannot be listed).
+    """
+    if kg_profile.large:
+        raise ValueError(f"{kg_profile.kg_name} is large: its unmatched entities cannot be listed")
+    all_partitions = profile_partitions_to_grouping(kg_profile)
+    unmatched = set(retrieve_entities(manager, all_partitions, kg_profile.entity_space)) - matched_entities
+    neighbours = retrieve_linked_entities(
+        manager, all_partitions, kg_profile.entity_space, matched_entities
+        ) & unmatched
+    excluded_groups = [group for group in kg_profile.groups if group.excluded]
+    excluded = (
+        set(retrieve_entities(manager, groups_to_grouping(excluded_groups), kg_profile.entity_space))
+        if excluded_groups else set()
+        ) & unmatched
+    excluded -= neighbours
+    rest = unmatched - neighbours - excluded
+    return {
+        stratum: frozenset(entities)
+        for stratum, entities in zip(RECALL_STRATA, (neighbours, excluded, rest), strict=True)
+        }
+
+
+def allocate_recall_sample(
+        stratum_sizes: dict[str, int],
+        params: RecallParams,
+        previous: RecallEstimate | None = None
+        ) -> dict[str, int]:
+    """
+    The sample size per stratum: in the first round by the fixed shares,
+    later by Neyman allocation (size * sqrt(p (1 - p)), p the share found in
+    the round before, at least 1 / (judged + 1)); at least min_per_stratum,
+    at most the stratum size.
+    """
+    if previous is None:
+        weights = {stratum: params.first_round_shares.get(stratum, 0.0) for stratum in stratum_sizes}
+    else:
+        found_share = {
+            estimate.stratum: max(estimate.found, 1) / (estimate.judged + 1) for estimate in previous.strata
+            }
+        weights = {
+            stratum: size * math.sqrt(found_share.get(stratum, 0.5) * (1 - found_share.get(stratum, 0.5)))
+            for stratum, size in stratum_sizes.items()
+            }
+    total_weight = sum(weight for stratum, weight in weights.items() if stratum_sizes[stratum]) or 1.0
+    return {
+        stratum: min(size, max(params.min_per_stratum, round(params.sample_size * weights[stratum] / total_weight)))
+        if size else 0
+        for stratum, size in stratum_sizes.items()
+        }
+
+
+def draw_consistent_sample(entities: frozenset[IRI], size: int, seed: int) -> list[IRI]:
+    """
+    The size entities with the smallest sample positions: the same in every
+    run, and nested over the rounds (an entity drawn before and still in the
+    stratum is drawn again).
+    """
+    return sorted(entities, key=lambda entity: (sample_position(entity, seed), entity))[:size]
+
+
+def missed_upper_bound(found: int, judged: int, size: int, confidence: float) -> int:
+    """
+    The exact one-sided upper confidence bound of the number of entities with
+    a missed partner in a stratum of this size, from a sample without
+    replacement (hypergeometric): the largest number K for which finding at
+    most `found` in `judged` drawn entities still has a probability above
+    1 - confidence. A stratum judged completely gives `found` exactly; a
+    stratum not judged gives its size.
+    """
+    if judged == 0:
+        return size
+    significance = 1 - confidence
+    smallest, largest = found, found + (size - judged)  # K lies between them
+    # P(at most `found` | K) falls with K: bisection for the last K above the significance
+    while smallest < largest:
+        middle = (smallest + largest + 1) // 2
+        if hypergeom.cdf(found, size, middle, judged) > significance:
+            smallest = middle
+        else:
+            largest = middle - 1
+    return smallest
+
+
+def estimate_recall(
+        round_number: int,
+        accepted: int,
+        stratum_sizes: dict[str, int],
+        judged_by_stratum: dict[str, int],
+        found_by_stratum: dict[str, int],
+        params: RecallParams
+        ) -> RecallEstimate:
+    """
+    The stratified estimate: missed = sum of size * found / judged per
+    stratum; its upper bound from the strata's exact (hypergeometric) upper
+    bounds, each at the Bonferroni level (1 - confidence) / strata, so that
+    all hold together with the confidence (conservative). A stratum not
+    judged counts wholly, one judged completely exactly.
+    """
+    strata = [stratum for stratum, size in stratum_sizes.items() if size]
+    stratum_confidence = 1 - (1 - params.confidence) / max(len(strata), 1)
+    estimates = []
+    for stratum in strata:
+        size, judged, found = stratum_sizes[stratum], judged_by_stratum.get(stratum, 0), found_by_stratum.get(stratum, 0)
+        estimates.append(RecallStratumEstimate(
+            stratum=stratum, size=size, judged=judged, found=found,
+            estimated_missed=size * found / judged if judged else float(size),
+            missed_upper=missed_upper_bound(found, judged, size, stratum_confidence),
+            ))
+    estimated_missed = sum(estimate.estimated_missed for estimate in estimates)
+    missed_upper = sum(estimate.missed_upper for estimate in estimates)
+
+    def recall_of(missed: float) -> float:
+        return accepted / (accepted + missed) if accepted + missed else 1.0
+
+    return RecallEstimate(
+        round=round_number, accepted=accepted, strata=estimates,
+        estimated_missed=estimated_missed, missed_upper=missed_upper,
+        recall=recall_of(estimated_missed), recall_lower=recall_of(missed_upper),
+        confidence=params.confidence,
+        )
+
+
+def stop_reason(estimates: list[RecallEstimate], params: RecallParams) -> str | None:
+    """
+    Why to stop after the last estimate, or None to go on: the lower bound
+    of the recall reached the target, the estimated missed equivalences fell
+    by less than min_relative_improvement since the round before, or
+    max_rounds rounds are done.
+    """
+    if not estimates:
+        return None
+    last = estimates[-1]
+    if last.recall_lower >= params.target_recall:
+        return f"recall >= {last.recall_lower:.3f} (at {params.confidence:.0%}), target {params.target_recall}"
+    if len(estimates) >= 2:
+        before = estimates[-2].estimated_missed
+        if before > 0 and (before - last.estimated_missed) / before < params.min_relative_improvement:
+            return (f"estimated missed equivalences fell from {before:.0f} to {last.estimated_missed:.0f}, "
+                    f"less than {params.min_relative_improvement:.0%}")
+    if last.round >= params.max_rounds:
+        return f"{params.max_rounds} rounds done"
+    return None

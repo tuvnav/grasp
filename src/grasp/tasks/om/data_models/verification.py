@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 from grasp.tasks.om.data_models.anchors import AnchorRecord
 from grasp.tasks.om.data_models.profile import KgProfile
-from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
 class VerdictOption(StrEnum):
@@ -135,3 +135,130 @@ class CertificationResult(BaseModel):
     variant: str
     params: CertificationParams
     strata: list[StratumCertification]
+
+
+# --- judging of candidate lists ------------------------------------------------
+# A judge gets a unit: one or two focus entities, each with its candidate list,
+# and searches the KGs with all functions; it sets equivalences (also with
+# entities outside the lists) and finishes. Every unit is judged (no
+# acceptance sampling); its stratum is only kept for the evaluation.
+
+
+class FocusEntity(BaseModel):
+    """An entity a judge has to find the partner(s) of, with its candidates."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    side: Side
+    entity: IRI
+    # the cut Pareto list in rank order; empty: a bare search
+    candidates: list[IRI] = []
+
+
+class JudgingUnit(BaseModel):
+    """
+    What one judge run is about: a single focus entity, or the two entities
+    of a mutual pair (each the other's only best candidate).
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    focus: list[FocusEntity]
+
+    @property
+    def key(self) -> str:
+        """Unique per unit, e.g. "source:s1|target:t1" for a mutual pair."""
+        return "|".join(sorted(f"{Side(focus.side).value}:{focus.entity}" for focus in self.focus))
+
+    @property
+    def is_mutual(self) -> bool:
+        return len(self.focus) == 2
+
+    def is_focus(self, side: Side, entity: IRI) -> bool:
+        return any(Side(focus.side) == Side(side) and focus.entity == entity for focus in self.focus)
+
+
+class CandidateJudgeVariant(BaseModel):
+    """How a unit is shown to the judge; the ablation settings."""
+    model_config = ConfigDict(extra="forbid")
+    # focused: the focus entities are named; clusters: the judge only sees two
+    # clusters of similar entities (the orchestration still knows the focus)
+    presentation: Literal["focused", "clusters"] = "focused"
+    show_signals: bool = True      # the signals that ranked the candidates
+    fixed_order: bool = True       # rank order; False: shuffled per unit
+    max_steps: int = 20
+
+    @property
+    def name(self) -> str:
+        return "+".join([
+            self.presentation,
+            "signals" if self.show_signals else "no_signals",
+            "ranked" if self.fixed_order else "shuffled",
+            ])
+
+
+class UnitJudgment(BaseModel):
+    """The result of judging one unit."""
+    model_config = ConfigDict(extra="forbid")
+    unit: JudgingUnit
+    stratum: str                           # for the evaluation only; not shown to the judge
+    equivalences: list[tuple[IRI, IRI]]    # all set, also outside the lists
+    unsure_focus: list[EntityKey] = []     # focus entities marked unsure at finish
+    finished: bool                         # the judge called finish
+    rationale: str = ""
+    variant: str
+    steps: int
+    elapsed: float
+    error: str | None = None               # the run failed
+
+
+
+# --- recall estimation ------------------------------------------------------------
+# A stratified random sample of the source entities without a partner is
+# searched by the judge without candidate lists; the share with a partner found
+# per stratum, weighted with the stratum sizes, estimates the missed
+# equivalences.
+
+# strata of the unmatched source entities, assigned in this order
+RECALL_STRATA = ("neighbours", "excluded", "rest")
+
+
+class RecallParams(BaseModel):
+    """Recall estimation and stop criterion. Provisional values."""
+    model_config = ConfigDict(extra="forbid")
+    sample_size: int = 200
+    # sample shares of the strata in the first round (later: Neyman allocation
+    # with the shares found in the round before)
+    first_round_shares: dict[str, float] = {"neighbours": 0.4, "excluded": 0.2, "rest": 0.4}
+    min_per_stratum: int = 10
+    confidence: float = 0.95
+    # stop: lower confidence bound of the recall reached ...
+    target_recall: float = 0.9
+    # ... or the estimated missed equivalences fell by less than this share
+    # since the round before ...
+    min_relative_improvement: float = 0.1
+    # ... or this many candidate rounds are done
+    max_rounds: int = 5
+    seed: int = 0
+
+
+class RecallStratumEstimate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stratum: str
+    size: int                 # unmatched source entities in the stratum
+    judged: int               # sampled and judged to the end
+    found: int                # of them, with a partner found (or unsure)
+    estimated_missed: float   # size * found / judged
+    missed_upper: float       # with the upper confidence bound of the share
+
+
+class RecallEstimate(BaseModel):
+    """
+    The recall of a round, relative to the judge: accepted / (accepted +
+    missed), with a lower bound from the upper bounds of the missed ones.
+    """
+    model_config = ConfigDict(extra="forbid")
+    round: int
+    accepted: int
+    strata: list[RecallStratumEstimate]
+    estimated_missed: float
+    missed_upper: float
+    recall: float
+    recall_lower: float
+    confidence: float

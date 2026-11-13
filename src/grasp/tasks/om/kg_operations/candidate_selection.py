@@ -19,6 +19,7 @@ import random
 from grasp.tasks.om.data_models.candidate_generators import Selection
 from grasp.tasks.om.data_models.candidate_selection import CandidateRankIndex, EnsembleEvaluation, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, StrategyResult, StrategySignals, Stratum, VennIndex
 from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
+from grasp.tasks.om.data_models.verification import FocusEntity, JudgingUnit
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
 
@@ -474,8 +475,18 @@ def list_length_class(length: int) -> str:
 
 
 def flatten_layers(layers: list[list[list[IRI]]]) -> list[IRI]:
-    """The candidates of an entity's layers in rank order."""
-    return [candidate for layer in layers for sublayer in layer for candidate in sublayer]
+    """
+    The candidates of an entity's layers in rank order; tied ones (within a
+    sublayer) sorted, so that the order is the same in every run.
+    """
+    return [candidate for layer in layers for sublayer in layer for candidate in sorted(sublayer)]
+
+
+def only_best_candidate(layers: list[list[list[IRI]]]) -> IRI | None:
+    """The candidate alone in the first sublayer of the first layer, if one."""
+    if layers and layers[0] and len(layers[0][0]) == 1:
+        return layers[0][0][0]
+    return None
 
 
 def to_entity_pair(side: Side, entity: IRI, candidate: IRI) -> tuple[IRI, IRI]:
@@ -566,3 +577,46 @@ def build_verification_strata(
         merged_candidates: MergedCandidates
         ) -> list[Stratum]:
     return strata_of(merged_candidates.venn_index)
+
+
+def families_by_pair(venn_index: VennIndex) -> dict[tuple[IRI, IRI], frozenset[str]]:
+    """The Venn cell (run families) of each pair of the cut lists."""
+    return {pair: families for families, pairs in venn_index.items() for pair in pairs}
+
+
+def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[JudgingUnit, str]]:
+    """
+    The units of the candidate judging, each with its stratum (for the
+    evaluation only): every mutual pair (each entity the other's only best
+    candidate) with both cut lists, and every entity with a cut list, on
+    both sides, alone (so an entity of a mutual pair is judged three times:
+    conflicts between the judgments are information). Stratum:
+    kind/cell of the best pair/list length class, e.g. "source/key+vector/2-3".
+    """
+    layers_by_entity = merged_candidates.pareto_layers_by_entity
+    cell_of = families_by_pair(merged_candidates.venn_index)
+
+    def focus_entity(side: Side, entity: IRI) -> FocusEntity:
+        return FocusEntity(side=side, entity=entity, candidates=flatten_layers(layers_by_entity[(side, entity)]))
+
+    def cell_name(side: Side, entity: IRI, candidate: IRI) -> str:
+        return "+".join(sorted(cell_of.get(to_entity_pair(side, entity, candidate), frozenset())))
+
+    units: list[tuple[JudgingUnit, str]] = []
+    for (side, entity), layers in sorted(layers_by_entity.items()):
+        candidates = flatten_layers(layers)
+        if not candidates:
+            continue
+        units.append((
+            JudgingUnit(focus=[focus_entity(side, entity)]),
+            f"{Side(side).value}/{cell_name(side, entity, candidates[0])}/{list_length_class(len(candidates))}"
+            ))
+        best = only_best_candidate(layers)
+        if Side(side) == Side.SOURCE and best is not None:
+            partner_layers = layers_by_entity.get((Side.TARGET, best), [])
+            if only_best_candidate(partner_layers) == entity:
+                units.append((
+                    JudgingUnit(focus=[focus_entity(Side.SOURCE, entity), focus_entity(Side.TARGET, best)]),
+                    f"mutual/{cell_name(side, entity, best)}"
+                    ))
+    return units

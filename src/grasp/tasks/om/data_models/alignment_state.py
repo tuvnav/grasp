@@ -4,11 +4,16 @@ profiles (the anchor stage later, the candidate stage now):
     source, target                the profiles of the two KGs: the working profiles
                                   of the pair (copies of the profile pipeline's
                                   output, changed only here by the stages of the pair)
-    correspondences               accepted correspondences, with their provenance
-    rejected                      pairs judged wrong (counter-evidence; not proposed again)
-    reviewed                      source entities the judge has looked at, and the outcome
+    equivalences                  the equivalences accepted so far
+    rejected_equivalences         the equivalences rejected so far (not proposed again)
     cross_kg_non_competing_pairs  partitions of the two KGs that do not compete
     skipped                       populations not worth searching
+
+The two equivalence lists are a snapshot of the current decisions: their
+history (who proposed, judged, accepted or rejected what, and why) is kept in
+the orchestration's ledger of events (data_models/equivalence.py), which
+builds a new state before every stage (with_decisions). The lists are never
+changed in place; the index over them is built when the state is constructed.
 
 Competition: uniqueness, ambiguity and rank of a candidate are measured against
 all entities of both KGs except those in partitions that do not compete with its
@@ -18,15 +23,16 @@ the non-competing pairs of its profile; across the KGs, the non-competing pairs
 here (none at the start: every partition competes until a stage of the pair
 forbids it).
 """
-from copy import deepcopy
-from typing import Literal, Self
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
-from grasp.tasks.om.data_models.correspondence import Correspondence
+from grasp.tasks.om.data_models.equivalence import (
+    Equivalence, ExistingEquivalences, build_existing_equivalences_index,
+)
 from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPartitionPair
 from grasp.tasks.om.data_models.scope import Population
-from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
 class CrossKgNonCompetingPartitionPair(BaseModel):
@@ -48,16 +54,6 @@ class NonCompetingPartition(BaseModel):
     set_by: str
 
 
-class ReviewedSource(BaseModel):
-    """A source entity the judge has looked at. With an outcome other than
-    match, it is reviewed again only with new candidates."""
-    model_config = ConfigDict(extra="forbid")
-    source: IRI
-    round: int = 0
-    outcome: Literal["match", "none_absent", "none_present", "escalated"]
-    candidates_seen: list[IRI] = []
-
-
 class SkippedScope(BaseModel):
     model_config = ConfigDict(extra="forbid")
     population: Population
@@ -69,12 +65,14 @@ class AlignmentState(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_kg_profile: KgProfile
     target_kg_profile: KgProfile
-    correspondences: list[Correspondence] = []
-    rejected: list[Correspondence] = []
-    reviewed: list[ReviewedSource] = []
+    equivalences: list[Equivalence] = []
+    rejected_equivalences: list[Equivalence] = []
     cross_kg_non_competing_pairs: list[CrossKgNonCompetingPartitionPair] = []
     skipped: list[SkippedScope] = []
-    _aligned_entities: dict[Side, set[IRI]] = PrivateAttr(default_factory=dict)
+    # per entity its accepted and its rejected equivalences (built from the lists)
+    _accepted_by_entity: dict[EntityKey, list[Equivalence]] = PrivateAttr(default_factory=dict)
+    _rejected_by_entity: dict[EntityKey, list[Equivalence]] = PrivateAttr(default_factory=dict)
+    _existing_equivalences: ExistingEquivalences = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="after")
     def cross_kg_pairs_name_partitions(self) -> Self:
@@ -82,10 +80,49 @@ class AlignmentState(BaseModel):
             self.check_known_partitions(Side.SOURCE, pair.source_partition, Side.TARGET, pair.target_partition)
         return self
 
+    @model_validator(mode="after")
+    def each_equivalence_has_one_status(self) -> Self:
+        """No equivalence twice in a list, none both accepted and rejected."""
+        for name, equivalences in (
+                ("equivalences", self.equivalences),
+                ("rejected_equivalences", self.rejected_equivalences)):
+            keys = [equivalence.key for equivalence in equivalences]
+            duplicates = sorted({key for key in keys if keys.count(key) > 1})
+            if duplicates:
+                raise ValueError(f"equivalences more than once in {name}: {duplicates}")
+        both = (
+            {equivalence.key for equivalence in self.equivalences}
+            & {equivalence.key for equivalence in self.rejected_equivalences}
+            )
+        if both:
+            raise ValueError(f"equivalences both accepted and rejected: {sorted(both)}")
+        return self
+
+    def model_post_init(self, context: Any) -> None:
+        self._accepted_by_entity = index_by_entity(self.equivalences)
+        self._rejected_by_entity = index_by_entity(self.rejected_equivalences)
+        self._existing_equivalences = build_existing_equivalences_index(self.equivalences)
+
     @classmethod
     def create(cls, source: KgProfile, target: KgProfile) -> "AlignmentState":
         """A new state with copies of the profiles; across the KGs, all partitions compete."""
         return cls(source_kg_profile=source.model_copy(deep=True), target_kg_profile=target.model_copy(deep=True))
+
+    def with_decisions(
+            self,
+            equivalences: list[Equivalence],
+            rejected_equivalences: list[Equivalence]
+            ) -> "AlignmentState":
+        """
+        A new state with these current decisions (from the ledger) and the
+        rest of this one. Constructed anew, so that the checks and the index
+        run (model_copy runs neither).
+        """
+        return type(self)(
+            **self.model_dump(exclude={"equivalences", "rejected_equivalences"}),
+            equivalences=equivalences,
+            rejected_equivalences=rejected_equivalences,
+            )
 
     @property
     def source_kg_name(self) -> str:
@@ -96,13 +133,33 @@ class AlignmentState(BaseModel):
         return self.target_kg_profile.kg_name
 
     @property
-    def aligned_entites(self) -> dict[Side, set[IRI]]:
-        return deepcopy(self._aligned_entities)
+    def aligned_entities(self) -> dict[Side, set[IRI]]:
+        """
+        Per side the entities with an accepted equivalence.
+        """
+        aligned: dict[Side, set[IRI]] = {Side.SOURCE: set(), Side.TARGET: set()}
+        for side, entity in self._accepted_by_entity:
+            aligned[side].add(entity)
+        return aligned
 
-    def add_correspondence(self, correspondence: Correspondence):
-        self.correspondences.append(correspondence)
-        self._aligned_entities.setdefault(Side.SOURCE, set()).add(correspondence.entity_source)
-        self._aligned_entities.setdefault(Side.TARGET, set()).add(correspondence.entity_target)
+    def existing_equivalences(self) -> ExistingEquivalences:
+        """
+        The accepted equivalences per side by the entity of that side (the
+        witnesses of a neighbour strategy); built once with the state.
+        """
+        return self._existing_equivalences
+
+    def equivalences_of(self, entity: EntityKey) -> list[Equivalence]:
+        """The accepted equivalences of the entity (side, IRI)."""
+        return list(self._accepted_by_entity.get(entity_key(entity), []))
+
+    def rejected_partners(self, entity: EntityKey) -> set[IRI]:
+        """The entities of the other side rejected as partners of the entity."""
+        side, iri = entity_key(entity)
+        return {
+            partner for equivalence in self._rejected_by_entity.get((side, iri), [])
+            if (partner := equivalence.partner_of(side, iri)) is not None
+            }
 
     def get_kg_profile(self, side: Side) -> KgProfile:
         return self.source_kg_profile if Side(side) == Side.SOURCE else self.target_kg_profile
@@ -175,3 +232,17 @@ class AlignmentState(BaseModel):
                 result.append(NonCompetingPartition(side=other_side, partition=other, reason=pair.reason,
                                                     set_by=pair.set_by))
         return result
+
+
+def entity_key(entity: EntityKey) -> EntityKey:
+    """The key with the side as Side (it may come as a string from JSON)."""
+    return (Side(entity[0]), entity[1])
+
+
+def index_by_entity(equivalences: list[Equivalence]) -> dict[EntityKey, list[Equivalence]]:
+    """Per entity (side, IRI) the equivalences it is part of."""
+    index: dict[EntityKey, list[Equivalence]] = {}
+    for equivalence in equivalences:
+        for entity in equivalence.mentioned_entities():
+            index.setdefault(entity, []).append(equivalence)
+    return index

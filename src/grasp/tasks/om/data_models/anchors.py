@@ -6,6 +6,7 @@ stage result.
 from dataclasses import dataclass, field
 from typing import Any
 
+from grasp.tasks.om.data_models.candidate_selection import RunEnsemble, TriedRun
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from grasp.sparql.types import Binding
@@ -261,12 +262,9 @@ class AnchorConflict(BaseModel):
 class AnchorStageResult(BaseModel):
     source_kg: str
     target_kg: str
-    entity_space: dict[str, list[str]]
     finished: bool
     fallback: str | None
     rationale: str | None
-    runs_tried: int
-    selected: list[SelectedRun]
-    strata: dict[str, int]
-    anchors: list[AnchorRecord]
-    conflicts: list[AnchorConflict]
+    run_ensemble: RunEnsemble | None
+    runs: dict[str, TriedRun]
+

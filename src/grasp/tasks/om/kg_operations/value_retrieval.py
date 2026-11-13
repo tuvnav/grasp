@@ -1,6 +1,7 @@
 """
 Values of the entities of a grouping (names, synonyms, ... or own patterns) for comparison.
 """
+from itertools import batched
 from typing import Collection, Iterable, Iterator
 
 from grasp.manager import KgManager
@@ -113,6 +114,31 @@ def retrieve_entities(
     """
     query = grouping_to_sparql_query(manager, grouping, entity_space, "DISTINCT ?entity")
     return sorted({IRI(Binding.from_dict(row["entity"]).identifier()) for row in stream_rows(manager, query)})
+
+
+def retrieve_linked_entities(
+        manager: KgManager,
+        grouping: Grouping,
+        entity_space: Iterable[str],
+        linked_to: Collection[IRI],
+        batch_size: int = 1000
+        ) -> set[IRI]:
+    """
+    The entities of a grouping linked by a triple, in either direction, to
+    one of the given entities (e.g. the neighbours of matched entities).
+    """
+    entity_space = list(entity_space)
+    linked_entities: set[IRI] = set()
+    for batch in batched(sorted(linked_to), batch_size):
+        query = grouping_to_sparql_query(
+            manager, grouping, entity_space, "DISTINCT ?entity",
+            where=f"{values_clause('linked', batch)}\n"
+                  "{ ?entity ?predicate ?linked } UNION { ?linked ?predicate ?entity }"
+            )
+        linked_entities.update(
+            IRI(Binding.from_dict(row["entity"]).identifier()) for row in stream_rows(manager, query)
+            )
+    return linked_entities
 
 
 def retrieve_partitions_by_entity(

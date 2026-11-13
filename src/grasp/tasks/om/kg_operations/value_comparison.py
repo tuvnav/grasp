@@ -5,7 +5,9 @@ import numpy as np
 
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidate_generators import WitnessWeighting
-from grasp.tasks.om.data_models.correspondence import Correspondence
+from grasp.tasks.om.data_models.equivalence import (  # noqa: F401  (ExistingEquivalences, build_existing_equivalences_index: re-exported)
+    Equivalence, ExistingEquivalences, build_existing_equivalences_index,
+)
 from grasp.tasks.om.data_models.relations import EQUIVALENCE
 from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, EntityPair, KeyCandidate, KeyEntityPair, KeyMatch, KeyHub, NeighbourCandidate,
@@ -132,26 +134,6 @@ def relation_keys_by_role_name(
         if relation is not None:
             keys[item] = relation_key(relation, inverse=item.startswith(INVERSE_PREFIX))
     return keys
-
-
-# per side: entity -> the equivalences (witnesses) it takes part in
-type ExistingEquivalences = dict[Side, dict[IRI, list[tuple[IRI, IRI]]]]
-
-
-def build_existing_equivalences_index(correspondences: Iterable[Correspondence]) -> ExistingEquivalences:
-    """
-    The witnesses of a neighbour strategy: the equivalences among the
-    correspondences, per side by the entity of that side (an entity may take
-    part in several).
-    """
-    witnesses_by_entity: ExistingEquivalences = {Side.SOURCE: {}, Side.TARGET: {}}
-    for correspondence in correspondences:
-        if correspondence.relation != EQUIVALENCE.iri:
-            continue
-        witness = (correspondence.entity_source, correspondence.entity_target)
-        witnesses_by_entity[Side.SOURCE].setdefault(witness[0], []).append(witness)
-        witnesses_by_entity[Side.TARGET].setdefault(witness[1], []).append(witness)
-    return witnesses_by_entity
 
 
 def find_confirmed_equivalences(
