@@ -28,7 +28,7 @@ the sampled side, drawn per group at spread offsets (large_kg_sampling) in
 proportion to the estimated group sizes, and queried for the sampled entities
 only; two large KGs are not supported yet.
 """
-from collections import Counter, defaultdict
+from collections import Counter
 import dataclasses
 from enum import StrEnum, auto
 import hashlib
@@ -54,7 +54,12 @@ from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile, descr
 from grasp.tasks.om.data_models.scope import REST, GroupRef, Population, ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.configuration import load_task_instructions
-from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, TRANSFORM_OPERATIONS
+from grasp.tasks.om.foundation.text_normalization import (
+    NORMALIZATION_LEVELS,
+    TRANSFORM_OPERATIONS,
+    NormalizationLevel,
+    words,
+)
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
@@ -451,12 +456,16 @@ def get_key_candidates(
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         max_entity_pairs_per_bucket: int | None = None,
         entity_sample: EntitySample | None = None,
-        ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[KeyHub], list[tuple[IRI, IRI]]]:
+        ) -> tuple[
+            dict[tuple[Side, IRI], EntityCandidates], list[KeyHub], list[tuple[IRI, IRI]],
+            dict[Side, frozenset[frozenset[str]]]
+        ]:
     """
     The candidates of a key strategy for every entity in its population, on both
-    sides, and the keys whose entities would give too many entity pairs
-    (above max_entity_pairs_per_bucket). entity_sample: a trial run compares
-    only these entities on their side.
+    sides, the keys whose entities would give too many entity pairs (above
+    max_entity_pairs_per_bucket), the existing equivalences found again, and per
+    side the word sets of all values compared (value_wordsets). entity_sample: a
+    trial run compares only these entities on their side.
     Not yet ranked or cut by generator.selection.
     """
     strategy = generator.strategy
@@ -483,12 +492,23 @@ def get_key_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = alignment_state.existing_equivalences()
+    existing_equivalences = alignment_state.existing_equivalences()
     candidates_by_entity = key_entity_pairs_to_candidates(
         alignment_state, entity_pairs,
-        group_names_by_side, partition_names_by_entity, witnesses_by_entity
+        group_names_by_side, partition_names_by_entity, existing_equivalences
         )
-    return candidates_by_entity, overfull_keys, find_confirmed_equivalences(entity_pairs, witnesses_by_entity)
+    value_wordsets = {side: value_wordsets_of(indices_by_side[side]) for side in SIDES}
+    return (candidates_by_entity, overfull_keys, find_confirmed_equivalences(entity_pairs, existing_equivalences),
+            value_wordsets)
+
+
+def value_wordsets_of(indices_by_level: dict[NormalizationLevel, ValueIndex]) -> frozenset[frozenset[str]]:
+    """The word sets of all values of one side (each level's index holds all rows)."""
+    any_index = next(iter(indices_by_level.values()), {})
+    return frozenset(
+        wordset for rows in any_index.values() for row in rows
+        if (wordset := frozenset(words(row.raw_projection_value)))
+        )
 
 
 def get_vector_candidates(
@@ -693,9 +713,10 @@ def run_strategy(
         }
 
     # 1. collect
+    value_wordsets = None
     match generator.strategy.kind:
         case CandidateStrategyType.KEY:
-            collected, hubs, confirmed_equivalences = get_key_candidates(
+            collected, hubs, confirmed_equivalences, value_wordsets = get_key_candidates(
                 managers, alignment_state, generator,
                 partition_names_by_entity, max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
@@ -734,7 +755,8 @@ def run_strategy(
         signals=signals,
         confirmed_equivalences=confirmed_equivalences,
         existing_equivalences=sum(len(witnesses) for witnesses in existing_equivalences_by_entity[Side.SOURCE].values()),
-        hubs=hubs
+        hubs=hubs,
+        value_wordsets=value_wordsets,
         )
 
 
@@ -888,7 +910,9 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
 
 
 def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
-    """The ensemble of the function arguments, with run ids of tried runs."""
+    """
+    The ensemble of the function arguments, with run ids of tried runs.
+    """
     try:
         run_ensemble = RunEnsemble.model_validate({"runs": runs})
     except ValidationError as error:
@@ -926,8 +950,10 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
 
 @func_reg.register(TaskFunctionName.FINISH)
 def finish(state: CandidateTaskState, fn_args: dict) -> str:
-    """Selects the ensemble of runs whose generators are run in full later,
-    with a rationale; no runs: no strategy is good."""
+    """
+    Selects the ensemble of runs whose generators are run in full later,
+    with a rationale; no runs: no strategy is good.
+    """
     runs = fn_args.get("runs")
     rationale = fn_args.get("rationale")
     if not isinstance(runs, list):
@@ -1456,7 +1482,6 @@ def format_start_message(state: CandidateTaskState) -> str:
     return (
         format_section("Knowledge graphs", knowledge_graphs, level=2)
         + "\n\n" + format_alignment_status(state)
-        + "\n\nNo strategy has been tried yet."
     )
 
 
@@ -1663,7 +1688,7 @@ def candidate_functions() -> list[dict]:
 def system_information(config: GraspConfig) -> str:
     info = load_prompt("candidate_task.txt")
     info = add_equivalence_condition(info, config)
-    task_instructions = load_task_instructions(config.task_kwargs.get("om", {}))
+    task_instructions = load_task_instructions(config)
     if task_instructions:
         info += "\n\n" + format_section("Task-specific instructions", task_instructions)
     return info
@@ -1684,8 +1709,6 @@ class OMCandidateTask(GraspTask):
     state: CandidateTaskState
 
     def setup(self, input: Any) -> str:
-        # TODO: source and target KG should be resolved out of alignment-state
-        # and not be separate fields in input
         source_manager, target_manager = resolve_managers(self, input)
         kg_managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
         alignment_state = resolve_alignment_state(input)
@@ -1698,7 +1721,7 @@ class OMCandidateTask(GraspTask):
                 for side in SIDES
             },
         )
-        return format_start_message(self.state)
+        return format_start_message(self.state) + "\n\nNo strategy has been tried yet."
 
     def system_information(self) -> str:
         return system_information(self.config)
@@ -1720,7 +1743,7 @@ class OMCandidateTask(GraspTask):
         return [FINISH_DEFINITION]
 
     def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
-        function = func_reg.Registry.get(fn_name)  # type: ignore[call-overload]
+        function = func_reg.Registry.get(fn_name)
         if function is None:
             raise FunctionCallException(f"Unknown function {fn_name}")
         return function(self.state, fn_args)

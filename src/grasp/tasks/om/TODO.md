@@ -3,10 +3,11 @@
 - Rules oder in anderen Promptteil in CandidateTask: Ergänzende Strategien suchen mit unterschiedlichen Fehlerkorrelationen
 - CandidateTask für große KGs pro Gruppe?
 - Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
-- partition_names_by_entity zentralisieren
+- partition_names_by_entity zentralisieren (nur einmal abrufen)
 - Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
 - Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
-- Zusätzliche Profile-Schicht am Ende: Notizen auflösen
+- run-0 und compare_to in anchors wieder aufnehmen
 - Infos zwischen Kandidatstufen und vergangenen Stufen: Welche Strategien wurden bereits genutzt (mit Ergebnissen - z. B. wie viel Prozent Abnahme)
 - Funktion: in bestehende Äquivalenzen reinschauen (z. B. nach Partitionspaaren / Gruppenpaaren / random)
 - Erinnerung, dass LLM mehrere Tools pro Runde nutzen kann, wenn es viele Runden lang immer nur einen Tool Call tätigt?
+- ProfileSpaceTask: In YAML neben space auch angeben: veränderbar oder nicht.

@@ -146,9 +146,11 @@ def prefix_totals(counts: dict[tuple[str, str], int]) -> Counter[str]:
 
 
 def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[str], str]:
-    """(entity space, how it was chosen): the configured namespaces of the KG,
+    """
+    (entity space, how it was chosen): the configured namespaces of the KG,
     otherwise the prefix with the most named entities, otherwise the one with
-    the most entities."""
+    the most entities.
+    """
     configured = configured_namespaces(config, manager.kg)
     if configured:
         return list(configured), "configured"

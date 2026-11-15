@@ -1,4 +1,4 @@
-Your stage: b2. groups.
+Your stage: d. groups.
 
 Groups are sets of entities that are recognizable by features of their own (a type, a predicate they all have, an IRI pattern) and that matter for matching in this task: the next stage profiles each group on its own (where names and codes are stored, local names), and matching compares entities group by group. Unlike the partitions, groups may overlap (e.g. starships among the instances, authors among the persons), and they are chosen with the task in view: the task-specific instructions say what is to be matched.
 

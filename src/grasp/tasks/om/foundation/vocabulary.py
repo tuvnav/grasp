@@ -108,11 +108,10 @@ UNIVERSE = "?entity ?anyPredicate ?anyObject"
 ALL = "all"
 
 
-# Default partitions of the profile (stage b1) by kind: membership patterns over
+# Default partitions of the profile (stage b) by kind: membership patterns over
 # ?entity, as alternatives, in order. Partitions are exclusive, an entity belongs
 # to the first that matches: an entity used as a predicate is a property even if
 # it is also typed as a class (punning), a class is not also an instance.
-# KIND_PARTITION_SPARQL above is the older, non-exclusive form of the anchor stage.
 _NOT_VOCABULARY_TYPE = ("FILTER(isIRI(?type) && !STRSTARTS(STR(?type), STR(owl:)) && !STRSTARTS(STR(?type), STR(rdfs:)) "
                         "&& !STRSTARTS(STR(?type), STR(rdf:)) && !STRSTARTS(STR(?type), STR(skos:)))")
 

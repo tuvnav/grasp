@@ -21,7 +21,9 @@ from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
 from grasp.tasks.om.tasks.anchor_task import OMAnchorTask
 from grasp.tasks.om.tasks.candidate_task import OMCandidateTask
+from grasp.tasks.om.tasks.cross_kg_competition_task import CrossKgCompetitionTask
 from grasp.tasks.om.tasks.profile_tasks import PROFILE_TASKS
+from grasp.tasks.om.tasks.search_verify_task import SearchVerifyTask
 
 
 # official tasks supported by GRASP, excluding exploration
@@ -36,11 +38,14 @@ class Task(StrEnum):
     OM_ANCHORS = "om-anchors"
     OM_CANDIDATES = "om-candidates"
     OM_VERIFY = "om-verify"
+    OM_SEARCH_VERIFY = "om-search-verify"
     OM_PROFILE_SPACE = "om-profile-space"
     OM_PROFILE_PARTITIONS = "om-profile-partitions"
     OM_PROFILE_ROLES = "om-profile-roles"
     OM_PROFILE_GROUPS = "om-profile-groups"
     OM_PROFILE_GROUP = "om-profile-group"
+    OM_PROFILE_REVISION = "om-profile-revision"
+    OM_CROSS_KG_COMPETITION = "om-cross-kg-competition"
 
 
 _REGISTRY: dict[str, type[GraspTask]] = {
@@ -61,7 +66,9 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         OMAnchorTask,
         OMCandidateTask,
         OMVerifyTask,
+        SearchVerifyTask,
         *PROFILE_TASKS,
+        CrossKgCompetitionTask,
         ShapesSetupTask,
     ]
 }

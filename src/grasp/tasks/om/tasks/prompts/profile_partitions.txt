@@ -1,4 +1,4 @@
-Your stage: b1. partitions.
+Your stage: b. partitions.
 
 Partitions are the hard boundaries between kinds of entities in this knowledge graph: kinds whose entities are fundamentally different, e.g. in an OWL ontology classes, properties and individuals, in a thesaurus concepts, in Wikidata items and properties. They are exclusive: in their order, an entity belongs to the first partition whose membership pattern matches. Judge them from this knowledge graph alone, not from the task: groups of entities that matter for the task (e.g. starships among the instances, image pages to exclude) are defined in a later stage, and may overlap.
 

@@ -164,7 +164,10 @@ class StrategyResult[H: Hub]:
     # keys/texts with too many entity pairs to pair them
     # (a list of KeyHub, VectorHub or NeighbourHub)
     hubs: Sequence[H]  # make Pyright happy: list not covariant
-    # 1.0: side compared whole population; None: large KG
+    # key strategy: per side the word sets of all values compared (the
+    # competition set, not only the population), to tell head anchors from
+    # specific ones; None: another strategy
+    value_wordsets: dict[Side, frozenset[frozenset[str]]] | None = None
 
 
 class TriedRun(BaseModel):
@@ -237,12 +240,15 @@ class EnsembleEvaluation:
 
 class Stratum(BaseModel):
     """
-    The pairs of one Venn cell: found by exactly these run families.
+    The pairs of one Venn cell: found by exactly these run families; label: a
+    further division of the cell (anchors: e.g. head or specific), empty if none.
     """
     families: frozenset[str]
     pairs: list[tuple[IRI, IRI]]
+    label: str = ""
 
     @property
     def name(self) -> str:
-        return "+".join(sorted(self.families))
+        cell = "+".join(sorted(self.families))
+        return f"{cell}/{self.label}" if self.label else cell
 

@@ -1,4 +1,4 @@
-Your stage: d. one group.
+Your stage: e. one group.
 
 The roles of the group are derived from the roles of the whole knowledge graph: elements the group does not use are dropped. They are shown with their coverage in the group, together with the predicates of the group that have no role, and statistics on the local names of its IRIs.
 

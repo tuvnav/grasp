@@ -12,14 +12,16 @@ Order (select_<...>_candidates):
        selection.mutual
 """
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import math
 import random
 
-from grasp.tasks.om.data_models.candidate_generators import Selection
+from grasp.tasks.om.data_models.anchors import Anchor, AnchorMerge, AnchorSpecificity
+from grasp.tasks.om.data_models.candidate_generators import Generator, KeyStrategy, Selection
 from grasp.tasks.om.data_models.candidate_selection import CandidateRankIndex, EnsembleEvaluation, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, StrategyResult, StrategySignals, Stratum, VennIndex
-from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates
-from grasp.tasks.om.data_models.verification import FocusEntity, JudgingUnit
+from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates, KeyCandidate, KeyEntityPair
+from grasp.tasks.om.data_models.verification import CandidateSignal, FocusEntity, JudgingUnit, ListedCandidate
+from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
 
@@ -596,8 +598,27 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
     layers_by_entity = merged_candidates.pareto_layers_by_entity
     cell_of = families_by_pair(merged_candidates.venn_index)
 
+    family_by_run = {run.run_id: run.family or run.run_id for run in merged_candidates.run_ensemble.runs}
+
+    def listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
+        """The candidates in list order, with their Pareto layer and the best rank per family."""
+        ranks_by_candidate = merged_candidates.candidate_rank_index.get((side, entity), {})
+        listed = []
+        for layer_number, layer in enumerate(layers_by_entity[(side, entity)], start=1):
+            for candidate in flatten_layers([layer]):
+                best_rank_by_family: dict[str, int] = {}
+                for run_id, rank in ranks_by_candidate.get(candidate, {}).items():
+                    family = family_by_run.get(run_id, run_id)
+                    best_rank_by_family[family] = min(rank, best_rank_by_family.get(family, rank))
+                listed.append(ListedCandidate(
+                    entity=candidate, pareto_layer=layer_number,
+                    signals=[CandidateSignal(family=family, rank=rank)
+                             for family, rank in sorted(best_rank_by_family.items())],
+                    ))
+        return listed
+
     def focus_entity(side: Side, entity: IRI) -> FocusEntity:
-        return FocusEntity(side=side, entity=entity, candidates=flatten_layers(layers_by_entity[(side, entity)]))
+        return FocusEntity(side=side, entity=entity, candidates=listed_candidates(side, entity))
 
     def cell_name(side: Side, entity: IRI, candidate: IRI) -> str:
         return "+".join(sorted(cell_of.get(to_entity_pair(side, entity, candidate), frozenset())))
@@ -620,3 +641,152 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
                     f"mutual/{cell_name(side, entity, best)}"
                     ))
     return units
+
+
+# --- anchors: the unique pairs of key runs ------------------------------------------
+
+# roles whose values are names: only their anchors are head or specific
+NAME_ROLES = frozenset({"names", "synonyms"})
+
+
+def lexical_information_content(extensions: int, num_wordsets: int) -> float:
+    """Seco et al. (2004): 1 - log(extensions + 1) / log(N); 1: no other word set extends it."""
+    if num_wordsets <= 1:
+        return 1.0
+    return 1 - math.log(extensions + 1) / math.log(num_wordsets)
+
+
+def extension_counter(wordsets: frozenset[frozenset[str]]) -> Callable[[frozenset[str]], int]:
+    """Counts the word sets that properly extend a given one ({paper} by {poster, paper})."""
+    wordsets_by_word: dict[str, set[frozenset[str]]] = defaultdict(set)
+    for wordset in wordsets:
+        for word in wordset:
+            wordsets_by_word[word].add(wordset)
+
+    def count(wordset: frozenset[str]) -> int:
+        if not wordset or any(word not in wordsets_by_word for word in wordset):
+            return 0
+        containing = set.intersection(*(wordsets_by_word[word] for word in wordset))
+        return sum(len(other) > len(wordset) for other in containing)
+
+    return count
+
+
+def compares_names(generator: Generator) -> bool:
+    """The key strategy compares names (roles names, synonyms) on both sides."""
+    strategy = generator.strategy
+    if not isinstance(strategy, KeyStrategy):
+        return False
+    return all(
+        isinstance(source := strategy.values.by_side(side), list) and set(source) <= NAME_ROLES
+        for side in SIDES
+        )
+
+
+def anchor_wordset(entity_pair: KeyEntityPair, level: NormalizationLevel) -> frozenset[str]:
+    """The word set of an anchor's name: the largest among the values behind its key on that level."""
+    rows = [row for match in entity_pair.matches if match.level == level
+            for row in (*match.source_rows, *match.target_rows)]
+    return max((frozenset(words(row.raw_projection_value)) for row in rows), key=len, default=frozenset())
+
+
+def unique_key_candidates(result: StrategyResult) -> dict[tuple[IRI, IRI], KeyCandidate]:
+    """The unique pairs of a key run (the anchor rule), with the source entity's candidate."""
+    pairs: dict[tuple[IRI, IRI], KeyCandidate] = {}
+    for (side, entity), selected in result.selected.items():
+        if side != Side.SOURCE or selected.unique_candidate is None:
+            continue
+        candidate = next(candidate for candidate in selected.collected.candidates
+                         if candidate.candidate_entity == selected.unique_candidate)
+        if isinstance(candidate, KeyCandidate):
+            pairs[(entity, selected.unique_candidate)] = candidate
+    return pairs
+
+
+type RunAnchor = tuple[str, NormalizationLevel, AnchorSpecificity, float | None]  # family, level, specificity, IC
+
+
+def run_anchors(family: str, generator: Generator, result: StrategyResult) -> dict[tuple[IRI, IRI], RunAnchor]:
+    """The anchors of one key run with their level, specificity and information content."""
+    counters = None
+    if compares_names(generator) and result.value_wordsets is not None:
+        counters = {side: (extension_counter(result.value_wordsets[side]), len(result.value_wordsets[side]))
+                    for side in SIDES}
+    anchors: dict[tuple[IRI, IRI], RunAnchor] = {}
+    for pair, candidate in unique_key_candidates(result).items():
+        level = candidate.finest_unique_level or candidate.entity_pair.finest_normalization_level()
+        if counters is None:
+            anchors[pair] = (family, level, AnchorSpecificity.NOT_APPLICABLE, None)
+            continue
+        wordset = anchor_wordset(candidate.entity_pair, level)
+        extensions = {side: counters[side][0](wordset) for side in SIDES}
+        specificity = AnchorSpecificity.HEAD if any(extensions.values()) else AnchorSpecificity.SPECIFIC
+        information_content = min(lexical_information_content(extensions[side], counters[side][1]) for side in SIDES)
+        anchors[pair] = (family, level, specificity, information_content)
+    return anchors
+
+
+def merge_run_anchors(pair: tuple[IRI, IRI], found: list[RunAnchor]) -> Anchor:
+    """One anchor from the runs that found it: the finest level; head if one run
+    sees a head, specific if one sees it specific, else not applicable."""
+    specificities = {specificity for _, _, specificity, _ in found}
+    information_contents = [ic for _, _, _, ic in found if ic is not None]
+    if AnchorSpecificity.HEAD in specificities:
+        specificity = AnchorSpecificity.HEAD
+    elif AnchorSpecificity.SPECIFIC in specificities:
+        specificity = AnchorSpecificity.SPECIFIC
+    else:
+        specificity = AnchorSpecificity.NOT_APPLICABLE
+    return Anchor(
+        source_entity=pair[0], target_entity=pair[1],
+        families=frozenset(family for family, _, _, _ in found),
+        level=min((level for _, level, _, _ in found), key=normalization_level_order),
+        specificity=specificity,
+        information_content=min(information_contents) if information_contents else None,
+    )
+
+
+def merge_anchors(run_ensemble: RunEnsemble, runs: dict[str, tuple[Generator, StrategyResult]]) -> AnchorMerge:
+    """
+    The anchors of an ensemble of key runs: the unique pairs of every run,
+    merged; pairs whose entity has another partner in another run are conflicts.
+    """
+    family_by_run = {run.run_id: run.family or run.run_id for run in run_ensemble.runs}
+    found: dict[tuple[IRI, IRI], list[RunAnchor]] = defaultdict(list)
+    for run_id in run_ensemble.run_ids():
+        generator, result = runs[run_id]
+        for pair, run_anchor in run_anchors(family_by_run[run_id], generator, result).items():
+            found[pair].append(run_anchor)
+
+    partners: dict[EntityKey, set[IRI]] = defaultdict(set)
+    for source_entity, target_entity in found:
+        partners[(Side.SOURCE, source_entity)].add(target_entity)
+        partners[(Side.TARGET, target_entity)].add(source_entity)
+
+    anchors, conflicts = [], []
+    for pair, run_anchors_of_pair in sorted(found.items()):
+        if len(partners[(Side.SOURCE, pair[0])]) > 1 or len(partners[(Side.TARGET, pair[1])]) > 1:
+            conflicts.append((*pair, frozenset(family for family, _, _, _ in run_anchors_of_pair)))
+        else:
+            anchors.append(merge_run_anchors(pair, run_anchors_of_pair))
+    return AnchorMerge(anchors=anchors, conflicts=conflicts)
+
+
+def anchor_stratum_label(anchor: Anchor) -> str:
+    """head or specific (names only), and extended for a coarse level; empty: neither."""
+    parts = [] if anchor.specificity == AnchorSpecificity.NOT_APPLICABLE else [anchor.specificity.value]
+    if anchor.extended:
+        parts.append("extended")
+    return "-".join(parts)
+
+
+def anchor_strata(anchor_merge: AnchorMerge) -> list[Stratum]:
+    """The anchors in certification strata: by the families that found them, and
+    by head/specific and extended."""
+    pairs_by_stratum: dict[tuple[frozenset[str], str], list[tuple[IRI, IRI]]] = defaultdict(list)
+    for anchor in anchor_merge.anchors:
+        pairs_by_stratum[(anchor.families, anchor_stratum_label(anchor))].append(anchor.pair)
+    return [
+        Stratum(families=families, pairs=sorted(pairs), label=label)
+        for (families, label), pairs in sorted(pairs_by_stratum.items(), key=lambda item: (sorted(item[0][0]), item[0][1]))
+        ]

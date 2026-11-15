@@ -210,8 +210,10 @@ def format_judged_kgs(
         managers: list[KgManager],
         kg_notes: dict[str, list[str]] | None,
         ) -> str:
-    """Source and target KG for the one-shot prompt: name, description and the
-    KG's notes (structural notes), without endpoint, indices or prefixes."""
+    """
+    Source and target KG for the one-shot prompt: name, description and the
+    KG's notes (structural notes), without endpoint, indices or prefixes.
+    """
     parts = []
     for role, kg in (("source", verify_input.source_kg), ("target", verify_input.target_kg)):
         manager, _ = find_manager(managers, kg)
@@ -241,14 +243,13 @@ def run_one_shot(
     # the model must call a verdict function, there is no second step
     config = config.model_copy(update={"tool_choice": "required"})
     task = get_task(VERIFY_TASK, kg_managers, config)
+    # setup first: the system information depends on the input (competitors, mode)
+    user_message = task.setup(verify_input.model_dump(mode="json"))
     system = (
         task.system_information() + "\n\n"
         + format_judged_kgs(verify_input, kg_managers, kg_notes)
         )
-    messages = [
-        Message.system(system),
-        Message.user(task.setup(verify_input.model_dump(mode="json")))
-        ]
+    messages = [Message.system(system), Message.user(user_message)]
 
     error = None
     try:
@@ -377,8 +378,10 @@ def certify_strata(
         stop_rule_for_size: StopRuleForSize,
         num_max_errors_in_a_row: int = 3,
         ) -> list[StratumCertification]:
-    """The strata certified one after the other, largest first (independent:
-    each has its own order); the order only makes logs easier to read."""
+    """
+    The strata certified one after the other, largest first (independent:
+    each has its own order); the order only makes logs easier to read.
+    """
     strata = sorted(strata, key=lambda stratum: -len(stratum.pairs))
     return [
         certify_stratum(
@@ -478,7 +481,7 @@ def certify(
     """
     build_verify_input = verify_input_builder(
         alignment_state,
-        competitor_index if judge_variant.competitors else None
+        competitor_index if judge_variant.competitors else None,
         )
     certified_strata = certify_strata(
         strata,

@@ -6,7 +6,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from grasp.tasks.om.data_models.anchors import AnchorRecord
+from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
@@ -32,9 +32,9 @@ class VerifyInput(BaseModel):
     target_kg: str
     source_profile: KgProfile
     target_profile: KgProfile
-    source_iri: IRI          # das zu prüfende Paar
+    source_iri: IRI
     target_iri: IRI
-    # vom Aufrufer gewählt; leer = ohne Konkurrenten
+    agentic: bool = False
     competitors: dict[Side, list[IRI]] = {}
 
 
@@ -144,13 +144,33 @@ class CertificationResult(BaseModel):
 # acceptance sampling); its stratum is only kept for the evaluation.
 
 
+class CandidateSignal(BaseModel):
+    """The evidence of one run family for a candidate: its best rank among the
+    family's runs (1 = the first tie group)."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    family: str
+    rank: int
+
+
+class ListedCandidate(BaseModel):
+    """A candidate of a focus entity's list, with the signals that ranked it."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    entity: IRI
+    pareto_layer: int  # 1: no other candidate ranks better in every run
+    signals: list[CandidateSignal] = []
+
+
 class FocusEntity(BaseModel):
     """An entity a judge has to find the partner(s) of, with its candidates."""
     model_config = ConfigDict(extra="forbid", frozen=True)
     side: Side
     entity: IRI
     # the cut Pareto list in rank order; empty: a bare search
-    candidates: list[IRI] = []
+    candidates: list[ListedCandidate] = []
+
+    @property
+    def candidate_entities(self) -> list[IRI]:
+        return [candidate.entity for candidate in self.candidates]
 
 
 class JudgingUnit(BaseModel):
@@ -181,7 +201,8 @@ class CandidateJudgeVariant(BaseModel):
     # clusters of similar entities (the orchestration still knows the focus)
     presentation: Literal["focused", "clusters"] = "focused"
     show_signals: bool = True      # the signals that ranked the candidates
-    fixed_order: bool = True       # rank order; False: shuffled per unit
+    # pareto: the candidates in rank order; random: shuffled per unit (seeded by the unit)
+    candidate_order: Literal["pareto", "random"] = "pareto"
     max_steps: int = 20
 
     @property
@@ -189,7 +210,7 @@ class CandidateJudgeVariant(BaseModel):
         return "+".join([
             self.presentation,
             "signals" if self.show_signals else "no_signals",
-            "ranked" if self.fixed_order else "shuffled",
+            "ranked" if self.candidate_order == "pareto" else "shuffled",
             ])
 
 
@@ -208,13 +229,29 @@ class UnitJudgment(BaseModel):
     error: str | None = None               # the run failed
 
 
+class SearchVerifyInput(BaseModel):
+    """The input of om-search-verify: the unit to judge, how it is shown, and
+    the alignment state (the KGs' profiles, the decisions so far)."""
+    model_config = ConfigDict(extra="forbid")
+    alignment_state: AlignmentState
+    unit: JudgingUnit
+    variant: CandidateJudgeVariant = CandidateJudgeVariant()
+
+
+class SearchVerifyResult(BaseModel):
+    """The output of om-search-verify; the orchestration makes the UnitJudgment of it."""
+    model_config = ConfigDict(extra="forbid")
+    equivalences: list[tuple[IRI, IRI]]  # set by the judge, also outside the lists
+    unsure: list[EntityKey] = []         # entities the judge marked unsure at finish
+    finished: bool                       # the judge called finish
+    rationale: str = ""
+
 
 # --- recall estimation ------------------------------------------------------------
 # A stratified random sample of the source entities without a partner is
 # searched by the judge without candidate lists; the share with a partner found
 # per stratum, weighted with the stratum sizes, estimates the missed
 # equivalences.
-
 # strata of the unmatched source entities, assigned in this order
 RECALL_STRATA = ("neighbours", "excluded", "rest")
 

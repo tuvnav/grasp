@@ -8,7 +8,6 @@ from grasp.tasks.om.data_models.candidate_generators import WitnessWeighting
 from grasp.tasks.om.data_models.equivalence import (  # noqa: F401  (ExistingEquivalences, build_existing_equivalences_index: re-exported)
     Equivalence, ExistingEquivalences, build_existing_equivalences_index,
 )
-from grasp.tasks.om.data_models.relations import EQUIVALENCE
 from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, EntityPair, KeyCandidate, KeyEntityPair, KeyMatch, KeyHub, NeighbourCandidate,
     NeighbourEntityPair, NeighbourHub, NeighbourMatch, VectorCandidate, VectorEntityPair, VectorHub, VectorMatch,
@@ -551,14 +550,14 @@ def entity_pairs_to_candidates[P: EntityPair](
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         build_candidate: Callable[[P, Side], Candidate],
-        witnesses_by_entity: "ExistingEquivalences | None" = None,
+        existing_equivalences: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     For each entity: the candidates and the summarized other counterparts in its
     population, on both sides, for any strategy. population_group_names: the
     names of the groups of each side's population, resolved (no REST). Each pair
     is seen from both sides. An entity that already has an equivalence
-    (witnesses_by_entity: the equivalences found so far) gets no candidates.
+    (existing_equivalences: the equivalences found so far) gets no candidates.
     Seen from an entity in its population without an equivalence, the other
     entity is
     - not counted at all if an entity has no partition (uncategorized),
@@ -571,7 +570,7 @@ def entity_pairs_to_candidates[P: EntityPair](
       rank key of the pair).
     Pairs with both entities outside their population are left out.
     """
-    matched_entities = {side: set(witnesses_by_entity[side]) if witnesses_by_entity else set()
+    matched_entities = {side: set(existing_equivalences[side]) if existing_equivalences else set()
                         for side in SIDES}
     candidates_by_entity: dict[tuple[Side, IRI], EntityCandidates] = {}
 
@@ -609,21 +608,23 @@ def key_entity_pairs_to_candidates(
         entity_pairs: EntityPairIndex[KeyEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
-        witnesses_by_entity: "ExistingEquivalences | None" = None,
+        existing_exquivalences: "ExistingEquivalences | None" = None,
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     entity_pairs_to_candidates for the key strategy: 
     the key candidates need
     the competing counterparts of all pairs per level.
     """
-    counterparts = competing_counterparts_by_level(alignment_state, entity_pairs, partition_names_by_entity)
+    counterparts = competing_counterparts_by_level(
+        alignment_state, entity_pairs, partition_names_by_entity
+        )
     return entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
         partition_names_by_entity,
         build_candidate=lambda entity_pair, side: build_key_candidate(
             entity_pair, side, counterparts
             ),
-        witnesses_by_entity=witnesses_by_entity,
+        existing_equivalences=existing_exquivalences,
     )
 
 

@@ -1,647 +1,531 @@
+"""
+The anchor stage (om-anchors): the LLM tries key strategies and selects those
+whose anchors are run in full later and certified. An anchor is a pair that a
+key strategy finds unique: the two entities share a key that no other
+competing entity of either KG shares on that or a finer normalization level
+(the anchor rule, Selection.unique). Only key strategies: names, codes and
+cross-references in a shared code system give anchors; similarity measures
+(vectors, embeddings) give candidates, not anchors (their mutual nearest
+neighbours are often related, not equivalent).
+
+Built on the candidate stage (candidate_task.py): the same generators (with a
+fixed selection), runs, state and full runs; only the functions for the LLM,
+their texts and the merge of the runs are the stage's own. The anchors of an
+ensemble are merged (kg_operations/candidate_selection.py: merge_anchors):
+pairs whose entity has another partner in another run are conflicts; the rest
+form the certification strata, by the run families that found them, head or
+specific (the words of a name extended by another name of a KG) and extended
+(unique only on a coarse normalization level).
+"""
 import random
-from collections import Counter
-from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import StrEnum, auto
 from typing import Any, Callable
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
-from grasp.configs import GraspConfig
 from grasp.manager import KgManager
-from grasp.model.base import Message
+from grasp.model import Message
 from grasp.tasks.base import GraspTask
+from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.anchors import (
-    AnchorConflict,
-    AnchorRecord,
+    Anchor,
+    AnchorMerge,
+    AnchorSpecificity,
     AnchorStageResult,
-    KeyAnchor,
-    KeyAnchorParams,
-    SelectedRun,
-    TryKeyAnchorResult,
 )
-from grasp.tasks.om.foundation.configuration import (
-    configured_namespaces,
-    load_task_instructions,
+from grasp.tasks.om.data_models.candidate_generators import (
+    CandidateStrategyType,
+    Generator,
+    KeyStrategy,
+    Selection,
 )
-from grasp.tasks.om.foundation.types import IRI, SIDES
-from grasp.tasks.om.foundation.vocabulary import UNCATEGORIZED
-from grasp.tasks.om.kg_operations.anchor_key_retrieval import (
-    determine_entity_space,
-    namespace_counts,
-    retrieve_key_rows,
+from grasp.tasks.om.data_models.candidate_selection import (
+    ParetoIndex,
+    RunEnsemble,
+    StrategyResult,
+    Stratum,
+    TriedRun,
 )
-from grasp.tasks.om.kg_operations.key_comparison import key_anchors, stratum
-from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
-from grasp.tasks.om.tasks.task_input import resolve_managers
+from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
+from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.tasks.om.foundation.types import IRI, SIDES, Side
+from grasp.tasks.om.kg_operations.candidate_selection import (
+    anchor_strata,
+    merge_anchors,
+    merge_runs,
+)
+from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
+from grasp.tasks.om.tasks.candidate_task import (
+    CANDIDATE_BUDGET_PER_ENTITY,
+    GENERATOR_SCHEMA,
+    MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
+    MAX_ENTITY_PAIRS_PER_BUCKET,
+    CandidateTaskState,
+    format_hubs,
+    format_share,
+    format_start_message,
+    prefetch_shown_entities,
+    reselect_result,
+    retrieve_partition_names,
+    run_strategy,
+)
+from grasp.tasks.om.tasks.prompting import (
+    Outline,
+    add_equivalence_condition,
+    format_outline,
+    load_prompt,
+)
+from grasp.tasks.om.tasks.task_input import resolve_alignment_state, resolve_managers
 from grasp.utils import FunctionCallException, format_section
 
-# TODO: Move this to central place
-# example anchors per stratum in the LLM view of a result
-NUM_EXAMPLES = 5
-# examples per kind of difference in the comparison with another result
-NUM_DIFF_EXAMPLES = 3
+# the selection of every anchor run: the unique candidate only (the anchor rule)
+ANCHOR_SELECTION = Selection(top_k=1, unique=True)
+# the selection for the competitors that certification may show with an anchor
+COMPETITOR_SELECTION = Selection(top_k=5)
 
-
-@dataclass
-class AnchorTaskState:
-    source: KgManager
-    target: KgManager
-    # run id -> parameters and result of a tried strategy; "run-0" is the default
-    runs: dict[str, tuple[KeyAnchorParams, TryKeyAnchorResult]] = field(default_factory=dict)
-    # set by finish: [(run id, selected group labels)]
-    selection: list[tuple[str, list[str]]] | None = None
-    rationale: str | None = None
-    # per side: IRI prefixes of the entities to align; all runs are restricted to them
-    entity_space: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    # per side: entities per namespace in the default run, before the restriction
-    namespace_count: dict[str, Counter[str]] = field(default_factory=dict)
-    # set by finish: the selected anchors merged into Venn cells, and conflicts
-    merged: "MergedSelection | None" = None
-
-    def add_run(self, params: KeyAnchorParams, result: TryKeyAnchorResult) -> str:
-        run_id = f"run-{len(self.runs)}"
-        self.runs[run_id] = (params, result)
-        return run_id
-
-
-def run_key_anchors(
-        manager_source: KgManager,
-        manager_target: KgManager,
-        params: KeyAnchorParams,
-        source_space: tuple[str, ...] | None = None,
-        target_space: tuple[str, ...] | None = None,
-        ) -> TryKeyAnchorResult:
-    """Computes the key anchors; used directly by the pipeline (default run)."""
-    source_rows = retrieve_key_rows(manager_source, params.source, source_space)
-    target_rows = retrieve_key_rows(manager_target, params.target, target_space)
-    return key_anchors(source_rows, target_rows, params.extended, params.pairing)
-
-
-def format_entity_space(state: AnchorTaskState) -> str:
-    lines = ["Entity space (only these entities are aligned, in all strategies):"]
-    for side in SIDES:
-        manager: KgManager = getattr(state, side)
-        space = state.entity_space[side]
-        counts = ", ".join(
-            f"{ns}: {n}" + (" (included)" if ns.startswith(space) or any(p.startswith(ns) for p in space) else " (excluded)")
-            for ns, n in state.namespace_count[side].most_common()
-        )
-        lines.append(f"  {side} {manager.kg}: {', '.join(space)}; entities per namespace: {counts}")
-    return "\n".join(lines)
-
-
-def diff_results(
-        reference: TryKeyAnchorResult,
-        result: TryKeyAnchorResult,
-        ) -> tuple[list, list, list, list, list]:
-    """Pairs kept, new, with a changed partner, lost with an entity no longer
-    compared, and lost although both entities are still compared."""
-    old = {(a.source_iri, a.target_iri): a for a in reference.anchors}
-    new = {(a.source_iri, a.target_iri): a for a in result.anchors}
-    old_by_src = {a.source_iri: a for a in old.values()}
-    old_by_tgt = {a.target_iri: a for a in old.values()}
-
-    kept = [new[p] for p in new.keys() & old.keys()]
-    added, changed = [], []
-    replaced: set[tuple[str, str]] = set()
-    for pair in sorted(new.keys() - old.keys()):
-        before = old_by_src.get(pair[0]) or old_by_tgt.get(pair[1])
-        if before is None:
-            added.append(new[pair])
-        else:
-            changed.append((before, new[pair]))
-            replaced.add((before.source_iri, before.target_iri))
-    lost_gone, lost_present = [], []
-    for pair in sorted(old.keys() - new.keys() - replaced):
-        if pair[0] in result.source_entities and pair[1] in result.target_entities:
-            lost_present.append(old[pair])
-        else:
-            lost_gone.append(old[pair])
-    return kept, added, changed, lost_gone, lost_present
-
-
-def format_diff(ref_id: str, reference: TryKeyAnchorResult, result: TryKeyAnchorResult, state: AnchorTaskState) -> str:
-    kept, added, changed, lost_gone, lost_present = diff_results(reference, result)
-    lines = [
-        f"Compared to {ref_id}: {len(kept)} anchors kept, {len(added)} new, {len(changed)} with "
-        f"another partner, {len(lost_gone) + len(lost_present)} lost ({len(lost_gone)} because an "
-        f"entity is no longer compared, {len(lost_present)} although both entities are still "
-        f"compared, e.g. through new collisions or ambiguities)"
-    ]
-    rng = random.Random(0)
-
-    def sample(items: list) -> list:
-        return rng.sample(items, min(NUM_DIFF_EXAMPLES, len(items)))
-
-    for name, items in [("new", added), ("lost, entity no longer compared", lost_gone),
-                        ("lost, entities still compared", lost_present)]:
-        if items:
-            lines.append(f"  examples {name}:")
-            lines.extend(f"    {format_anchor(a, state)}" for a in sample(items))
-    if changed:
-        lines.append(f"  examples with another partner ({ref_id} -> this result):")
-        lines.extend(
-            f"    {format_anchor(before, state)}  ->  {format_anchor(after, state)}"
-            for before, after in sample(changed)
-        )
-    return "\n".join(lines)
-
-
-def format_anchor(anchor: KeyAnchor, state: AnchorTaskState) -> str:
-    text = (
-        f"{state.source.format_iri(anchor.source_iri)} \"{anchor.source_key}\" = "
-        f"{state.target.format_iri(anchor.target_iri)} \"{anchor.target_key}\""
-    )
-    if anchor.head:
-        text += f" (information content {anchor.information_content:.2f})"
-    return text
-
-
-def format_key_anchor_result(run_id: str, result: TryKeyAnchorResult, state: AnchorTaskState) -> str:
-    """LLM view of a result: statistics per partition group and a few example
-    anchors per stratum; the full anchor lists stay in the task state."""
-    lines = [f"Result {run_id}:"]
-    by_stratum: dict[tuple[str, str], list[KeyAnchor]] = {}
-    for anchor in result.anchors:
-        by_stratum.setdefault(stratum(anchor), []).append(anchor)
-
-    for group, s in result.group_statistics.items():
-        lines.append(
-            f"Group {group.label}: {s.n_source} source / {s.n_target} target entities, "
-            f"{s.anchors} anchors (specific {s.specific}, head {s.head}, extended {s.extended}), "
-            f"anchor rate {s.anchor_rate:.2f}, token overlap {s.token_overlap:.2f}"
-        )
-        for level, ls in s.levels.items():
-            lines.append(
-                f"  level {level}: {ls.new_anchors} new anchors, new internal collisions "
-                f"{ls.new_collisions_source} source / {ls.new_collisions_target} target, "
-                f"ambiguous {ls.ambiguous_source} source / {ls.ambiguous_target} target"
-            )
-        for (label, name), anchors in by_stratum.items():
-            if label != group.label:
-                continue
-            # fixed seed: the same result always shows the same examples
-            examples = random.Random(0).sample(anchors, min(NUM_EXAMPLES, len(anchors)))
-            lines.append(f"  examples {name} ({len(anchors)} anchors):")
-            lines.extend(f"    {format_anchor(a, state)}" for a in examples)
-
-    if not result.group_statistics:
-        lines.append("No partition groups with entities on both sides.")
-    for name, partitions in [
-        ("Unpaired source partitions", result.unpaired_source),
-        ("Unpaired target partitions", result.unpaired_target),
-        ("Pairing names unknown source partitions", result.missing_source),
-        ("Pairing names unknown target partitions", result.missing_target),
-    ]:
-        if partitions:
-            lines.append(f"{name}: {', '.join(partitions)}")
-    return "\n".join(lines)
+NUM_EXAMPLE_ANCHORS = 5      # anchors shown per kind in a result
+NUM_AMBIGUOUS_EXAMPLES = 3   # entities with a key match but no anchor shown in a result
+NUM_SHOWN_COUNTERPARTS = 3   # tied counterparts shown per ambiguous entity
+MAX_SHOWN_ANCHORS = 20
+NUM_CONFLICT_EXAMPLES = 5
 
 
 class AnchorFunctionName(StrEnum):
-    TRY_KEY = "try_key_strategy"
-    FINISH = "finish"
+    TRY_ANCHOR_STRATEGY = auto()
+    SHOW_ANCHORS = auto()
+    EVALUATE_ANCHOR_ENSEMBLE = auto()
+    FINISH = auto()
 
 
-func_reg = FunctionRegistry()
+class AnchorListKind(StrEnum):
+    RANDOM = auto()
+    HEAD = auto()        # head anchors, lowest information content first
+    EXTENDED = auto()    # unique only on a coarse normalization level
+    AMBIGUOUS = auto()   # entities with a key match but no anchor
 
 
-@func_reg.register(AnchorFunctionName.TRY_KEY)
-def try_key_strategy(state: AnchorTaskState, fn_args: dict) -> str:
-    """Tool wrapper: LLM arguments (JSON) -> KeyAnchorParams -> result -> text."""
-    # display option, not part of the strategy
-    fn_args = dict(fn_args)
-    ref_id = fn_args.pop("compare_to", None) or "run-0"
-    if ref_id not in state.runs:
-        raise FunctionCallException(f"Unknown result {ref_id}, must be one of {list(state.runs)}")
+# ---------------------------------------------------------------- runs
+
+def anchor_generator(fn_args: dict) -> Generator:
+    """A key generator with the anchor selection from the arguments of try_anchor_strategy."""
     try:
-        params = KeyAnchorParams.model_validate(fn_args)
-    except ValidationError as e:
-        raise FunctionCallException(f"Invalid arguments for {AnchorFunctionName.TRY_KEY}:\n{e}") from e
-    try:
-        result = run_key_anchors(
-            state.source, state.target, params,
-            state.entity_space.get("source"), state.entity_space.get("target"),
+        return Generator(
+            population=Population(**(fn_args.get("population") or {})),
+            strategy=KeyStrategy(
+                values=ValuePatterns(**(fn_args.get("values") or {})),
+                normalization=Normalization(**(fn_args.get("normalization") or {})),
+                ),
+            selection=ANCHOR_SELECTION,
+            )
+    except ValidationError as error:
+        raise FunctionCallException(f"Invalid anchor strategy: {error}") from error
+
+
+def run_anchors_of(state: CandidateTaskState, run_id: str) -> list[Anchor]:
+    """The anchors of one tried run (a merge of the run alone: no conflicts)."""
+    return merge_anchors(RunEnsemble.model_validate({"runs": [{"run_id": run_id}]}), state.runs).anchors
+
+
+def run_full_anchor_ensemble(
+        managers: dict[Side, KgManager],
+        alignment_state: AlignmentState,
+        run_ensemble: RunEnsemble,
+        generators_by_run: dict[str, Generator],
+        ) -> tuple[AnchorMerge, list[Stratum], ParetoIndex]:
+    """
+    The full runs of the selected ensemble: the merged anchors, their
+    certification strata, and the competitors of every entity (the uncut
+    Pareto layers of the runs with a wider selection) for judges that see them.
+    """
+    partition_names_by_entity = retrieve_partition_names(managers, alignment_state)
+    runs = {
+        run_id: (generators_by_run[run_id], run_strategy(
+            managers, alignment_state, generators_by_run[run_id], partition_names_by_entity,
+            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY],
+            ))
+        for run_id in run_ensemble.run_ids()
+        }
+    anchor_merge = merge_anchors(run_ensemble, runs)
+    competitor_merge = merge_runs(
+        run_ensemble,
+        {run_id: reselect_result(result, COMPETITOR_SELECTION) for run_id, (_, result) in runs.items()},
+        CANDIDATE_BUDGET_PER_ENTITY,
+        MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
         )
-    except (ValueError, RuntimeError) as e:
-        # e.g. overlapping partition groups, SPARQL syntax errors (GRASP's parser),
-        # conflicting prefixes (merge_prefixes) or errors of the endpoint
-        raise FunctionCallException(str(e)) from e
-    run_id = state.add_run(params, result)
-    return (
-        format_key_anchor_result(run_id, result, state)
-        + "\n\n" + format_diff(ref_id, state.runs[ref_id][1], result, state)
-    )
+    return anchor_merge, anchor_strata(anchor_merge), competitor_merge.uncut_pareto_layers_by_entity
 
 
-class Selection(BaseModel):
-    run_id: str
-    groups: list[str] | None = None
+# ---------------------------------------------------------------- formatting
+
+def format_anchor(anchor: Anchor, entity_displays: dict[Side, EntityDisplay]) -> str:
+    text = (f"{entity_displays[Side.SOURCE].show(anchor.source_entity)} = "
+            f"{entity_displays[Side.TARGET].show(anchor.target_entity)} [{anchor.level}")
+    if anchor.specificity == AnchorSpecificity.HEAD and anchor.information_content is not None:
+        text += f", head, information content {anchor.information_content:.2f}"
+    return text + "]"
 
 
-class FinishArgs(BaseModel):
-    selected: list[Selection]
-    rationale: str
+def prefetch_anchors(anchors: list[Anchor], entity_displays: dict[Side, EntityDisplay]) -> None:
+    entity_displays[Side.SOURCE].prefetch(anchor.source_entity for anchor in anchors)
+    entity_displays[Side.TARGET].prefetch(anchor.target_entity for anchor in anchors)
 
 
-# stratum types from least to most risky; a pair in several results gets the riskiest
-STRATUM_RISK = {"standard_specific": 0, "standard_head": 1, "extended": 2}
+def ambiguous_entities(result: StrategyResult) -> list[IRI]:
+    """Source entities with a key match but no anchor, in a fixed order."""
+    return sorted(
+        entity for (side, entity), selected in result.selected.items()
+        if side == Side.SOURCE and selected.collected.candidates and selected.unique_candidate is None
+        )
 
 
-@dataclass
-class VennCell:
-    """Venn cell of the selection: the pairs found by exactly the same selected
-    results and groups, split by their riskiest stratum type. Cells are disjoint
-    and are the strata of the certification."""
-    memberships: tuple[tuple[str, str], ...]  # (run id, group label), sorted
-    stratum_type: str
-    anchors: list[tuple[str, KeyAnchor]] = field(default_factory=list)  # (run id, anchor)
-
-    @property
-    def label(self) -> str:
-        runs = " & ".join(f"{run_id} {group}" for run_id, group in self.memberships)
-        return f"[{runs}] {self.stratum_type}"
-
-
-@dataclass
-class MergedSelection:
-    cells: list[VennCell]
-    # pairs whose source or target has another partner in the selection;
-    # (pair, run ids) - no anchors, to be checked individually
-    conflicts: list[tuple[tuple[str, str], list[str]]]
+def format_ambiguous(result: StrategyResult, entity: IRI, entity_displays: dict[Side, EntityDisplay]) -> str:
+    """An entity without an anchor, with the counterparts on its best rank."""
+    collected = result.collected[(Side.SOURCE, entity)]
+    best = sorted((c for c in collected.candidates if c.rank_key == collected.top_rank),
+                  key=lambda candidate: candidate.candidate_entity)
+    counterparts = ", ".join(entity_displays[Side.TARGET].show(c.candidate_entity)
+                             for c in best[:NUM_SHOWN_COUNTERPARTS])
+    more = len(best) - NUM_SHOWN_COUNTERPARTS
+    rivals = collected.num_rivals_outside_by_rank.get(collected.top_rank, 0)
+    text = f"{entity_displays[Side.SOURCE].show(entity)}: {counterparts}" + (f", {more} more" if more > 0 else "")
+    if rivals:
+        text += f"; {rivals} competing entities outside the population share the key"
+    return text
 
 
-# TODO: 1:1-restriction is to strict
-def merge_selection(state: AnchorTaskState, selection: list[tuple[str, list[str]]]) -> MergedSelection:
-    """Splits the selected anchors into Venn cells by the results that found them,
-    instead of prioritizing one result over another. Pairs in 1:1 conflict across
-    the selection become no anchors."""
-    found: dict[tuple[str, str], list[tuple[str, KeyAnchor]]] = {}
-    for run_id, groups in selection:
-        for anchor in state.runs[run_id][1].anchors:
-            if anchor.group.label in groups:
-                found.setdefault((anchor.source_iri, anchor.target_iri), []).append((run_id, anchor))
-
-    partners_src: dict[str, set[str]] = {}
-    partners_tgt: dict[str, set[str]] = {}
-    for s, t in found:
-        partners_src.setdefault(s, set()).add(t)
-        partners_tgt.setdefault(t, set()).add(s)
-
-    cells: dict[tuple, VennCell] = {}
-    conflicts = []
-    for pair, hits in sorted(found.items()):
-        if len(partners_src[pair[0]]) > 1 or len(partners_tgt[pair[1]]) > 1:
-            conflicts.append((pair, sorted({run_id for run_id, _ in hits})))
-            continue
-        memberships = tuple(sorted({(run_id, a.group.label) for run_id, a in hits}))
-        stratum_type = max((stratum(a)[1] for _, a in hits), key=STRATUM_RISK.__getitem__)
-        key = (memberships, stratum_type)
-        cells.setdefault(key, VennCell(memberships, stratum_type)).anchors.extend(hits[:1])
-    return MergedSelection(
-        cells=sorted(cells.values(), key=lambda c: (-len(c.anchors), c.label)),
-        conflicts=conflicts,
-    )
+def prefetch_ambiguous(result: StrategyResult, entities: list[IRI], entity_displays: dict[Side, EntityDisplay]) -> None:
+    entity_displays[Side.SOURCE].prefetch(entities)
+    entity_displays[Side.TARGET].prefetch(
+        candidate.candidate_entity for entity in entities
+        for candidate in result.collected[(Side.SOURCE, entity)].candidates
+        )
 
 
-@func_reg.register(AnchorFunctionName.FINISH)
-def finish(state: AnchorTaskState, fn_args: dict) -> str:
-    try:
-        args = FinishArgs.model_validate(fn_args)
-    except ValidationError as e:
-        raise FunctionCallException(f"Invalid arguments for {AnchorFunctionName.FINISH}:\n{e}") from e
+def anchors_of_kind(anchors: list[Anchor], kind: AnchorListKind, seed: int = 0) -> list[Anchor]:
+    match kind:
+        case AnchorListKind.HEAD:
+            heads = [a for a in anchors if a.specificity == AnchorSpecificity.HEAD]
+            return sorted(heads, key=lambda a: (a.information_content or 0.0, a.pair))
+        case AnchorListKind.EXTENDED:
+            return [a for a in anchors if a.extended]
+        case _:
+            shuffled = list(anchors)
+            random.Random(seed).shuffle(shuffled)
+            return shuffled
 
-    selection = []
-    for sel in args.selected:
-        if sel.run_id not in state.runs:
-            raise FunctionCallException(
-                f"Unknown result {sel.run_id}, must be one of {list(state.runs)}"
-            )
-        _, result = state.runs[sel.run_id]
-        labels = [g.label for g in result.group_statistics]
-        groups = labels if sel.groups is None else sel.groups
-        unknown = [g for g in groups if g not in labels]
-        if unknown:
-            raise FunctionCallException(
-                f"Result {sel.run_id} has no groups {unknown}, its groups are {labels}"
-            )
-        selection.append((sel.run_id, groups))
 
-    # the default result is always verified with all its groups, in addition to
-    # the selection; a result selected several times: union of its groups
-    merged_groups: dict[str, list[str]] = {}
-    if "run-0" in state.runs:
-        merged_groups["run-0"] = [g.label for g in state.runs["run-0"][1].group_statistics]
-    for run_id, groups in selection:
-        merged_groups.setdefault(run_id, [])
-        merged_groups[run_id] += [g for g in groups if g not in merged_groups[run_id]]
-    selection = list(merged_groups.items())
+def format_anchor_result(
+        run_id: str,
+        result: StrategyResult,
+        anchors: list[Anchor],
+        entity_displays: dict[Side, EntityDisplay],
+        ) -> str:
+    sizes = {side: result.signals[side].population_size for side in SIDES}
+    with_match = {side: sum(1 for (s, _), selected in result.selected.items()
+                            if s == side and selected.collected.candidates) for side in SIDES}
+    specificity_counts = {specificity: sum(a.specificity == specificity for a in anchors)
+                          for specificity in AnchorSpecificity}
+    sampled_side = result.signals[Side.SOURCE].sampled_side
+    random_examples = anchors_of_kind(anchors, AnchorListKind.RANDOM)[:NUM_EXAMPLE_ANCHORS]
+    head_examples = anchors_of_kind(anchors, AnchorListKind.HEAD)[:NUM_EXAMPLE_ANCHORS]
+    ambiguous = ambiguous_entities(result)[:NUM_AMBIGUOUS_EXAMPLES]
+    prefetch_anchors(random_examples + head_examples, entity_displays)
+    prefetch_ambiguous(result, ambiguous, entity_displays)
+    prefetch_shown_entities([], result.hubs, entity_displays)
 
-    state.selection = selection
-    state.rationale = args.rationale
-    state.merged = merge_selection(state, selection)
-
-    n = sum(len(c.anchors) for c in state.merged.cells)
-    lines = [
-        f"Selected {n} anchors from {len(selection)} result(s), in {len(state.merged.cells)} "
-        f"disjoint strata (by the results that found them and the riskiest stratum type), "
-        f"each verified separately:"
+    outline: Outline = [
+        (f"{len(anchors)} anchors", [
+            f"{side}: {format_share(len(anchors) / sizes[side]) if sizes[side] else '-'} of {sizes[side]} entities"
+            + (" (a sample)" if sampled_side == side else "")
+            + f"; {with_match[side]} share a key with a competing entity, "
+              f"{with_match[side] - len(anchors)} of them without an anchor (ambiguous)"
+            for side in SIDES
+        ]),
+        f"names: {specificity_counts[AnchorSpecificity.SPECIFIC]} specific, "
+        f"{specificity_counts[AnchorSpecificity.HEAD]} head; "
+        f"{specificity_counts[AnchorSpecificity.NOT_APPLICABLE]} other values (not names); "
+        f"{sum(a.extended for a in anchors)} unique only on a coarse level (extended)",
     ]
-    lines.extend(f"  {c.label}: {len(c.anchors)}" for c in state.merged.cells)
-    if state.merged.conflicts:
-        lines.append(
-            f"{len(state.merged.conflicts)} pairs are in conflict across the results (an entity "
-            f"with different partners); they are not used as anchors but checked individually."
-        )
-    return "\n".join(lines)
+    if result.existing_equivalences:
+        outline.append(f"existing equivalences found again as key matches: "
+                       f"{len(result.confirmed_equivalences)} of {result.existing_equivalences}")
+    outline += format_hubs(result.hubs, entity_displays)
+    if random_examples:
+        outline.append(("examples", [format_anchor(a, entity_displays) for a in random_examples]))
+    if head_examples:
+        outline.append(("head anchors with the lowest information content",
+                        [format_anchor(a, entity_displays) for a in head_examples]))
+    if ambiguous:
+        outline.append(("entities without an anchor: the counterparts sharing their best key",
+                        [format_ambiguous(result, entity, entity_displays) for entity in ambiguous]))
+    return format_outline([(f"Result {run_id}", outline)])
 
 
-def system_information(config: GraspConfig) -> str:
-    info = load_prompt("anchor_task.txt")
-    info = add_equivalence_condition(info, config)
-    task_instructions = load_task_instructions(config.task_kwargs.get("om", {}))
-    if task_instructions:
-        info += "\n\n" + format_section("Task-specific instructions", task_instructions)
-    return info
+def format_anchor_merge(anchor_merge: AnchorMerge, entity_displays: dict[Side, EntityDisplay]) -> Outline:
+    strata = anchor_strata(anchor_merge)
+    conflict_examples = anchor_merge.conflicts[:NUM_CONFLICT_EXAMPLES]
+    entity_displays[Side.SOURCE].prefetch(source for source, _, _ in conflict_examples)
+    entity_displays[Side.TARGET].prefetch(target for _, target, _ in conflict_examples)
+    outline: Outline = [
+        f"{len(anchor_merge.anchors)} anchors",
+        ("strata (families that found the anchors / head, specific, extended): anchors",
+         [f"{stratum.name}: {len(stratum.pairs)}" for stratum in sorted(strata, key=lambda s: -len(s.pairs))]),
+        (f"{len(anchor_merge.conflicts)} conflicts: an entity has different partners in different runs "
+         "(left out of the anchors)",
+         [f"{entity_displays[Side.SOURCE].show(source)} = {entity_displays[Side.TARGET].show(target)} "
+          f"({'+'.join(sorted(families))})" for source, target, families in conflict_examples]),
+    ]
+    return outline
 
 
-SIDE_QUERIES_SCHEMA = {
+# ---------------------------------------------------------------- functions for the LLM
+
+STRATEGY_PROPERTIES = GENERATOR_SCHEMA["properties"]["strategy"]["properties"]
+ANCHOR_STRATEGY_PARAMETERS = {
     "type": "object",
     "properties": {
-        "key": {
-            "type": "string",
-            "description": (
-                "SPARQL SELECT query with the variables ?entity and ?key, optionally ?role. "
-                "Each row gives one key of an entity. ?role \"secondary\" marks keys that only "
-                "block ambiguous anchors but do not create anchors themselves (e.g. synonyms); "
-                "rows without ?role are primary. Omit to use the default name keys: "
-                "rdfs:label and skos:prefLabel as primary keys, skos:altLabel and oboInOwl "
-                "synonyms as secondary keys, the local name of the IRI as primary key for "
-                "entities without a label."
-            ),
+        "population": {
+            **GENERATOR_SCHEMA["properties"]["population"],
+            "description": "The entities that get anchors. Entities that already have an equivalence get "
+                           "none. Uniqueness is checked against all competing entities of both knowledge "
+                           "graphs, not only the population. Default: rest on both sides.",
         },
-        "scope": {
-            "type": ["string", "null"],
-            "description": (
-                "SPARQL SELECT query with the variable ?entity. Only these entities take part. "
-                "Omit or null to use all entities of the key query."
-            ),
-        },
-        "partition": {
-            "type": ["string", "null"],
-            "description": (
-                "SPARQL SELECT query with the variables ?entity and ?partition (a literal or an "
-                "IRI). The anchor rule runs separately per partition group, and anchors are "
-                "certified per partition group. An entity may be in several partitions; "
-                "entities without a partition become \"uncategorized\", which is only compared "
-                "if a pairing group names it. Omit to use the default partitions by kind: "
-                "class, property, instance, concept (SKOS), from declared types and usage. "
-                "null puts all entities into one partition \"all\"."
-            ),
-        },
+        "values": {**STRATEGY_PROPERTIES["values"],
+                   "description": "The values compared: a key shared by two entities. Default: names and synonyms."},
+        "normalization": {**STRATEGY_PROPERTIES["normalization"],
+                          "description": "How values are normalized before they are compared; an anchor "
+                                         "records the finest level on which it is unique."},
     },
     "additionalProperties": False,
 }
 
+ANCHOR_ENSEMBLE_SCHEMA = {
+    "type": "array",
+    "description": "Tried runs whose anchors are merged. Runs of one family count as one kind of evidence "
+                   "when the anchors are grouped for certification (e.g. two runs on names in different groups).",
+    "items": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string"},
+            "family": {"type": "string", "description": "Name of the kind of evidence; default: the run id."},
+        },
+        "required": ["run_id"],
+        "additionalProperties": False,
+    },
+}
 
-def anchor_functions() -> list[dict]:
+ANCHOR_FINISH_DEFINITION = {
+    "name": AnchorFunctionName.FINISH,
+    "description": "Ends the task: selects the tried runs whose anchors are computed in full later (on all "
+                   "entities, not a sample) and certified. Call it exactly once, at the end.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "runs": {**ANCHOR_ENSEMBLE_SCHEMA,
+                     "description": "The selected runs; empty if no strategy gives reliable anchors. "
+                     + ANCHOR_ENSEMBLE_SCHEMA["description"]},
+            "rationale": {"type": "string",
+                          "description": "Which keys for which groups, why, and which anchors are risky."},
+        },
+        "required": ["runs", "rationale"],
+        "additionalProperties": False,
+    },
+}
+
+
+def anchor_function_definitions() -> list[dict]:
     return [
         {
-            "name": AnchorFunctionName.TRY_KEY,
+            "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
             "description": (
-                "Computes key anchors between the source and the target ontology and returns "
-                "statistics per partition group. An anchor is a pair of entities that share a "
-                "primary key which is unique among all keys of its partition group on both "
-                "sides; an entity with unique keys towards several partners gets no anchor. "
-                "Keys are compared on increasingly coarse normalization levels (raw; case; "
-                "word boundaries such as CamelCase, _ and -; spaceless). Each anchor gets the "
-                "finest level on which it is unique; coarser levels only add entities without "
-                "an anchor. Anchors whose key is extended by another name of the same "
-                "ontology (e.g. 'paper' vs. 'poster paper') are counted as head anchors, "
-                "since their scope may differ between the ontologies. Call without arguments "
-                "for the default strategy (name keys, partitions by kind)."
+                "Tries a key strategy in a trial run (on a sample of a large knowledge graph) and shows its "
+                "anchors: pairs whose key no other competing entity of either knowledge graph shares. It "
+                "shows how many entities get an anchor, how many share a key but stay ambiguous, how many "
+                "anchors are head anchors (their name is part of longer names, e.g. 'paper' of 'poster "
+                "paper', so they may name a broader or narrower thing), the existing equivalences found "
+                "again, keys shared by too many entities, and examples. The run gets an id (run-N)."
             ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {
-                        **SIDE_QUERIES_SCHEMA,
-                        "description": "Queries for the source ontology. Omitted fields use the defaults.",
-                    },
-                    "target": {
-                        **SIDE_QUERIES_SCHEMA,
-                        "description": (
-                            "Queries for the target ontology. Starts as a copy of the source "
-                            "queries; only the fields given here replace them. Omit if the same "
-                            "queries apply to both ontologies."
-                        ),
-                    },
-                    "compare_to": {
-                        "type": "string",
-                        "description": (
-                            "Id of a tried result to compare the new result with (kept, new, "
-                            "changed and lost anchors). Default run-0, the default strategy."
-                        ),
-                    },
-                    "extended": {
-                        "type": "boolean",
-                        "description": (
-                            "Also compare keys on the extended normalization levels: word order, "
-                            "singular/plural and verb inflection. Their anchors form a separate "
-                            "stratum. Default false."
-                        ),
-                    },
-                    "pairing": {
-                        "type": ["array", "null"],
-                        "description": (
-                            "Which source partitions are compared with which target partitions. "
-                            "Uniqueness holds within the union of the partitions of each side of "
-                            "a group. Each partition may occur in at most one group per side. "
-                            "Omit to compare each partition with the partition of the same name, "
-                            "e.g. use [{\"source\": [\"class\"], \"target\": [\"class\", "
-                            "\"concept\"]}] to compare OWL classes with SKOS concepts."
-                        ),
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "source": {"type": "array", "items": {"type": "string"}},
-                                "target": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["source", "target"],
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-            # optional nested fields are not possible in strict mode
-            "strict": False,
+            "parameters": ANCHOR_STRATEGY_PARAMETERS,
         },
         {
-            "name": AnchorFunctionName.FINISH,
-            "description": (
-                "Submit your decision and end the task. The default result run-0 is always used "
-                "with all its groups; select the results you want to use in addition (by their "
-                "id) and optionally only some of their partition groups. The selected anchors are split into "
-                "disjoint strata by the results that found them (e.g. pairs found by two "
-                "results, pairs found by only one of them) and by stratum type; each stratum is "
-                "verified separately by sampling. Pairs whose entities have different partners "
-                "in different results are not used as anchors. Select nothing if no anchor set "
-                "is plausibly mostly correct, apart from run-0."
-            ),
+            "name": AnchorFunctionName.SHOW_ANCHORS,
+            "description": "Shows more anchors of a run, or source entities without an anchor.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "selected": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "run_id": {"type": "string", "description": "Id of a tried result, e.g. run-0"},
-                                "groups": {
-                                    "type": ["array", "null"],
-                                    "items": {"type": "string"},
-                                    "description": (
-                                        "Labels of the partition groups to use, as shown in the "
-                                        "result (e.g. \"class <-> class\"); omit or null for all groups"
-                                    ),
-                                },
-                            },
-                            "required": ["run_id"],
-                            "additionalProperties": False,
-                        },
-                    },
-                    "rationale": {
-                        "type": "string",
-                        "description": (
-                            "Short explanation of the selection: which keys and partitions, why, "
-                            "and which anchors you expect to be risky."
-                        ),
-                    },
+                    "run_id": {"type": "string"},
+                    "kind": {"type": "string", "enum": [str(kind) for kind in AnchorListKind],
+                             "description": "random (default), head (lowest information content first), "
+                                            "extended (unique only on a coarse level) or ambiguous (entities "
+                                            "that share a key with several entities)."},
+                    "n": {"type": "integer", "minimum": 1, "maximum": MAX_SHOWN_ANCHORS},
                 },
-                "required": ["selected", "rationale"],
+                "required": ["run_id"],
                 "additionalProperties": False,
             },
-            "strict": False,
         },
+        {
+            "name": AnchorFunctionName.EVALUATE_ANCHOR_ENSEMBLE,
+            "description": "Merges the anchors of tried runs and shows the merge: the anchors per stratum "
+                           "of the certification and the conflicts between the runs (an entity with "
+                           "different partners in different runs).",
+            "parameters": {"type": "object", "properties": {"runs": ANCHOR_ENSEMBLE_SCHEMA},
+                           "required": ["runs"], "additionalProperties": False},
+        },
+        ANCHOR_FINISH_DEFINITION,
     ]
 
 
+def parse_anchor_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
+    try:
+        run_ensemble = RunEnsemble.model_validate({"runs": runs})
+    except ValidationError as error:
+        raise FunctionCallException(f"Invalid runs: {error}") from error
+    unknown_run_ids = [run_id for run_id in run_ensemble.run_ids() if run_id not in state.runs]
+    if unknown_run_ids:
+        raise FunctionCallException(f"Unknown run ids {unknown_run_ids}; existing runs: {list(state.runs)}")
+    return run_ensemble
+
+
+def try_anchor_strategy(state: CandidateTaskState, fn_args: dict) -> str:
+    generator = anchor_generator(fn_args)
+    try:
+        result = run_strategy(
+            state.kg_managers, state.alignment_state, generator, state.partition_names_by_entity,
+            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY], trial=True,
+            )
+    except (ValueError, NotImplementedError) as error:
+        raise FunctionCallException(str(error)) from error
+    run_id = state.add_run(generator, result)
+    return format_anchor_result(run_id, result, run_anchors_of(state, run_id), state.entity_displays)
+
+
+def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
+    run_id = fn_args.get("run_id")
+    if run_id not in state.runs:
+        raise FunctionCallException(f"Unknown run_id {run_id!r}; existing runs: {list(state.runs)}")
+    try:
+        kind = AnchorListKind(fn_args.get("kind") or AnchorListKind.RANDOM)
+    except ValueError as error:
+        raise FunctionCallException(f"Invalid kind: {error}") from error
+    n = min(int(fn_args.get("n") or NUM_EXAMPLE_ANCHORS), MAX_SHOWN_ANCHORS)
+    _, result = state.runs[run_id]
+    if kind == AnchorListKind.AMBIGUOUS:
+        entities = ambiguous_entities(result)
+        random.Random(0).shuffle(entities)
+        entities = entities[:n]
+        prefetch_ambiguous(result, entities, state.entity_displays)
+        lines: Outline = [format_ambiguous(result, entity, state.entity_displays) for entity in entities]
+    else:
+        anchors = anchors_of_kind(run_anchors_of(state, run_id), kind)[:n]
+        prefetch_anchors(anchors, state.entity_displays)
+        lines = [format_anchor(anchor, state.entity_displays) for anchor in anchors]
+    return format_outline([(f"{kind} of {run_id}", lines or ["none"])])
+
+
+def evaluate_anchor_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
+    run_ensemble = parse_anchor_ensemble(state, fn_args.get("runs"))
+    return format_outline([(
+        "Ensemble " + ", ".join(run_ensemble.run_ids()),
+        format_anchor_merge(merge_anchors(run_ensemble, state.runs), state.entity_displays),
+    )])
+
+
+def finish(state: CandidateTaskState, fn_args: dict) -> str:
+    runs = fn_args.get("runs")
+    rationale = fn_args.get("rationale")
+    if not isinstance(runs, list):
+        raise FunctionCallException("runs must be a list of runs (it may be empty)")
+    if not rationale:
+        raise FunctionCallException("A rationale is required")
+    state.run_ensemble = parse_anchor_ensemble(state, runs) if runs else None
+    state.rationale = rationale
+    state.finished = True
+    if state.run_ensemble is None:
+        return "Selected runs: none (no anchors)."
+    return "Selected runs: " + ", ".join(state.run_ensemble.run_ids()) + "."
+
+
+ANCHOR_FUNCTIONS: dict[str, Callable[[CandidateTaskState, dict], str]] = {
+    AnchorFunctionName.TRY_ANCHOR_STRATEGY: try_anchor_strategy,
+    AnchorFunctionName.SHOW_ANCHORS: show_anchors,
+    AnchorFunctionName.EVALUATE_ANCHOR_ENSEMBLE: evaluate_anchor_ensemble,
+    AnchorFunctionName.FINISH: finish,
+}
+
+
 class OMAnchorTask(GraspTask):
-    """First stage of the orchestrator: choose anchor strategies. Input: a dict
-    with source_kg and target_kg (names of the configured knowledge graphs); by
-    default the first configured KG is the source, the second the target."""
+    """
+    The anchor stage. Input: a dict with source_kg, target_kg (names of the
+    configured KGs; may be omitted with exactly two KGs) and alignment_state
+    (a serialized AlignmentState with the profiles and the equivalences so far).
+    """
     name = "om-anchors"
-    state: AnchorTaskState
+    state: CandidateTaskState
 
     def setup(self, input: Any) -> str:
-        source, target = resolve_managers(self, input)
-        self.state = state = AnchorTaskState(source=source, target=target)
-        params = KeyAnchorParams()
-        # default run: retrieve unrestricted once, to determine the entity space
-        rows = {
-            "source": list(retrieve_key_rows(source, params.source)),
-            "target": list(retrieve_key_rows(target, params.target)),
-        }
-        for side in SIDES:
-            # helper nodes the partition query does not cover would distort the counts
-            state.namespace_count[side] = namespace_counts(
-                r for r in rows[side] if r.partition != UNCATEGORIZED
-            )
-            state.entity_space[side] = determine_entity_space(
-                state.namespace_count[side],
-                configured_namespaces(self.config, getattr(state, side).kg, side),
-            )
-            rows[side] = [r for r in rows[side] if r.entity.startswith(state.entity_space[side])]
-        result = key_anchors(rows["source"], rows["target"], params.extended, params.pairing)
-        run_id = state.add_run(params, result)
-        return (
-            f"Source ontology: {source.kg}"
-            + (f" ({source.description})" if source.description else "")
-            + f"\nTarget ontology: {target.kg}"
-            + (f" ({target.description})" if target.description else "")
-            + "\n\n" + format_entity_space(state)
-            + "\n\nThe default strategy (name keys, partitions by kind) has already been run:\n\n"
-            + format_key_anchor_result(run_id, result, state)
+        source_manager, target_manager = resolve_managers(self, input)
+        kg_managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
+        alignment_state = resolve_alignment_state(input)
+        self.state = CandidateTaskState(
+            kg_managers=kg_managers,
+            alignment_state=alignment_state,
+            partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
+            entity_displays={
+                side: EntityDisplay.of_profile(kg_managers[side], alignment_state.get_kg_profile(side))
+                for side in SIDES
+            },
         )
+        return format_start_message(self.state) + "\n\nNo anchor strategy has been tried yet."
 
     def system_information(self) -> str:
-        return system_information(self.config)
+        info = add_equivalence_condition(load_prompt("anchor_task.txt"), self.config)
+        task_instructions = load_task_instructions(self.config)
+        if task_instructions:
+            info += "\n\n" + format_section("Task-specific instructions", task_instructions)
+        return info
 
     def rules(self) -> list[str]:
         return [
-            "Look at the default result and its examples first. Inspect the ontologies with "
-            "the SPARQL and search functions before you define your own key, scope or "
-            "partition queries.",
-            "Test every strategy you want to select with try_key_strategy; you can only "
-            "select results that you have tried.",
-            "You can execute multiple tool calls in one step. Prefer multiple tool calls "
-            "and sparql queries in one round over single tool calls per step.",
-            "Call finish exactly once, at the end.",
-            f"You have at most {self.config.max_steps} steps; one step is one response of yours, "
-            "with all tool calls in it. Use about a third of them to explore the ontologies, "
-            "then test your ideas with try_key_strategy and call finish well before the "
-            "limit. The default result run-0 is always used with all its groups; if you run "
-            "out of steps without calling finish, it is the only one.",
+            "Try every strategy you want to select with try_anchor_strategy; you can only select tried runs.",
+            "Look at the examples, head anchors and ambiguous entities with show_anchors before you judge "
+            "a strategy.",
+            "You can execute multiple tool calls in one step.",
+            f"You have at most {self.config.max_steps} steps; one step is one response of yours, with "
+            "all tool calls in it. Call finish exactly once, well before the limit.",
         ]
 
     def function_definitions(self) -> list[dict]:
-        return anchor_functions()
+        return anchor_function_definitions()
 
-    def output(self, messages: list[Message]) -> dict:
-        state: AnchorTaskState = self.state
-        finished = state.selection is not None
-        if not finished and "run-0" in state.runs:
-            # step limit reached without finish: fall back to the default result
-            groups = [g.label for g in state.runs["run-0"][1].group_statistics]
-            state.selection = [("run-0", groups)]
-            state.merged = merge_selection(state, state.selection)
-        selected = []
-        for run_id, groups in state.selection or []:
-            params, result = state.runs[run_id]
-            selected.append(
-                SelectedRun(
-                    run_id=run_id,
-                    groups=groups,
-                    params=params,
-                    statistics={
-                        g.label: {k: v for k, v in vars(s).items() if k != "levels"}
-                        for g, s in result.group_statistics.items() if g.label in groups
-                        }
-                )
-                )
-        merged = state.merged or MergedSelection([], [])
-        anchors = [
-            AnchorRecord(**a.model_dump(), stratum=cell.label, run_id=run_id)
-            for cell in merged.cells for run_id, a in cell.anchors
-        ]
-        return AnchorStageResult(
-            source_kg=state.source.kg,
-            target_kg=state.target.kg,
-            entity_space={side: list(state.entity_space.get(side, ())) for side in SIDES},
-            finished=finished,
-            fallback=None if finished else "default",
-            rationale=state.rationale,
-            runs_tried=len(state.runs) - 1,
-            selected=selected,
-            strata={cell.label: len(cell.anchors) for cell in merged.cells},
-            anchors=anchors,
-            conflicts=[
-                AnchorConflict(source_iri=IRI(s), target_iri=IRI(t), runs=runs) for (s, t), runs in merged.conflicts
-            ]
-        ).model_dump(mode="json")
+    def final_step_functions(self) -> list[dict] | None:
+        return [ANCHOR_FINISH_DEFINITION]
 
     def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
-        fn: Callable | None = func_reg.Registry.get(fn_name)
-        if fn is None:
+        function = ANCHOR_FUNCTIONS.get(fn_name)
+        if function is None:
             raise FunctionCallException(f"Unknown function {fn_name}")
-        return fn(self.state, fn_args)
+        return function(self.state, fn_args)
 
     def done(self, fn_name: str) -> bool:
-        return fn_name == AnchorFunctionName.FINISH and self.state.selection is not None
+        return fn_name == AnchorFunctionName.FINISH and self.state.finished
 
-    @property
-    def default_input_field(self) -> str | None:
-        return None
+    def output(self, messages: list[Message]) -> dict:
+        state = self.state
+        return AnchorStageResult(
+            source_kg=state.kg_managers[Side.SOURCE].kg,
+            target_kg=state.kg_managers[Side.TARGET].kg,
+            finished=state.finished,
+            rationale=state.rationale,
+            run_ensemble=state.run_ensemble,
+            runs={
+                run_id: TriedRun(
+                    generator=generator,
+                    signals=result.signals,
+                    confirmed_equivalences=len(result.confirmed_equivalences),
+                    existing_equivalences=result.existing_equivalences,
+                    num_hubs=len(result.hubs),
+                )
+                for run_id, (generator, result) in state.runs.items()
+            },
+        ).model_dump(mode="json")

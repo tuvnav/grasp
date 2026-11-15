@@ -4,20 +4,21 @@ Data model of the staged KG profile.
 Stages, each a GRASP task on one KG; each reads the profile of the stages
 before and adds to it:
     a.  space       entity space (namespaces of the entities to align)
-    b1. partitions  exclusive partitions: the hard boundaries between kinds of
+    b.  partitions  exclusive partitions: the hard boundaries between kinds of
                     entities, from the KG alone, and which partitions of the KG
                     do not compete with each other
     c.  roles       KG-wide roles: names, synonyms, ..., structure relations
-    b2. groups      overlapping groups of entities recognizable by their own
+    d.  groups      overlapping groups of entities recognizable by their own
                     features, with the task in view; a group may be excluded
                     from the alignment
-    d.  group       one small task per group: local name type and the group's
+    e.  group       one small task per group: local name type and the group's
                     deviations from the KG-wide roles
+    f.  revision    open flags resolved or dismissed, findings condensed
 
 The entities to align are those in at least one group and in no excluded group.
 Partitions and groups are independent: a group is defined by its own
-membership pattern, never by a partition (stage b2 starts with one group per
-partition, as a copy). Partitions are read only by stage b1, the roles stage
+membership pattern, never by a partition (stage d starts with one group per
+partition, as a copy). Partitions are read only by stage b, the roles stage
 (coverage per partition) and the competition (alignment_state), so
 they can be dropped without touching groups.
 
@@ -33,7 +34,7 @@ prompts (they replace the structural notes when these are missing). Later
 stages read them as unverified observations and report a contradiction as a
 flag instead of changing an earlier stage's result.
 """
-from enum import StrEnum
+from enum import StrEnum, auto
 from typing import Any, Iterable, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -51,6 +52,7 @@ class Stage(StrEnum):
     ROLES = "roles"
     GROUPS = "groups"
     GROUP = "group"
+    REVISION = "revision"
 
 
 STAGES = list(Stage)  # in pipeline order
@@ -128,7 +130,7 @@ assert set(Roles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the
 
 
 class Partition(BaseModel):
-    """A partition of stage b1. Partitions are exclusive: in their order, an
+    """A partition of stage b. Partitions are exclusive: in their order, an
     entity belongs to the first whose membership matches."""
     model_config = ConfigDict(extra="forbid")
     name: str
@@ -144,16 +146,16 @@ class WithinKgNonCompetingPartitionPair(BaseModel):
     partition_a: str
     partition_b: str
     reason: str = ""
-    set_by: str = "partitions"  # the stage that set it (stage b1, or a stage of the pair)
+    set_by: str = "partitions"  # the stage that set it (stage b, or a stage of the pair)
 
     def partitions(self) -> frozenset[str]:
         return frozenset((self.partition_a, self.partition_b))
 
 
 class GroupOrigin(StrEnum):
-    PARTITION = "partition"  # copy of a partition (the start of stage b2)
+    PARTITION = "partition"  # copy of a partition (the start of stage d)
     CLASS = "class"          # a large class (rdf:type) of a large KG
-    FORMED = "formed"        # formed in stage b2
+    FORMED = "formed"        # formed in stage d
 
 
 class GroupDefinition(BaseModel):
@@ -173,11 +175,11 @@ class GroupProfile(BaseModel):
     """A group of the profile: its definition and what the stages decided about it."""
     model_config = ConfigDict(extra="forbid")
     definition: GroupDefinition
-    # not aligned (e.g. image pages, helper nodes), set by stage b2; an entity in an
+    # not aligned (e.g. image pages, helper nodes), set by stage d; an entity in an
     # excluded group is not aligned even if it is in other groups
     excluded: bool = False
     exclusion_reason: str = ""
-    local_name_type: NameType | None = None  # set by stage d (or its default)
+    local_name_type: NameType | None = None  # set by stage e (or its default)
     added: Roles = Roles()    # group-specific; a relation overrides the KG-wide one of its name
     removed: Roles = Roles()  # used in the group, but uninformative there
 
@@ -190,16 +192,25 @@ class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     stage: Stage
     text: str
-    group: str | None = None  # the group (or in stage b1 the partition) it is about
+    group: str | None = None  # the group (or in stage b the partition) it is about
+
+
+class FlagStatus(StrEnum):
+    OPEN = auto()
+    RESOLVED = auto()
+    DISMISSED = auto()
 
 
 class Flag(BaseModel):
     """A later stage's objection to an earlier stage's result."""
     model_config = ConfigDict(extra="forbid")
-    stage: Stage        # stage that raises the flag
-    concerns: Stage     # stage whose result it questions
-    text: str
-    group: str | None = None
+    id: str
+    raised_by_stage: Stage        # stage that raises the flag
+    concerns_stage: Stage     # stage whose result it questions
+    content: str
+    concerns_group: str | None = None
+    status: FlagStatus = FlagStatus.OPEN
+    resolution_description: str | None = None
 
 
 def unknown_name_message(kind: str, name: str, existing_names: list[str]) -> str:

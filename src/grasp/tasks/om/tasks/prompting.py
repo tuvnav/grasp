@@ -35,7 +35,7 @@ def add_equivalence_condition(text: str, config: GraspConfig) -> str:
         "are treated as equivalent in the context of "
         "their usage."
     )
-    if load_task_instructions(config.task_kwargs.get("om", {})) is not None:
+    if load_task_instructions(config) is not None:
         injection += (
             " For more information about the usage of the ontologies "
             "and the alignment you assist with, see the section "

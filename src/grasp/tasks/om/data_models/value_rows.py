@@ -1,8 +1,7 @@
 """
 Values of entities as retrieved for comparison (kg_operations/value_retrieval.py),
-one row per value: the common input of the key strategy of the candidate stage
-and, after its migration, of the anchor rule (which still reads
-anchors.KeyEntityRow).
+one row per value: the input of the key, vector and neighbour strategies of the
+candidate and anchor stages.
 """
 from dataclasses import dataclass
 
@@ -16,7 +15,7 @@ class ValueRow:
     entity: IRI
     group_name: str             # group of the population the entity was retrieved for
     role_name: str              # role of the value: "names", "synonyms", ... or "own" (own pattern)
-    raw_projection_value: str   # normalized keys are derived in key_comparison
+    raw_projection_value: str   # normalized keys are derived in value_comparison
     value_language: str | None   # language tag of a literal, if any (multilingual tracks)
 
     @property

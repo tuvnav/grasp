@@ -1,5 +1,5 @@
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable, Optional
 
@@ -7,14 +7,11 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.tasks.om.data_models.anchors import AnchorRecord
 from grasp.tasks.om.data_models.verification import Verdict, VerdictOption, VerifyInput
 from grasp.tasks.om.foundation.configuration import (
-    get_om_task_config,
     load_task_instructions,
 )
 from grasp.tasks.om.foundation.types import IRI, Side
-from grasp.tasks.om.foundation.vocabulary import local_name, namespace_of
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition
@@ -26,15 +23,26 @@ from grasp.utils import FunctionCallException, format_section
 class VerifyState:
     source_kg: str
     target_kg: str
-    source_manager: KgManager
-    target_manager: KgManager
-    anchor: AnchorRecord
-    # how entities are shown, per side (the long view: the context of each entity)
+    kg_managers: dict[Side, KgManager]
+    source_iri: IRI
+    target_iri: IRI
     entity_displays: dict[Side, EntityDisplay]
+    agentic: bool
+    competitors_by_side: dict[Side, list[IRI]]
     verdict: Optional[Verdict] = None
-    # entities shown to the LLM (with competitors: the pair plus similar entities)
-    presented_source: list[IRI] = field(default_factory=list)
-    presented_target: list[IRI] = field(default_factory=list)
+
+    @property
+    def competitors(self) -> bool:
+        """Competitors on at least one side: the judge sees a group, not a pair."""
+        return any(self.competitors_by_side.get(side) for side in (Side.SOURCE, Side.TARGET))
+
+    @property
+    def presented_source(self) -> list[IRI]:
+        return [self.source_iri] + self.competitors_by_side.get(Side.SOURCE, [])
+
+    @property
+    def presented_target(self) -> list[IRI]:
+        return [self.target_iri] + self.competitors_by_side.get(Side.TARGET, [])
 
 
 class VerifyFunction(StrEnum):
@@ -48,63 +56,38 @@ class VerifyFunction(StrEnum):
 func_reg = FunctionRegistry()
 
 
-@func_reg.register(VerifyFunction.ACCEPT)
-def accept_anchor(state: VerifyState, fn_args: dict, known: set[str]) -> str:
-    anchor = state.anchor
+def judge_focus_pair(state: VerifyState, fn_args: dict, function_name: VerifyFunction,
+                     verdict: VerdictOption, judged_as: str) -> str:
+    """The verdict on the presented pair (accept, reject, unsure), with the
+    rationale; judged_as completes the confirmation for the model."""
     rationale = fn_args.get("rationale")
     if rationale is None:
-        raise FunctionCallException(
-            f"Argument 'rationale' required when calling '{VerifyFunction.ACCEPT}'"
-            )
+        raise FunctionCallException(f"Argument 'rationale' required when calling '{function_name}'")
     state.verdict = Verdict(
-        **anchor.model_dump(),
-        verdict=VerdictOption.ACCEPT,
-        rationale=rationale
+        source_iri=state.source_iri,
+        target_iri=state.target_iri,
+        verdict=verdict,
+        rationale=rationale,
     )
+    return f"You judged {state.source_iri} and {state.target_iri} {judged_as}."
 
-    return (
-        f"You judged {anchor.source_iri} and {anchor.target_iri} to be "
-        "truly equivalent in the context of the task."
-        )
+
+@func_reg.register(VerifyFunction.ACCEPT)
+def accept_anchor(state: VerifyState, fn_args: dict, known: set[str]) -> str:
+    return judge_focus_pair(state, fn_args, VerifyFunction.ACCEPT, VerdictOption.ACCEPT,
+                            "to be truly equivalent in the context of the task")
 
 
 @func_reg.register(VerifyFunction.REJECT)
 def reject_anchor(state: VerifyState, fn_args: dict, known: set[str]) -> str:
-    anchor = state.anchor
-    rationale = fn_args.get("rationale")
-    if rationale is None:
-        raise FunctionCallException(
-            f"Argument 'rationale' required when calling '{VerifyFunction.REJECT}'"
-            )
-    state.verdict = Verdict(
-        **anchor.model_dump(),
-        verdict=VerdictOption.REJECT,
-        rationale=rationale
-    )
-    return (
-        f"You judged {anchor.source_iri} and {anchor.target_iri} to be "
-        "not equivalent in the context of the task."
-        )
+    return judge_focus_pair(state, fn_args, VerifyFunction.REJECT, VerdictOption.REJECT,
+                            "to be not equivalent in the context of the task")
 
 
 @func_reg.register(VerifyFunction.UNSURE)
 def unsure_anchor(state: VerifyState, fn_args: dict, known: set[str]) -> str:
-    anchor = state.anchor
-    rationale = fn_args.get("rationale")
-    if rationale is None:
-        raise FunctionCallException(
-            f"Argument 'rationale' required when calling '{VerifyFunction.UNSURE}'"
-            )
-    state.verdict = Verdict(
-        **anchor.model_dump(),
-        verdict=VerdictOption.UNSURE,
-        rationale=rationale
-    )
-    return (
-        f"You confirmed you are unsure about {anchor.source_iri} "
-        f"and {anchor.target_iri} being equivalent in the context "
-        "of the task."
-        )
+    return judge_focus_pair(state, fn_args, VerifyFunction.UNSURE, VerdictOption.UNSURE,
+                            "as unsure: you cannot decide whether they are equivalent in the context of the task")
 
 
 @func_reg.register(VerifyFunction.SET_VERDICT)
@@ -122,7 +105,6 @@ def set_verdict(state: VerifyState, fn_args: dict, known: set[str]) -> str:
             f"Argument 'rationale' required when calling '{VerifyFunction.SET_VERDICT}'"
             )
     unsure = bool(fn_args.get("unsure", False))
-    anchor = state.anchor
 
     # all pairs must consist of presented entities; an entity may occur in several
     # pairs (entities can be equivalent within an ontology), frequent use of this
@@ -139,13 +121,21 @@ def set_verdict(state: VerifyState, fn_args: dict, known: set[str]) -> str:
             )
 
     anchor_accepted = any(
-        m["source"] == anchor.source_iri and m["target"] == anchor.target_iri for m in mappings
+        m["source"] == state.source_iri and m["target"] == state.target_iri for m in mappings
     )
     if unsure:
         verdict = VerdictOption.UNSURE
     else:
         verdict = VerdictOption.ACCEPT if anchor_accepted else VerdictOption.REJECT
-    state.verdict = Verdict(**anchor.model_dump(), verdict=verdict, rationale=rationale)
+    # all mappings among the presented entities, also those between competitors
+    # (by-products for later stages); unsure: the mappings are ignored
+    state.verdict = Verdict(
+        source_iri=state.source_iri,
+        target_iri=state.target_iri,
+        verdict=verdict,
+        rationale=rationale,
+        mappings=None if unsure else [(mapping["source"], mapping["target"]) for mapping in mappings],
+        )
 
     if unsure:
         return "You confirmed you are unsure which of the presented entities are equivalent."
@@ -163,11 +153,11 @@ def set_verdict(state: VerifyState, fn_args: dict, known: set[str]) -> str:
         return (
             f"You judged {
                 ", ".join(
-                    (mapping["source"] + " → " + mapping["target"]
+                    (mapping["source"] + " ↔ " + mapping["target"]
                      for mapping in mappings[:-1])
                 )
             } "
-            f"and {mappings[-1]["source"]} → {mappings[-1]["target"]} "
+            f"and {mappings[-1]["source"]} ↔ {mappings[-1]["target"]} "
             "to be truly equivalent in the context of the task."
             )
 
@@ -366,54 +356,29 @@ def input_instructions(
     return input
 
 
-def retrieve_competitors(
-        entity: IRI,
-        manager: KgManager,
-        k: int = 4,
-        entity_space: tuple[str, ...] | None = None,
-        ) -> list[IRI]:
-    """IRIs of up to k entities from the KG's entity index most similar to
-    `entity`, excluding the entity itself and entities outside the entity space
-    (default: the namespace of `entity`, which keeps out e.g. vocabulary
-    entities like oboInOwl:Synonym). Used to present the LLM with plausible,
-    confusable alternatives instead of just the pair."""
-    space = entity_space or (namespace_of(entity),)
-    label = manager.get_label(entity, "entities") or local_name(entity)
-    # over-fetch, since the filter may remove some alternatives
-    alternatives = manager.search_index("entities", query=label, k=3 * k + 1)
-    return [
-        IRI(alt.identifier) for alt in alternatives
-        if alt.identifier != entity and alt.identifier.startswith(space)
-    ][:k]
-
-
-def get_verify_task_config(config: GraspConfig) -> dict[str, Any]:
-    return get_om_task_config(config).get("om_verify", {})
-
-
 class OMVerifyTask(GraspTask):
     name = "om-verify"
     state: VerifyState
 
     def system_information(self) -> str:
-        task_kwargs = get_verify_task_config(self.config)
-        competitors = bool(task_kwargs.get("competitors", False))
-        agentic = task_kwargs.get("mode") == "agentic"
-
         prompt = (
             "You are an ontology matching assistant. "
             "The goal is 1:1 equivalences between the entities of "
             "a source and a target ontology."
         )
         prompt += "\n\n" + "\n\n".join(
-            system_prompt_completion(competitors, agentic, self.config)
+            system_prompt_completion(
+                self.state.competitors, self.state.agentic, self.config
+                )
             )
 
         prompt = add_equivalence_condition(prompt, self.config)
 
-        task_instructions = load_task_instructions(get_om_task_config(self.config))
+        task_instructions = load_task_instructions(self.config)
         if task_instructions:
-            prompt += "\n\n" + format_section("Task-specific instructions", task_instructions)
+            prompt += "\n\n" + format_section(
+                "Task-specific instructions", task_instructions
+                )
 
         return prompt
 
@@ -422,69 +387,50 @@ class OMVerifyTask(GraspTask):
         Input must be a serialized VerifyInput
         """
         try:
-            input_as_class = VerifyInput(**input)
+            verify_input = VerifyInput(**input)
         except Exception as e:
-            raise ValueError(f"Input must be a serialized VerifyInput object: {e}") from e
+            raise ValueError(
+                f"Input must be a serialized VerifyInput object: {e}"
+                ) from e
 
-        source_manager, target_manager = resolve_managers(self, input)
+        source_manager, target_manager = resolve_managers(
+            self,
+            source_kg=verify_input.source_kg,
+            target_kg=verify_input.target_kg
+            )
         self.state = VerifyState(
-            source_kg=input_as_class.source_kg,
-            target_kg=input_as_class.target_kg,
-            source_manager=source_manager,
-            target_manager=target_manager,
-            # the model itself, not model_dump(): the verdict functions need an AnchorRecord
-            anchor=input_as_class.anchor,
+            source_kg=verify_input.source_kg,
+            target_kg=verify_input.target_kg,
+            kg_managers={Side.SOURCE: source_manager, Side.TARGET: target_manager},
+            source_iri=verify_input.source_iri,
+            target_iri=verify_input.target_iri,
             entity_displays={
-                Side.SOURCE: EntityDisplay.of_profile(source_manager, input_as_class.source_profile, LONG_VIEW),
-                Side.TARGET: EntityDisplay.of_profile(target_manager, input_as_class.target_profile, LONG_VIEW),
+                Side.SOURCE: EntityDisplay.of_profile(source_manager, verify_input.source_profile, LONG_VIEW),
+                Side.TARGET: EntityDisplay.of_profile(target_manager, verify_input.target_profile, LONG_VIEW),
             },
+            agentic=verify_input.agentic,
+            competitors_by_side=verify_input.competitors
             )
 
-        task_kwargs = get_verify_task_config(self.config)
-        competitors = bool(task_kwargs.get("competitors", False))
-        k_competitors = int(task_kwargs.get("k_competitors", 4))
-        # entity space per KG name (pipeline parameter), else the entity's namespace
-        entity_spaces = get_om_task_config(self.config).get("entity_space", {})
+        src_iris = list(self.state.presented_source)
+        tgt_iris = list(self.state.presented_target)
 
-        src_iri = input_as_class.anchor.source_iri
-        tgt_iri = input_as_class.anchor.target_iri
+        rng = random.Random(f"{verify_input.source_iri}|{verify_input.target_iri}")
+        rng.shuffle(src_iris)
+        rng.shuffle(tgt_iris)
 
-        src_iris, tgt_iris = [src_iri], [tgt_iri]
-
-        if competitors:
-            comps_src = retrieve_competitors(
-                src_iri, self.state.source_manager, k_competitors,
-                tuple(entity_spaces.get(input_as_class.source_kg, ())) or None,
-                )
-            comps_tgt = retrieve_competitors(
-                tgt_iri, self.state.target_manager, k_competitors,
-                tuple(entity_spaces.get(input_as_class.target_kg, ())) or None,
-                )
-            src_iris.extend(comps_src)
-            tgt_iris.extend(comps_tgt)
-
-            rng = random.Random(f"{src_iri}|{tgt_iri}")
-            rng.shuffle(src_iris)
-            rng.shuffle(tgt_iris)
-
-        self.state.presented_source = src_iris
-        self.state.presented_target = tgt_iris
         return input_instructions(self.state, src_iris, tgt_iris)
 
     def rules(self) -> list[str]:
         return []
 
     def offered_functions(self) -> list[VerifyFunction]:
-        task_kwargs = get_verify_task_config(self.config)
-        agentic = task_kwargs.get("mode") == "agentic"
-        competitors = bool(task_kwargs.get("competitors", False))
-
-        if competitors:
+        if self.state.competitors:
             function_names = [VerifyFunction.SET_VERDICT]
         else:
             function_names = [VerifyFunction.ACCEPT, VerifyFunction.REJECT, VerifyFunction.UNSURE]
 
-        if agentic:
+        if self.state.agentic:
             function_names.append(VerifyFunction.STOP)
         return function_names
 
@@ -510,7 +456,12 @@ class OMVerifyTask(GraspTask):
             f"call {names} before you run out of steps."
         )
 
-    def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
+    def call_function(
+            self,
+            fn_name: str,
+            fn_args: dict,
+            known: set[str],
+            example_indices: dict | None) -> str:
         fn: Optional[Callable] = func_reg.Registry.get(fn_name)
         if fn is None or fn_name not in self.offered_functions():
             raise FunctionCallException(

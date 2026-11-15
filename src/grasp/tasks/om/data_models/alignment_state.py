@@ -23,14 +23,20 @@ the non-competing pairs of its profile; across the KGs, the non-competing pairs
 here (none at the start: every partition competes until a stage of the pair
 forbids it).
 """
+from collections import Counter
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 
 from grasp.tasks.om.data_models.equivalence import (
-    Equivalence, ExistingEquivalences, build_existing_equivalences_index,
+    Equivalence,
+    ExistingEquivalences,
+    build_existing_equivalences_index,
 )
-from grasp.tasks.om.data_models.profile import KgProfile, WithinKgNonCompetingPartitionPair
+from grasp.tasks.om.data_models.profile import (
+    KgProfile,
+    WithinKgNonCompetingPartitionPair,
+)
 from grasp.tasks.om.data_models.scope import Population
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
@@ -43,6 +49,14 @@ class CrossKgNonCompetingPartitionPair(BaseModel):
     target_partition: str
     reason: str
     set_by: str  # the stage that set it
+
+
+class CrossKgCompetitionOutput(BaseModel):
+    """Output of om-cross-kg-competition: the partitions of the two KGs that do not compete."""
+    model_config = ConfigDict(extra="forbid")
+    finished: bool
+    rationale: str | None = None
+    non_competing_pairs: list[CrossKgNonCompetingPartitionPair]
 
 
 class NonCompetingPartition(BaseModel):
@@ -86,8 +100,8 @@ class AlignmentState(BaseModel):
         for name, equivalences in (
                 ("equivalences", self.equivalences),
                 ("rejected_equivalences", self.rejected_equivalences)):
-            keys = [equivalence.key for equivalence in equivalences]
-            duplicates = sorted({key for key in keys if keys.count(key) > 1})
+            key_counts = Counter(equivalence.key for equivalence in equivalences)
+            duplicates = sorted(key for key, count in key_counts.items() if count > 1)
             if duplicates:
                 raise ValueError(f"equivalences more than once in {name}: {duplicates}")
         both = (
@@ -122,6 +136,16 @@ class AlignmentState(BaseModel):
             **self.model_dump(exclude={"equivalences", "rejected_equivalences"}),
             equivalences=equivalences,
             rejected_equivalences=rejected_equivalences,
+            )
+
+    def with_cross_kg_non_competing_pairs(
+            self,
+            non_competing_pairs: list[CrossKgNonCompetingPartitionPair]
+            ) -> "AlignmentState":
+        """A new state with these pairs across the KGs (checked against the partitions)."""
+        return type(self)(
+            **self.model_dump(exclude={"cross_kg_non_competing_pairs"}),
+            cross_kg_non_competing_pairs=non_competing_pairs,
             )
 
     @property

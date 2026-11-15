@@ -34,9 +34,9 @@ them).
 - **KG profile** (`tasks/profile_tasks.py`, stages a, b1, c, b2, d): statistics from
   `kg_operations/profile_statistics.py` over groupings (`kg_operations/grouping.py`),
   result `data_models/profile.py`.
-- **Anchor stage** (`tasks/anchor_task.py`): key rows from
-  `kg_operations/anchor_key_retrieval.py`, anchor rule in `kg_operations/key_comparison.py`,
-  models in `data_models/anchors.py`. To be migrated to groups and `ValueRow`.
+- **Anchor stage** (`tasks/anchor_task.py`): key strategies of the candidate stage with the
+  anchor selection (unique); merge, head/specific and strata in `kg_operations/candidate_selection.py`,
+  models in `data_models/anchors.py`.
 - **Candidate stage** (`tasks/candidate_task.py`, in progress): generators from
   `data_models/candidate_generators.py`, values from `kg_operations/value_retrieval.py`
   as `data_models/value_rows.py`, competition from `data_models/alignment_state.py`.
