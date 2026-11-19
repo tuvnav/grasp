@@ -1,6 +1,6 @@
 """
-Groupings: named membership patterns over ?entity, as exclusive partitions or
-overlapping groups, and the queries over their entities (?entity ?group) that
+Groupings: named membership patterns over ?s, as exclusive partitions or
+overlapping groups, and the queries over their entities (?s ?group) that
 every statistic and value retrieval builds on. In a large KG the members are
 the sampled entities (large_kg_sampling).
 """
@@ -14,23 +14,25 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     Partition,
 )
-from grasp.tasks.om.foundation.vocabulary import (
+from grasp.tasks.om.foundation.rdf_vocabulary import (
     KIND_ALTERNATIVES,
     UNCATEGORIZED,
     UNIVERSE,
     VOCABULARY_PROLOGUE,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import current_sample
-from grasp.tasks.om.sparql_access.execution import select_rows
-from grasp.tasks.om.sparql_access.query_building import (
-    literal,
-    prologue_of,
-    space_filter,
+from grasp.tasks.om.sparql_access.lookups import (
+    select_rows,
+    sparql_literal,
+    make_sparql_prologue,
+    sparql_filter_by_space,
     split_prologue,
     union_of,
     down_pushed_union,
+    as_batched_values_blocks,
+    values_table,
 )
-from grasp.tasks.om.sparql_access.values import values_table
+from grasp.tasks.om.foundation.types import IRI
 
 # kinds of the default partitions (stage b1), in order: the first match wins
 KINDS = tuple(KIND_ALTERNATIVES)
@@ -42,7 +44,7 @@ LARGE_KG_SKIPPED_ALTERNATIVES = {"instance": 2}
 
 @dataclass(frozen=True)
 class Grouping:
-    """Named membership patterns over ?entity, in order. Exclusive (partitions):
+    """Named membership patterns over ?s, in order. Exclusive (partitions):
     an entity belongs to the first member that matches. Overlapping (groups): to
     every one that matches. A name may occur more than once (one set of
     entities defined by several patterns). Entities matching a membership of
@@ -113,7 +115,7 @@ def grouping_to_sparql_subquery(
     """
     Generates a SPARQL query with prefixes as dict. Returns:
     ({shortened_prefix: <http://full_prefix_iri>}, sparql_subquery_for_grouping).
-    binding ?entity ?group within the entity space.
+    binding ?s ?group within the entity space.
     Without a grouping: the kind partitions. In a large KG, the sampled members
     (large_kg_sampling), assigned in Python, as a VALUES table.
     """
@@ -121,21 +123,21 @@ def grouping_to_sparql_subquery(
     prefixes, _ = split_prologue(manager, VOCABULARY_PROLOGUE + "\nSELECT * WHERE { ?s ?p ?o }")
     sample = current_sample(manager)
     if sample is not None:
-        rows = [(f"<{e}>", literal(g)) for e, g in sample.assignments(grouping)]
-        return prefixes, f"{{ {values_table(['entity', 'group'], rows)} }}"
+        rows = [(f"<{e}>", sparql_literal(g)) for e, g in sample.assignments(grouping)]
+        return prefixes, f"{{ {values_table(['s', 'group'], rows)} }}"
     branches = " UNION ".join(
-        f"{{ {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
+        f"{{ {{ SELECT DISTINCT ?s WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
         for rank, (_, membership) in enumerate(grouping.members)
     )
-    minus_part = "".join(f"\nMINUS {{ SELECT DISTINCT ?entity WHERE {{ {membership} }} }}" for membership in grouping.minus)
-    internal_wheres = f"{branches}\nFILTER(isIRI(?entity))\n{space_filter(space)}{minus_part}"
-    names_rank_mapping = " ".join(f"({rank} {literal(name)})" for rank, (name, _) in enumerate(grouping.members))
+    minus_part = "".join(f"\nMINUS {{ SELECT DISTINCT ?s WHERE {{ {membership} }} }}" for membership in grouping.minus)
+    internal_wheres = f"{branches}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}{minus_part}"
+    names_rank_mapping = " ".join(f"({rank} {sparql_literal(name)})" for rank, (name, _) in enumerate(grouping.members))
     if grouping.exclusive:
-        return prefixes, (f"{{ SELECT ?entity ?group WHERE {{\n"
-                          f"{{ SELECT ?entity (MIN(?rank) AS ?first) WHERE {{\n{internal_wheres}\n}} GROUP BY ?entity }}\n"
+        return prefixes, (f"{{ SELECT ?s ?group WHERE {{\n"
+                          f"{{ SELECT ?s (MIN(?rank) AS ?first) WHERE {{\n{internal_wheres}\n}} GROUP BY ?s }}\n"
                           f"VALUES (?first ?group) {{ {names_rank_mapping} }}\n}} }}")
     return prefixes, (
-        f"{{ SELECT DISTINCT ?entity ?group WHERE {{\n{internal_wheres}\n"
+        f"{{ SELECT DISTINCT ?s ?group WHERE {{\n{internal_wheres}\n"
         f"VALUES (?rank ?group) {{ {names_rank_mapping} }}\n}} }}"
         )
 
@@ -157,23 +159,22 @@ def grouping_to_sparql_query(
     where: str = "",
     tail: str = "",
     branches: list[str] | None = None,
-    var: str = "s"
         ) -> str:
     """
-    Query over the entities of a grouping (?entity ?group), joined with the
-    given patterns; with parts, joined with the alternatives of a pattern whose
-    ?var is the entity (union_with).
+    Query over the entities of a grouping (?s ?group), joined with the
+    given patterns; with branches, joined with the alternatives of a pattern
+    over ?s (the entity).
     """
     # TODO: down push only cheap parts, not whole subquery for non large KGs.
     # E. g. proceed as in large KGs (reach down only value-tables).
     prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
     body = (
-        down_pushed_union(subquery, branches, var)
+        down_pushed_union(subquery, branches)
         if branches is not None
         else subquery
         )
     return (
-        f"{prologue_of(prefixes)}\nSELECT {select}"
+        f"{make_sparql_prologue(prefixes)}\nSELECT {select}"
         f" WHERE {{\n{body}\n{where}\n}} {tail}"
     )
 
@@ -182,17 +183,17 @@ def count_rows(rows: list[dict], *keys: str) -> dict[tuple[str, ...], int]:
     return {tuple(row[k].value for k in keys): int(row["n"].value) for row in rows if all(k in row for k in keys)}
 
 
-def counts_by_group(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
-                    where: str, parts: list[str] | None = None, var: str = "s") -> dict[str, int]:
-    sparql = grouping_to_sparql_query(manager, grouping, space, "?group (COUNT(DISTINCT ?entity) AS ?n)",
-                                      where, "GROUP BY ?group", parts, var)
+def retrieve_counts_by_group(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
+                    where: str, parts: list[str] | None = None) -> dict[str, int]:
+    sparql = grouping_to_sparql_query(manager, grouping, space, "?group (COUNT(DISTINCT ?s) AS ?n)",
+                                      where, "GROUP BY ?group", parts)
     return {group: n for (group,), n in count_rows(select_rows(manager, sparql), "group").items()}
 
 
 def group_sizes(
         manager: KgManager, grouping: Grouping | None, space: Iterable[str]
         ) -> dict[str, int]:
-    return counts_by_group(manager, grouping, space, "")
+    return retrieve_counts_by_group(manager, grouping, space, "")
 
 
 def profile_groups_to_grouping(
@@ -211,3 +212,26 @@ def profile_partitions_to_grouping(
     return partitions_to_grouping(
         kg_profile.partitions, mark_uncategorized_as_rest=False
         )
+
+
+def groups_by_entity(
+        manager: KgManager, kg_profile: KgProfile, entities: Iterable[IRI]
+        ) -> dict[IRI, frozenset[str]]:
+    """
+    The names of the groups of each entity (empty: in no group).
+    """
+    group_names: dict[IRI, set[str]] = {entity: set() for entity in entities}
+    branches = [
+        f"{group.definition.membership_sparql} BIND({sparql_literal(group.name)} AS ?group)"
+        for group in kg_profile.groups
+    ]
+    if branches:
+        for values_block in as_batched_values_blocks(group_names):
+            query = (
+                "SELECT DISTINCT ?s ?group WHERE {\n"
+                + down_pushed_union(f"VALUES ?s {{ {values_block} }}", branches)
+                + "\n}"
+            )
+            for row in select_rows(manager, query):
+                group_names[IRI(row["s"].value)].add(row["group"].value)
+    return {entity: frozenset(names) for entity, names in group_names.items()}

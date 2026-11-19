@@ -12,8 +12,13 @@ from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, EntityPair, KeyCandidate, KeyEntityPair, KeyMatch, KeyHub, NeighbourCandidate,
     NeighbourEntityPair, NeighbourHub, NeighbourMatch, VectorCandidate, VectorEntityPair, VectorHub, VectorMatch,
 )
-from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation, StructureRelationKind
-from grasp.tasks.om.data_models.profile import INVERSE_PREFIX, Roles
+from grasp.tasks.om.data_models.profile import (
+    PredicatePattern,
+    StructureRelation,
+    StructureRelationKind,
+    INVERSE_PREFIX,
+    Roles,
+)
 from grasp.tasks.om.data_models.scope import Normalization, StringTransform, ValuePatternSource, apply_string_transforms
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
@@ -590,15 +595,15 @@ def entity_pairs_to_candidates[P: EntityPair](
                 (side, entity), EntityCandidates(side=side, entity=entity))
             if not competing:
                 other_partition = partition_names_by_entity[other_side][entity_pair.get_entity(other_side)]
-                entity_candidates.num_non_competing_rivals_by_partition[other_partition] += 1
+                entity_candidates.num_non_competing_counterparts_by_partition[other_partition] += 1
             elif in_population[other_side]:
                 candidate = build_candidate(entity_pair, side)
                 if entity_pair.get_entity(other_side) in matched_entities[other_side]:
                     candidate = dataclasses.replace(candidate, candidate_already_matched=True)
                 entity_candidates.candidates.append(candidate)
             else:
-                entity_candidates.num_rivals_outside_population_by_group.update(groups_by_side[other_side])
-                entity_candidates.num_rivals_outside_by_rank[entity_pair.rank_key] += 1
+                entity_candidates.num_counterparts_outside_population_by_group.update(groups_by_side[other_side])
+                entity_candidates.num_counterparts_outside_population_by_rank[entity_pair.rank_key] += 1
 
     return candidates_by_entity
 

@@ -1,13 +1,49 @@
-- SPARQL-Variablen einstellbar machen, "s", "o", "entity", "group" etc. überall aus dem Hartcode rausnehmen und dort auf Konstanten verweisen
-- Dateistruktur verständlicher machen: Dateien zusammenlegen/umbenennen
-- Rules oder in anderen Promptteil in CandidateTask: Ergänzende Strategien suchen mit unterschiedlichen Fehlerkorrelationen
-- CandidateTask für große KGs pro Gruppe?
-- Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
+## Unbedingt notwendig
+- Klarstellen: Welche Ablation brauche ich, welche nicht + Trennung Ablation von echten Konfigurationen für Endprodukt (JudgeType etc.)
 - partition_names_by_entity zentralisieren (nur einmal abrufen)
 - Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
+- SPARQL-Variablen einstellbar machen, "s", "o", "entity", "group" etc. überall aus dem Hartcode rausnehmen und dort auf Konstanten verweisen
 - Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
+- Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
+- Dateistruktur verständlicher machen: Dateien zusammenlegen/umbenennen
+- Strukturrollen streichen: Identity, Association, Other nur bei Ausnahmen setzen. Oder Identity beibehalten und bei Key- und Äquivalenzkollisionen bei Judge bedenken (gefährlicher als wegschmeiße ).
+- Ziele der Strukturrollen erklären.
+- 'other'-Rollen irgendwie zwischen KGs ablgeichen. Oder besser: Source- und Targetgenerator eigene Relationen verwenden lassen!
+- Berechenbare Relationen berechnen statt setzen: Subsumption ↔ Membership: Aus den Partitionen ableitbar: ?s Instanz und ?o Klasse → Membership; beide in derselben Partition → Subsumption
+- Funde in Prompts als 'KG notes' integrieren
+- EntityContext überarbeiten: noise rausstreichen, nochmal Regeln überdenken
+- Transforms aus Ankerstufe entfernen...
+- Anzeige in allen Aufgaben überarbeiten: describe profile, Texte für die Judges...
+- 'x entities aus Strategie ausgelassen, weil sie schon gematcht sind' in Ergebnisübersicht pro Kandidatenstrategie
+- Familien wählen in den Prompt: unabhängige Informationsquellen = Fehler korrelieren nicht mit Beispielen: "Give runs the same family if they draw on the same information of the entities (the same values, or values derived from or containing one another), whatever their technique, population or selection; mutual runs take the family of the run they select from. Use a new family only for information whose errors are unlikely to coincide with those of the existing families."
+- Kandidatenstrata in Reihenfolge der Stratumstärke bewerten mit Abbruchkriterium bei abfallenden Matches, pro Gruppe/Partition je nach Gruppengröße -> Recallrunde gleich schneiden!
+
+## Optimierungsideen
+- Rules oder in anderen Promptteil in CandidateTask: Ergänzende Strategien suchen mit unterschiedlichen Fehlerkorrelationen
+- CandidateTask für große KGs pro Gruppe?
 - run-0 und compare_to in anchors wieder aufnehmen
 - Infos zwischen Kandidatstufen und vergangenen Stufen: Welche Strategien wurden bereits genutzt (mit Ergebnissen - z. B. wie viel Prozent Abnahme)
-- Funktion: in bestehende Äquivalenzen reinschauen (z. B. nach Partitionspaaren / Gruppenpaaren / random)
+- Funktion für Judges: EntityContext für beliebige Entität aufrufen
+- Funktion für Judges: in bestehende Äquivalenzen reinschauen (z. B. nach Partitionspaaren / Gruppenpaaren / random)
 - Erinnerung, dass LLM mehrere Tools pro Runde nutzen kann, wenn es viele Runden lang immer nur einen Tool Call tätigt?
 - ProfileSpaceTask: In YAML neben space auch angeben: veränderbar oder nicht.
+- max_steps mit KG-Größen anpassen
+
+## Optimierungsideen aus Probeläufen
+### Profiling:
+- Roles: 
+    - Tool für Namen aus lokalen Namen? Oder explizit verbieten
+    - Präfixierte Prädikate in PredicatePattern korrekt behandeln!
+- Belegpflicht für Funde
+- Funde optional machen!!
+- Strukturrollen, die über Blank Nodes gehen, zusätzlich ein Beispielpaar zeigen, das das Modell bestätigen muss
+- Shortcut für Profilierung bei standartisierten KGs:
+    - Space: Präfix bis einschließlich # bzw. letztem / der deklarierten Entitäten statt nur des Hosts. owl:Ontology-Knoten aus dem Space ausschließen.
+    - Partitionen: class/instance konkurrieren nicht, wenn kein Punning vorliegt.
+    - Namen und Annotationen: Synonyme über einen Zwischenknoten: oboInOwl:has*Synonym → Knoten → rdfs:label. Weitere Synonym-Prädikate: oboInOwl:hasBroadSynonym, oboInOwl:hasNarrowSynonym (getrennt von den exakten Synonymen), skos:hiddenLabel. Weitere Namens-Prädikate: dc:title, dcterms:title, foaf:name, schema:name. Eigene Annotationsproperties mit rdfs:subPropertyOf eines bekannten Prädikats in dessen Rolle übernehmen.
+    - Struktur: subclass_of: Union-Glieder ⊑ Klasse aus owl:equivalentClass/owl:unionOf. subclass_of: Klasse ⊑ benannte Konjunkte aus owl:equivalentClass/owl:intersectionOf und aus rdfs:subClassOf/owl:intersectionOf. same_as: nur IRI-Objekte (FILTER(isIRI(?o))). inverse_of: owl:inverseOf, symmetrisch. domain: rdfs:domain, IRI-Objekte und Union-Glieder. range: rdfs:range, IRI-Objekte und Union-Glieder, ohne xsd-Typen. disjoint_with ergänzen um:owl:AllDisjointClasses (paarweise): owl:disjointUnionOf (Glieder paarweise); owl:complementOf in owl:equivalentClass/owl:intersectionOf. existential_restriction: auch unter owl:equivalentClass und innerhalb von owl:intersectionOf. restriction_on_property: Klasse → Property aus beliebigen Restriktionen (onProperty, auch Kardinalitäten).
+    - Abdeckungsprüfung (Schnellweg): Prüfen, ob jede Entität im Space eine OWL-Art hat und kein Punning vorliegt. Rest = Prädikate an Entitäten im Space, die keine Default-Rolle abdeckt. Ist er leer, entfällt die LLM-Profilierung; sonst bekommt das LLM nur den Rest.
+
+- Kandidatenstrategie: TF-IDF: Stopwortentfernung mit Sprachangabe als Option
+- Kandidatenstrategie: deterministische Zusammenführung von Familien
+- Präfixe in describe_profile kürzen: Auf KgManager zugreifen (Setup muss davor gelaufen sein) oder eigene Funktionalität für gekürzte Präfixe umsetzen...

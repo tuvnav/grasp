@@ -23,8 +23,10 @@ from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
 from grasp.tasks.om.data_models.profile import (
+    PredicatePattern,
+    StructureRelation,
+    ROLE_DESCRIPTIONS,
     ROLE_FIELDS,
     STAGES,
     ElementKey,
@@ -42,9 +44,9 @@ from grasp.tasks.om.data_models.profile import (
     WithinKgNonCompetingPartitionPair,
     check_structure,
     derived_roles,
-    describe_pattern,
+    describe_predicate_pattern,
     describe_profile,
-    describe_relation,
+    describe_structure_relation,
     diff_roles,
     effective_roles,
     role_elements,
@@ -54,8 +56,8 @@ from grasp.tasks.om.data_models.profile import (
 from grasp.tasks.om.foundation.configuration import (
     load_task_instructions,
 )
-from grasp.tasks.om.foundation.types import IRI, NameType
-from grasp.tasks.om.foundation.vocabulary import (
+from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.rdf_vocabulary import (
     LABEL_PREDICATES,
     RDF_TYPE,
     UNCATEGORIZED,
@@ -101,8 +103,10 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     sample_entities,
     type_coverage,
 )
-from grasp.tasks.om.sparql_access.execution import select_rows
-from grasp.tasks.om.sparql_access.query_building import sparql_path
+from grasp.tasks.om.sparql_access.lookups import (
+    select_rows,
+    sparql_path,
+)
 from grasp.tasks.om.tasks.prompting import load_prompt
 from grasp.utils import FunctionCallException, format_enumerate, format_section
 
@@ -156,16 +160,6 @@ def run_rows(manager: KgManager, sparql: str) -> list[dict]:
         raise FunctionCallException(f"The SPARQL query failed: {e}") from e
 
 
-ROLE_DESCRIPTIONS = {
-    "names": "preferred names",
-    "synonyms": "alternative names",
-    "definitions": "textual definitions or descriptions",
-    "codes": "codes of the entity in its own system (notations, IDs)",
-    "cross_references": "codes or IRIs of the entity in other systems",
-    "noise": "values that say nothing about the meaning of an entity (e.g. formatting, provenance, media files)",
-}
-
-
 # --- helpers of the stages and editors ------------------------------------------------
 
 # defaults of the profile parts
@@ -198,12 +192,12 @@ def entity_examples(manager: KgManager, grouping: Grouping, space: list[str], wh
     """Up to k entities with a name and their partition or group."""
     names = sparql_path(LABEL_PREDICATES)
     rows = run_rows(manager, grouping_to_sparql_query(
-        manager, grouping, space, "?entity ?group ?name",
-        f"{where}\nOPTIONAL {{ ?entity {names} ?name }}", f"LIMIT {k * 4}",
+        manager, grouping, space, "?s ?group ?name",
+        f"{where}\nOPTIONAL {{ ?s {names} ?name }}", f"LIMIT {k * 4}",
     ))
     seen, lines = set(), []
     for row in rows:
-        entity = row["entity"].value
+        entity = row["s"].value
         if entity in seen:
             continue
         seen.add(entity)
@@ -324,8 +318,8 @@ def format_features(inside: dict[str, int], size_inside: int, outside: dict[str,
 
 def membership_argument(fn_args: dict) -> str:
     membership = (fn_args.get("membership") or "").strip()
-    if not re.search(r"\?entity\b", membership):
-        raise FunctionCallException("The membership pattern must use ?entity")
+    if not re.search(r"\?s\b", membership):
+        raise FunctionCallException("The membership pattern must use ?s")
     return membership
 
 
@@ -350,7 +344,7 @@ def test_function(unit: str, description: str) -> dict:
 
 
 MEMBERSHIP = {"type": "string", "description": (
-    "SPARQL group pattern over ?entity, e.g. ?entity <http://example.org/p> ?v")}
+    "SPARQL group pattern over ?s, e.g. ?s <http://example.org/p> ?o")}
 
 
 # role overviews and the groups of stage e
@@ -571,13 +565,13 @@ class EntitySpaceEditor(Editor):
         if not sizes:
             return f"No entities with IRIs starting with {prefix}."
         named = run_rows(self.kg_manager, grouping_to_sparql_query(
-            self.kg_manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?entity) AS ?n)",
-            f"FILTER EXISTS {{ ?entity {sparql_path(LABEL_PREDICATES)} ?name }}",
+            self.kg_manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?s) AS ?n)",
+            f"FILTER EXISTS {{ ?s {sparql_path(LABEL_PREDICATES)} ?name }}",
         ))
         named_count = int(named[0]["n"].value) if named and "n" in named[0] else 0
         types = run_rows(self.kg_manager, grouping_to_sparql_query(
-            self.kg_manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?entity) AS ?n)",
-            f"?entity <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
+            self.kg_manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?s) AS ?n)",
+            f"?s <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
         ))
         return "\n".join([
             f"{prefix}: " + ", ".join(f"{p} {n}" for p, n in sizes.items()) + f"; {named_count} with a canon name",
@@ -609,10 +603,10 @@ class EntitySpaceEditor(Editor):
         if not pairs:
             return []
         names: dict[str, str] = {}
-        rows = run_rows(self.kg_manager, f"SELECT ?entity ?name WHERE {{ {values_block([e for e, _ in pairs])} "
-                        f"?entity {sparql_path(LABEL_PREDICATES)} ?name }}")
+        rows = run_rows(self.kg_manager, f"SELECT ?s ?name WHERE {{ {values_block([e for e, _ in pairs])} "
+                        f"?s {sparql_path(LABEL_PREDICATES)} ?name }}")
         for row in rows:
-            names.setdefault(row["entity"].value, row["name"].value)
+            names.setdefault(row["s"].value, row["name"].value)
         return [f"  {e}" + (f' "{clip(names[e], 50)}"' if e in names else "") + f" ({c})" for e, c in pairs]
 
     def has_entities(self, prefix: str) -> bool:
@@ -757,11 +751,11 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
         lines.append("Examples:")
         names = sparql_path(LABEL_PREDICATES)
         rows = run_rows(self.kg_manager, (
-            f"SELECT DISTINCT ?entity ?name WHERE {{ {members_query(membership, self.entity_space, self.kg_manager)} "
-            f"OPTIONAL {{ ?entity {names} ?name }} }} LIMIT 6"
+            f"SELECT DISTINCT ?s ?name WHERE {{ {members_query(membership, self.entity_space, self.kg_manager)} "
+            f"OPTIONAL {{ ?s {names} ?name }} }} LIMIT 6"
         ))
-        lines += [f"  {r['entity'].value}" + (f' "{clip(r["name"].value, 50)}"' if "name" in r else "")
-                  for r in rows if "entity" in r]
+        lines += [f"  {r['s'].value}" + (f' "{clip(r["name"].value, 50)}"' if "name" in r else "")
+                  for r in rows if "s" in r]
         return "\n".join(lines)
 
     def checked_membership(self, fn_args: dict) -> str:
@@ -954,7 +948,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
     unit = "group"
     exclusions: dict[str, str]  # name of an excluded group -> reason
     # set by set_local_name_type (revision); otherwise the group's stays
-    local_name_types: dict[str, NameType] = field(default_factory=dict)
+    local_name_types: dict[str, LocalNameType] = field(default_factory=dict)
     all_size: int = field(init=False)  # entities in any group, to compare a group with the rest
     all_predicates: dict[str, int] = field(init=False)
     all_types: dict[str, int] = field(init=False)
@@ -1072,7 +1066,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
             "parameters": {
                 "type": "object",
                 "properties": {"name": {"type": "string"},
-                               "local_name_type": {"type": "string", "enum": [t.value for t in NameType]}},
+                               "local_name_type": {"type": "string", "enum": [t.value for t in LocalNameType]}},
                 "required": ["name", "local_name_type"],
                 "additionalProperties": False,
             },
@@ -1138,7 +1132,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
     def set_local_name_type(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
         try:
-            name_type = NameType(fn_args.get("local_name_type"))
+            name_type = LocalNameType(fn_args.get("local_name_type"))
         except ValueError as e:
             raise FunctionCallException(f"Invalid local_name_type: {e}") from e
         self.local_name_types[name] = name_type
@@ -1385,7 +1379,7 @@ class RoleEditor(Editor):
         mark = f" [{origin(key)}]" if origin else ""
         side = lambda i: "; ".join(f"{p} {share(self.sides.get(p, {}).get(key, (0, 0))[i], self.sizes.get(p, 0))}"
                                    for p in self.scope)
-        return f"  {describe_relation(relation)}{mark}\n    as ?s: {side(0)}\n    as ?o: {side(1)}"
+        return f"  {describe_structure_relation(relation)}{mark}\n    as ?s: {side(0)}\n    as ?o: {side(1)}"
 
     def format_roles(self, roles: Roles, origin: Callable[[ElementKey], str] | None = None) -> str:
         """Each element with its coverage per partition or group in scope."""
@@ -1404,7 +1398,6 @@ class RoleEditor(Editor):
         member = fn_args.get("show_examples_from")
         if member is not None and member not in self.scope:
             raise FunctionCallException(f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}")
-        sparql = pattern.predicates_to_sparql()
         rows = run_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, self.grouping, self.entity_space,
             "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
@@ -1413,7 +1406,7 @@ class RoleEditor(Editor):
         ))
         counts = {row["group"].value: row for row in rows if "group" in row}
         value = lambda row, key: int(row[key].value) if key in row else 0
-        lines = [f"Pattern: {sparql}"]
+        lines = [f"Pattern: {describe_predicate_pattern(pattern)}"]
         for p in self.scope:
             row = counts.get(p, {})
             lines.append(f"{self.unit.capitalize()} {p}: {share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
@@ -1459,7 +1452,7 @@ class RoleEditor(Editor):
         missing += [p for p in fn_args.get("remove_patterns") or [] if p not in patterns]
         if missing:
             raise FunctionCallException(
-                f"Not in role {role}: {missing}; it has: {describe_pattern(current) if current else 'nothing'}")
+                f"Not in role {role}: {missing}; it has: {describe_predicate_pattern(current) if current else 'nothing'}")
         predicates = [p for p in predicates if p not in (fn_args.get("remove_predicates") or [])]
         patterns = [p for p in patterns if p not in (fn_args.get("remove_patterns") or [])]
         if fn_args.get("add"):
@@ -1524,6 +1517,18 @@ class RoleEditor(Editor):
         if self.derived_roles is None:
             raise ValueError("Only the roles of a group (from_group_profile) have a deviation")
         return diff_roles(self.derived_roles, self.roles)
+
+
+# what a model writes for "no group" in a group field
+NO_GROUP_VALUES = frozenset({"", "null", "none"})
+
+
+def group_reference(value: Any) -> str | None:
+    """The group (or partition) a finding or flag names; None for no group,
+    also if the model wrote one as text (e.g. "null")."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in NO_GROUP_VALUES):
+        return None
+    return value
 
 
 def next_flag_id(stage: Stage, existing: int) -> str:
@@ -1675,7 +1680,14 @@ class ProfileStageTask(GraspTask):
     def about_description(self) -> str:
         return "Group (or partition) it is about, if one."
 
+    def refers_to_groups(self) -> bool:
+        """Whether findings and flags of the stage can name a group or partition
+        (not before there are any)."""
+        return True
+
     def finish_definition(self) -> dict:
+        group_property = ({"group": {"type": "string", "description": self.about_description()}}
+                          if self.refers_to_groups() else {})
         properties = {
             "rationale": {"type": "string",
                           "description": "What you changed and why, and what remains uncertain."},
@@ -1689,10 +1701,7 @@ class ProfileStageTask(GraspTask):
                 "maxItems": MAX_FINDINGS,
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "group": {"type": "string", "description": self.about_description()},
-                    },
+                    "properties": {"text": {"type": "string"}} | group_property,
                     "required": ["text"],
                     "additionalProperties": False,
                 },
@@ -1707,8 +1716,7 @@ class ProfileStageTask(GraspTask):
                     "properties": {
                         "concerns": {"type": "string", "enum": [s.value for s in self.earlier_stages()]},
                         "text": {"type": "string"},
-                        "group": {"type": "string", "description": self.about_description()},
-                    },
+                    } | group_property,
                     "required": ["concerns", "text"],
                     "additionalProperties": False,
                 },
@@ -1745,10 +1753,12 @@ class ProfileStageTask(GraspTask):
             raise FunctionCallException(f"At most {MAX_FINDINGS} findings; keep the most useful ones for matching")
         profile, summary = self.apply_finish(fn_args)
         try:
-            findings = [Finding(stage=self.stage, **f) for f in fn_args.get("findings") or []]
+            findings = [Finding(stage=self.stage, text=f.get("text"), group=group_reference(f.get("group")))
+                        for f in fn_args.get("findings") or []]
             flags = [
                 Flag(id=next_flag_id(self.stage, len(profile.flags) + index), raised_by_stage=self.stage,
-                     concerns_stage=f.get("concerns"), content=f.get("text"), concerns_group=f.get("group"))
+                     concerns_stage=f.get("concerns"), content=f.get("text"),
+                     concerns_group=group_reference(f.get("group")))
                 for index, f in enumerate(fn_args.get("flags") or [])
                 ]
         except (ValidationError, TypeError) as e:

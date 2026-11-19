@@ -50,7 +50,7 @@ from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePat
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    anchor_strata,
+    get_anchor_strata,
     merge_anchors,
     merge_runs,
 )
@@ -69,13 +69,12 @@ from grasp.tasks.om.tasks.candidate_task import (
     retrieve_partition_names,
     run_strategy,
 )
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content
 from grasp.tasks.om.tasks.prompting import (
-    Outline,
     add_equivalence_condition,
-    format_outline,
     load_prompt,
 )
-from grasp.tasks.om.tasks.task_input import resolve_alignment_state, resolve_managers
+from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
 from grasp.utils import FunctionCallException, format_section
 
 # the selection of every anchor run: the unique candidate only (the anchor rule)
@@ -86,6 +85,7 @@ COMPETITOR_SELECTION = Selection(top_k=5)
 NUM_EXAMPLE_ANCHORS = 5      # anchors shown per kind in a result
 NUM_AMBIGUOUS_EXAMPLES = 3   # entities with a key match but no anchor shown in a result
 NUM_SHOWN_COUNTERPARTS = 3   # tied counterparts shown per ambiguous entity
+NUM_SHOWN_RIVALS = 3  # rivals (own side, same best counterpart) shown per ambiguous entity
 MAX_SHOWN_ANCHORS = 20
 NUM_CONFLICT_EXAMPLES = 5
 
@@ -152,49 +152,145 @@ def run_full_anchor_ensemble(
         CANDIDATE_BUDGET_PER_ENTITY,
         MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
         )
-    return anchor_merge, anchor_strata(anchor_merge), competitor_merge.uncut_pareto_layers_by_entity
+    return anchor_merge, get_anchor_strata(anchor_merge), competitor_merge.uncut_pareto_layers_by_entity
 
 
 # ---------------------------------------------------------------- formatting
 
-def format_anchor(anchor: Anchor, entity_displays: dict[Side, EntityDisplay]) -> str:
-    text = (f"{entity_displays[Side.SOURCE].show(anchor.source_entity)} = "
-            f"{entity_displays[Side.TARGET].show(anchor.target_entity)} [{anchor.level}")
-    if anchor.specificity == AnchorSpecificity.HEAD and anchor.information_content is not None:
-        text += f", head, information content {anchor.information_content:.2f}"
+def format_anchor(
+        anchor: Anchor,
+        entity_displays: dict[Side, EntityDisplay]
+        ) -> str:
+    text = (
+        f"{entity_displays[Side.SOURCE].show(anchor.source_entity)} = "
+        f"{entity_displays[Side.TARGET].show(anchor.target_entity)} "
+        f"[on normalization level '{anchor.normalization_level}'"
+        )
+    if (anchor.specificity == AnchorSpecificity.HEAD
+            and anchor.information_content is not None):
+        text += f", specificity: 'head', information content {anchor.information_content:.2f}"
     return text + "]"
 
 
-def prefetch_anchors(anchors: list[Anchor], entity_displays: dict[Side, EntityDisplay]) -> None:
+def prefetch_anchors(
+        anchors: list[Anchor], entity_displays: dict[Side, EntityDisplay]
+        ) -> None:
     entity_displays[Side.SOURCE].prefetch(anchor.source_entity for anchor in anchors)
     entity_displays[Side.TARGET].prefetch(anchor.target_entity for anchor in anchors)
 
 
-def ambiguous_entities(result: StrategyResult) -> list[IRI]:
-    """Source entities with a key match but no anchor, in a fixed order."""
+def get_top_rank_rivals(result: StrategyResult, entity: IRI) -> dict[IRI, list[IRI]]:
+    """
+    Per shown best candidate of a source entity: the other source entities on
+    the best rank of that candidate (a reason why the entity has no anchor).
+    In a run on a sample, the lists of one side lack entities, so rivals may be missing.
+    """
+    rivals_by_candidate: dict[IRI, list[IRI]] = {}
+    top_rank_candidates = result.collected[
+        (Side.SOURCE, entity)
+        ].get_top_rank_candidates()[:NUM_SHOWN_COUNTERPARTS]
+
+    for candidate in top_rank_candidates:
+        candidates_of_candidate = result.collected.get((Side.TARGET, candidate))
+        rivals_by_candidate[candidate] = [
+            rival for rival in (
+                candidates_of_candidate.get_top_rank_candidates()
+                if candidates_of_candidate else []
+                )
+            if rival != entity
+        ]
+
+    return rivals_by_candidate
+
+
+def get_all_ambiguous_entities(result: StrategyResult) -> list[IRI]:
+    """
+    Source entities with a key match but no anchor, in a fixed order.
+    """
     return sorted(
         entity for (side, entity), selected in result.selected.items()
-        if side == Side.SOURCE and selected.collected.candidates and selected.unique_candidate is None
+        if side == Side.SOURCE
+        and selected.collected.candidates
+        and selected.unique_candidate is None
         )
 
 
-def format_ambiguous(result: StrategyResult, entity: IRI, entity_displays: dict[Side, EntityDisplay]) -> str:
-    """An entity without an anchor, with the counterparts on its best rank."""
-    collected = result.collected[(Side.SOURCE, entity)]
-    best = sorted((c for c in collected.candidates if c.rank_key == collected.top_rank),
-                  key=lambda candidate: candidate.candidate_entity)
-    counterparts = ", ".join(entity_displays[Side.TARGET].show(c.candidate_entity)
-                             for c in best[:NUM_SHOWN_COUNTERPARTS])
-    more = len(best) - NUM_SHOWN_COUNTERPARTS
-    rivals = collected.num_rivals_outside_by_rank.get(collected.top_rank, 0)
-    text = f"{entity_displays[Side.SOURCE].show(entity)}: {counterparts}" + (f", {more} more" if more > 0 else "")
-    if rivals:
-        text += f"; {rivals} competing entities outside the population share the key"
-    return text
+def choose_ambiguous_entities(
+        result: StrategyResult,
+        num_entities: int,
+        seed: int = 0
+        ) -> list[IRI]:
+    pool = get_all_ambiguous_entities(result)
+    random.Random(seed).shuffle(pool)
+    chosen: list[IRI] = []
+    shown_rivals: set[IRI] = set()
+    for entity in pool:
+        if len(chosen) == num_entities:
+            break
+        if entity in shown_rivals:
+            continue
+        chosen.append(entity)
+        shown_rivals.update(
+            rival for rivals in get_top_rank_rivals(result, entity).values()
+            for rival in rivals[:NUM_SHOWN_RIVALS]
+            )
+    return chosen
 
 
-def prefetch_ambiguous(result: StrategyResult, entities: list[IRI], entity_displays: dict[Side, EntityDisplay]) -> None:
-    entity_displays[Side.SOURCE].prefetch(entities)
+def format_ambiguous_entity(
+        result: StrategyResult,
+        entity: IRI,
+        entity_displays: dict[Side, EntityDisplay]
+        ) -> Item:
+    """
+    An entity without an anchor, with the counterparts on its best rank and
+    its rivals (own side) on the best rank of these counterparts.
+    """
+    entity_candidates = result.collected[(Side.SOURCE, entity)]
+    rivals_by_candidate = get_top_rank_rivals(result, entity)
+    candidate_items = []
+
+    for candidate, rivals in rivals_by_candidate.items():
+        candidate_text = entity_displays[Side.TARGET].show(candidate)
+        if rivals:
+            num_cut_off_rivals = len(rivals) - NUM_SHOWN_RIVALS
+            candidate_text += (
+                ", rivals on its best rank: "
+                + ", ".join(entity_displays[Side.SOURCE].show(rival)
+                            for rival in rivals[:NUM_SHOWN_RIVALS])
+                + (f", +{num_cut_off_rivals} more" if num_cut_off_rivals > 0 else "")
+                )
+        candidate_items.append(Item(candidate_text))
+
+    num_cut_off_candidates = len(entity_candidates.get_top_rank_candidates()) - NUM_SHOWN_COUNTERPARTS
+    if num_cut_off_candidates > 0:
+        candidate_items.append(Item(f"+{num_cut_off_candidates} more"))
+
+    children = [Item("candidates:", candidate_items)]
+    counterparts_outside = entity_candidates.num_counterparts_outside_population_by_rank.get(
+        entity_candidates.top_rank, 0
+        )
+    if counterparts_outside:
+        children.append(
+            Item(f"; {counterparts_outside} competing entities "
+                 "outside the population share the key")
+            )
+    return Item(entity_displays[Side.SOURCE].show(entity), children)
+
+
+def prefetch_ambiguous(
+        result: StrategyResult,
+        entities: list[IRI],
+        entity_displays: dict[Side, EntityDisplay]
+        ) -> None:
+    entity_displays[Side.SOURCE].prefetch([
+        *entities,
+        *(
+            rival for entity in entities
+            for rivals in get_top_rank_rivals(result, entity).values()
+            for rival in rivals[:NUM_SHOWN_RIVALS]
+            )
+        ])
     entity_displays[Side.TARGET].prefetch(
         candidate.candidate_entity for entity in entities
         for candidate in result.collected[(Side.SOURCE, entity)].candidates
@@ -228,54 +324,92 @@ def format_anchor_result(
     sampled_side = result.signals[Side.SOURCE].sampled_side
     random_examples = anchors_of_kind(anchors, AnchorListKind.RANDOM)[:NUM_EXAMPLE_ANCHORS]
     head_examples = anchors_of_kind(anchors, AnchorListKind.HEAD)[:NUM_EXAMPLE_ANCHORS]
-    ambiguous = ambiguous_entities(result)[:NUM_AMBIGUOUS_EXAMPLES]
+    ambiguous = choose_ambiguous_entities(result, NUM_AMBIGUOUS_EXAMPLES)
     prefetch_anchors(random_examples + head_examples, entity_displays)
     prefetch_ambiguous(result, ambiguous, entity_displays)
     prefetch_shown_entities([], result.hubs, entity_displays)
 
-    outline: Outline = [
-        (f"{len(anchors)} anchors", [
-            f"{side}: {format_share(len(anchors) / sizes[side]) if sizes[side] else '-'} of {sizes[side]} entities"
+    statistics_content = [
+        f"Found {len(anchors)} anchors:",
+        *(Item(
+            f"""{side}: matched {
+                format_share(len(anchors) / sizes[side]) if sizes[side] else '-'
+                } of {sizes[side]} entities"""
             + (" (a sample)" if sampled_side == side else "")
             + f"; {with_match[side]} share a key with a competing entity, "
-              f"{with_match[side] - len(anchors)} of them without an anchor (ambiguous)"
-            for side in SIDES
-        ]),
-        f"names: {specificity_counts[AnchorSpecificity.SPECIFIC]} specific, "
-        f"{specificity_counts[AnchorSpecificity.HEAD]} head; "
-        f"{specificity_counts[AnchorSpecificity.NOT_APPLICABLE]} other values (not names); "
-        f"{sum(a.extended for a in anchors)} unique only on a coarse level (extended)",
-    ]
+            f"{with_match[side] - len(anchors)} of them without an anchor (ambiguous)"
+            ) for side in SIDES),
+        Item(
+            f"{specificity_counts[AnchorSpecificity.SPECIFIC]} names are specific, "
+            f"{specificity_counts[AnchorSpecificity.HEAD]} names are extended in the ontologies ('head' names); "
+            f"{specificity_counts[AnchorSpecificity.NOT_APPLICABLE]} other values (not names); "
+            f"{sum(a.extended for a in anchors)} names are unique only on a coarse normalization level ('extended')"
+            )
+        ]
+
     if result.existing_equivalences:
-        outline.append(f"existing equivalences found again as key matches: "
-                       f"{len(result.confirmed_equivalences)} of {result.existing_equivalences}")
-    outline += format_hubs(result.hubs, entity_displays)
+        statistics_content.append(
+            Item(
+            f"existing equivalences found again as key matches: "
+            f"{len(result.confirmed_equivalences)} of {result.existing_equivalences}"
+        )
+        )
+
+    statistics_subsection = Section("Statistics", statistics_content)
+
+    subsections = [statistics_subsection]
+    if result.hubs:
+        hubs_content = format_hubs(result.hubs, entity_displays)
+        if hubs_content:
+            subsections.append(Section("Hubs", hubs_content))
     if random_examples:
-        outline.append(("examples", [format_anchor(a, entity_displays) for a in random_examples]))
+        subsections.append(Section(
+            "Example anchors",
+            [Item(format_anchor(anchor, entity_displays)) for anchor in random_examples]
+            ))
     if head_examples:
-        outline.append(("head anchors with the lowest information content",
-                        [format_anchor(a, entity_displays) for a in head_examples]))
+        subsections.append(Section(
+            "Example head anchors with the lowest information content",
+            [Item(format_anchor(anchor, entity_displays)) for anchor in head_examples]
+            ))
     if ambiguous:
-        outline.append(("entities without an anchor: the counterparts sharing their best key",
-                        [format_ambiguous(result, entity, entity_displays) for entity in ambiguous]))
-    return format_outline([(f"Result {run_id}", outline)])
+        subsections.append(Section(
+            "Example entities without an anchor",
+            [format_ambiguous_entity(result, entity, entity_displays) for entity in ambiguous]
+            ))
+    return format_display_content(Section(f"Result {run_id}", subsections=subsections))
 
 
-def format_anchor_merge(anchor_merge: AnchorMerge, entity_displays: dict[Side, EntityDisplay]) -> Outline:
-    strata = anchor_strata(anchor_merge)
+def format_anchor_merge(
+        anchor_merge: AnchorMerge, entity_displays: dict[Side, EntityDisplay]
+        ) -> list[SectionContent]:
+    strata = get_anchor_strata(anchor_merge)
     conflict_examples = anchor_merge.conflicts[:NUM_CONFLICT_EXAMPLES]
     entity_displays[Side.SOURCE].prefetch(source for source, _, _ in conflict_examples)
     entity_displays[Side.TARGET].prefetch(target for _, target, _ in conflict_examples)
-    outline: Outline = [
-        f"{len(anchor_merge.anchors)} anchors",
-        ("strata (families that found the anchors / head, specific, extended): anchors",
-         [f"{stratum.name}: {len(stratum.pairs)}" for stratum in sorted(strata, key=lambda s: -len(s.pairs))]),
-        (f"{len(anchor_merge.conflicts)} conflicts: an entity has different partners in different runs "
-         "(left out of the anchors)",
-         [f"{entity_displays[Side.SOURCE].show(source)} = {entity_displays[Side.TARGET].show(target)} "
-          f"({'+'.join(sorted(families))})" for source, target, families in conflict_examples]),
-    ]
-    return outline
+    content: list[SectionContent] = [
+        Item(f"{len(anchor_merge.anchors)} anchors"),
+        Item(
+            "strata (families that found the anchors / head, specific, extended): anchors",
+            [
+                Item(f"{stratum.name}: {len(stratum.pairs)}")
+                for stratum in sorted(strata, key=lambda stratum: -len(stratum.pairs))
+                ]
+            ),
+        Item(
+            f"{len(anchor_merge.conflicts)} conflicts: an entity has different partners in different runs "
+            "(left out of the anchors)",
+            [
+                Item(
+                    f"{entity_displays[Side.SOURCE].show(source)} = "
+                    f"{entity_displays[Side.TARGET].show(target)} "
+                    f"({'+'.join(sorted(families))})"
+                    )
+                for source, target, families in conflict_examples
+                ]
+            ),
+        ]
+    return content
 
 
 # ---------------------------------------------------------------- functions for the LLM
@@ -411,24 +545,22 @@ def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
     n = min(int(fn_args.get("n") or NUM_EXAMPLE_ANCHORS), MAX_SHOWN_ANCHORS)
     _, result = state.runs[run_id]
     if kind == AnchorListKind.AMBIGUOUS:
-        entities = ambiguous_entities(result)
-        random.Random(0).shuffle(entities)
-        entities = entities[:n]
+        entities = choose_ambiguous_entities(result, n)
         prefetch_ambiguous(result, entities, state.entity_displays)
-        lines: Outline = [format_ambiguous(result, entity, state.entity_displays) for entity in entities]
+        lines = [format_ambiguous_entity(result, entity, state.entity_displays) for entity in entities]
     else:
         anchors = anchors_of_kind(run_anchors_of(state, run_id), kind)[:n]
         prefetch_anchors(anchors, state.entity_displays)
         lines = [format_anchor(anchor, state.entity_displays) for anchor in anchors]
-    return format_outline([(f"{kind} of {run_id}", lines or ["none"])])
+    return format_display_content([(f"{kind} of {run_id}", lines or ["none"])])
 
 
 def evaluate_anchor_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
     run_ensemble = parse_anchor_ensemble(state, fn_args.get("runs"))
-    return format_outline([(
+    return format_display_content(Section(
         "Ensemble " + ", ".join(run_ensemble.run_ids()),
         format_anchor_merge(merge_anchors(run_ensemble, state.runs), state.entity_displays),
-    )])
+        ))
 
 
 def finish(state: CandidateTaskState, fn_args: dict) -> str:
@@ -464,15 +596,14 @@ class OMAnchorTask(GraspTask):
     state: CandidateTaskState
 
     def setup(self, input: Any) -> str:
-        source_manager, target_manager = resolve_managers(self, input)
-        kg_managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
         alignment_state = resolve_alignment_state(input)
+        kg_managers = managers_by_side(self, alignment_state.source_kg_name, alignment_state.target_kg_name)
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
             partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
             entity_displays={
-                side: EntityDisplay.of_profile(kg_managers[side], alignment_state.get_kg_profile(side))
+                side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES
             },
         )

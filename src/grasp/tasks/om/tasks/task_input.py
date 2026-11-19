@@ -1,6 +1,6 @@
 """
-Resolving the input of a task: the KG managers of the source and target KG,
-and the alignment state.
+Resolving the input of a task: the KG managers of the source and target KG
+(by name), and the alignment state.
 """
 from typing import Any
 
@@ -10,32 +10,14 @@ from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.foundation.types import Side
 
 
-def resolve_managers(
-        task: GraspTask,
-        input: Any = None,
-        source_kg: str | None = None,
-        target_kg: str | None = None
-        ) -> tuple[KgManager, KgManager]:
-    if (
-            not (source_kg and target_kg) and isinstance(input, dict)
-            and "source_kg" in input and "target_kg" in input
-            ):
-        source_kg = str(input.get("source_kg"))
-        target_kg = str(input.get("target_kg"))
-
-    if source_kg is None or target_kg is None:
-        raise ValueError(
-            "No source_kg or no target_kg name was given. "
-            "Either specifiy the names explicitly in the args "
-            "of this function or as separate fields in the task input."
-            )
-
-    source, _ = find_manager(task.managers, source_kg)  # raises when wrong kg name
+def managers_by_side(task: GraspTask, source_kg: str, target_kg: str) -> dict[Side, KgManager]:
+    """The KG managers of the source and the target KG, by their names (e.g. from the alignment state)."""
+    source, _ = find_manager(task.managers, source_kg)  # raises on an unknown KG name
     target, _ = find_manager(task.managers, target_kg)
-
-    return source, target
+    return {Side.SOURCE: source, Side.TARGET: target}
 
 
 def resolve_alignment_state(input: Any) -> AlignmentState:

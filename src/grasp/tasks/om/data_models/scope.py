@@ -3,8 +3,11 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
-from grasp.tasks.om.data_models.profile import GroupDefinition, RoleName
+from grasp.tasks.om.data_models.profile import (
+    PredicatePattern,
+    StructureRelation,
+    GroupDefinition,
+)
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
     REGEX_REPLACE,

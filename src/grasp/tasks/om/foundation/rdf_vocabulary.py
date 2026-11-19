@@ -93,7 +93,7 @@ def namespace_of(iri: str) -> str:
     return iri[:cut + 1] if cut >= 0 else iri
 
 
-# Partition contract: ?entity ?partition. Joined optionally, entities without a
+# Partition contract: ?s ?partition. Joined optionally, entities without a
 # partition get UNCATEGORIZED. An entity may be in several partitions (e.g.
 # punning). ?evidence is for inspection only.
 UNCATEGORIZED = "uncategorized"
@@ -101,7 +101,7 @@ UNCATEGORIZED = "uncategorized"
 
 # membership matched by every subject: in the profile, the entities outside all
 # partitions are UNCATEGORIZED
-UNIVERSE = "?entity ?anyPredicate ?anyObject"
+UNIVERSE = "?s ?anyPredicate ?anyObject"
 
 
 # partition of all entities when a side has no partition query
@@ -109,7 +109,7 @@ ALL = "all"
 
 
 # Default partitions of the profile (stage b) by kind: membership patterns over
-# ?entity, as alternatives, in order. Partitions are exclusive, an entity belongs
+# ?s, as alternatives, in order. Partitions are exclusive, an entity belongs
 # to the first that matches: an entity used as a predicate is a property even if
 # it is also typed as a class (punning), a class is not also an instance.
 _NOT_VOCABULARY_TYPE = ("FILTER(isIRI(?type) && !STRSTARTS(STR(?type), STR(owl:)) && !STRSTARTS(STR(?type), STR(rdfs:)) "
@@ -118,27 +118,27 @@ _NOT_VOCABULARY_TYPE = ("FILTER(isIRI(?type) && !STRSTARTS(STR(?type), STR(owl:)
 
 KIND_ALTERNATIVES: dict[str, tuple[str, ...]] = {
     "property": (
-        "?anySubject ?entity ?anyObject",
-        "?entity rdf:type ?type VALUES ?type { owl:ObjectProperty owl:DatatypeProperty owl:AnnotationProperty rdf:Property }",
+        "?anySubject ?s ?anyObject",
+        "?s rdf:type ?type VALUES ?type { owl:ObjectProperty owl:DatatypeProperty owl:AnnotationProperty rdf:Property }",
     ),
     "class": (
-        "?entity rdf:type ?type VALUES ?type { owl:Class rdfs:Class }",
-        "?anyInstance rdf:type ?entity",
-        "?entity rdfs:subClassOf ?anySuper",
-        "?anySub rdfs:subClassOf ?entity",
+        "?s rdf:type ?type VALUES ?type { owl:Class rdfs:Class }",
+        "?anyInstance rdf:type ?s",
+        "?s rdfs:subClassOf ?anySuper",
+        "?anySub rdfs:subClassOf ?s",
     ),
-    "concept": ("?entity rdf:type skos:Concept",),
+    "concept": ("?s rdf:type skos:Concept",),
     "instance": (
         # owl:Thing: e.g. DBkWik articles typed with nothing else
-        "?entity rdf:type ?type VALUES ?type { owl:NamedIndividual owl:Thing }",
-        f"?entity rdf:type ?type {_NOT_VOCABULARY_TYPE}",
+        "?s rdf:type ?type VALUES ?type { owl:NamedIndividual owl:Thing }",
+        f"?s rdf:type ?type {_NOT_VOCABULARY_TYPE}",
         # untyped individuals (e.g. wiki articles): data beyond names; helper nodes
         # that only carry a label match no kind (in a large KG left out: the
         # negations would be evaluated on the whole KG)
-        "?entity ?p ?o FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:comment, skos:prefLabel, skos:altLabel)) "
-        "FILTER NOT EXISTS { ?entity rdf:type ?anyType } FILTER NOT EXISTS { ?anyInstance rdf:type ?entity } "
-        "FILTER NOT EXISTS { ?entity rdfs:subClassOf ?anySuper } FILTER NOT EXISTS { ?anySub rdfs:subClassOf ?entity } "
-        "FILTER NOT EXISTS { ?anySubject ?entity ?anyObject }",
+        "?s ?p ?o FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:comment, skos:prefLabel, skos:altLabel)) "
+        "FILTER NOT EXISTS { ?s rdf:type ?anyType } FILTER NOT EXISTS { ?anyInstance rdf:type ?s } "
+        "FILTER NOT EXISTS { ?s rdfs:subClassOf ?anySuper } FILTER NOT EXISTS { ?anySub rdfs:subClassOf ?s } "
+        "FILTER NOT EXISTS { ?anySubject ?s ?anyObject }",
     ),
 }
 

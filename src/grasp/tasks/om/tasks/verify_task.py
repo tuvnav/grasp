@@ -15,7 +15,7 @@ from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition
-from grasp.tasks.om.tasks.task_input import resolve_managers
+from grasp.tasks.om.tasks.task_input import managers_by_side
 from grasp.utils import FunctionCallException, format_section
 
 
@@ -393,20 +393,16 @@ class OMVerifyTask(GraspTask):
                 f"Input must be a serialized VerifyInput object: {e}"
                 ) from e
 
-        source_manager, target_manager = resolve_managers(
-            self,
-            source_kg=verify_input.source_kg,
-            target_kg=verify_input.target_kg
-            )
+        managers = managers_by_side(self, verify_input.source_kg, verify_input.target_kg)
         self.state = VerifyState(
             source_kg=verify_input.source_kg,
             target_kg=verify_input.target_kg,
-            kg_managers={Side.SOURCE: source_manager, Side.TARGET: target_manager},
+            kg_managers=managers,
             source_iri=verify_input.source_iri,
             target_iri=verify_input.target_iri,
             entity_displays={
-                Side.SOURCE: EntityDisplay.of_profile(source_manager, verify_input.source_profile, LONG_VIEW),
-                Side.TARGET: EntityDisplay.of_profile(target_manager, verify_input.target_profile, LONG_VIEW),
+                Side.SOURCE: EntityDisplay(managers[Side.SOURCE], verify_input.source_profile, LONG_VIEW),
+                Side.TARGET: EntityDisplay(managers[Side.TARGET], verify_input.target_profile, LONG_VIEW),
             },
             agentic=verify_input.agentic,
             competitors_by_side=verify_input.competitors

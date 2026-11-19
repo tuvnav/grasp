@@ -49,15 +49,21 @@ from grasp.tasks.om.data_models.entity_pairs import (
     Candidate, EntityCandidates, Hub, KeyHub, KeyMatch, Match, NeighbourEntityPair, NeighbourHub, NeighbourMatch,
     VectorHub, VectorMatch,
 )
-from grasp.tasks.om.data_models.patterns import StructureRelationKind
-from grasp.tasks.om.data_models.profile import GroupDefinition, KgProfile, describe_profile
+from grasp.tasks.om.data_models.profile import (
+    StructureRelationKind,
+    GroupDefinition,
+    KgProfile,
+    describe_profile,
+)
 from grasp.tasks.om.data_models.scope import REST, GroupRef, Population, ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
     TRANSFORM_OPERATIONS,
     NormalizationLevel,
+    normalization_level_order,
     words,
 )
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
@@ -67,7 +73,7 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, counts_by_group, group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
+    Grouping, retrieve_counts_by_group, group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.value_comparison import (
@@ -80,15 +86,16 @@ from grasp.tasks.om.kg_operations.value_comparison import (
 from grasp.tasks.om.kg_operations.value_retrieval import (
     retrieve_entities, retrieve_partitions_by_entity, retrieve_value_rows,
 )
-from grasp.tasks.om.sparql_access.values import values_clause
+from grasp.tasks.om.sparql_access.lookups import values_clause
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.tasks.prompting import Outline, OutlineItem, add_equivalence_condition, format_outline, load_prompt
-from grasp.tasks.om.tasks.task_input import resolve_alignment_state, resolve_managers
+from grasp.tasks.om.foundation.rendering import format_display_content
+from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
+from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
 from grasp.utils import FunctionCallException, format_section
 from pydantic import ValidationError
 
 
-# TODO: Perhaps move to retrieve_values.py
+# TODO: Move to lower level
 def group_refs_of_side(population: Population, side: Side) -> list[GroupRef]:
     return population.source_group_refs if side == Side.SOURCE else population.target_group_refs
 
@@ -854,13 +861,8 @@ def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     run_id = state.add_run(generator, result)
     examples = choose_examples(result)
     prefetch_shown_entities(examples, result.hubs, state.entity_displays)
-    return format_outline(
-        [
-            (
-                f"Result {run_id}",
-                format_strategy_result(result, examples, state.entity_displays)
-                )
-            ]
+    return format_display_content(
+        format_strategy_result(f"Result {run_id}", result, examples, state.entity_displays)
         )
 
 
@@ -903,10 +905,12 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
 
     examples = choose_examples(new_result)
     prefetch_shown_entities(examples, new_result.hubs, state.entity_displays)
-    return format_outline([(
-        f"Result {new_run_id} (run {run_id} with another selection)",
-        format_strategy_result(new_result, examples, state.entity_displays),
-    )])
+    return format_display_content(
+        format_strategy_result(
+            f"Result {new_run_id} (run {run_id} with another selection)",
+            new_result, examples, state.entity_displays,
+            )
+        )
 
 
 def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
@@ -925,8 +929,10 @@ def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
 
 @func_reg.register(TaskFunctionName.EVALUATE_RUN_ENSEMBLE)
 def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
-    """Merges the candidate lists of tried runs and shows the merge on the
-    entities where it equals a merge of full runs."""
+    """
+    Merges the candidate lists of tried runs and shows the merge on the
+    entities where it equals a merge of full runs.
+    """
     run_ensemble = parse_run_ensemble(state, fn_args.get("runs"))
     merged = merge_runs(
         run_ensemble,
@@ -942,10 +948,16 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
         for side in SIDES
     }
     prefetch_evaluation_entities(evaluations, merged, state.entity_displays)
-    return format_outline([(
-        f"Ensemble {format_run_ensemble(run_ensemble)}",
-        [format_ensemble_evaluation(side, evaluations[side], merged, state.entity_displays) for side in SIDES],
-    )])
+    return format_display_content(Section(
+        "Ensemble Evaluation",
+        subsections=[
+            format_run_ensemble(run_ensemble),
+            *(
+                format_ensemble_evaluation_of_side(side, evaluations[side], merged, state.entity_displays)
+                for side in SIDES
+                )
+            ]
+        ))
 
 
 @func_reg.register(TaskFunctionName.FINISH)
@@ -1044,12 +1056,12 @@ def show_candidates(state: CandidateTaskState, fn_args: dict) -> str:
 
     _, result = state.runs[run_id]
     entities = fn_args.get("entities")
-    outline: Outline = []
+    content: list[SectionContent] = []
     if entities:
         shown, missing = find_listed_entities(result, side, [IRI(entity) for entity in entities])
         title = f"Run {run_id}, the given {side} entities"
         if missing:
-            outline.append(
+            content.append(
                 "without a candidate list (no candidate, already matched, or not in the population): "
                 + ", ".join(missing))
     else:
@@ -1059,12 +1071,12 @@ def show_candidates(state: CandidateTaskState, fn_args: dict) -> str:
             title += " (trial run on a sample)"
 
     prefetch_shown_entities(shown, [], state.entity_displays)
-    outline.extend(format_selected_candidates(selected, state.entity_displays) for selected in shown)
-    return format_outline([(title, outline or ["no such entity"])])
+    content.extend(format_selected_candidates(selected, state.entity_displays) for selected in shown)
+    return format_display_content(Section(title, content or ["no such entity"]))
 
 
 # ---------------------------------------------------------------- formatting for the LLM
-# Every function returns outline items (prompting.format_outline lays them out).
+# Every function returns display content (foundation/rendering.py: Section, Item).
 NUM_EXAMPLE_ENTITIES = 3  # entities with candidates shown per side in a result
 NUM_SHOWN_HUBS = 3        # largest hubs shown in a result
 NUM_SHOWN_MATCHES = 2     # matches shown per candidate
@@ -1080,22 +1092,33 @@ def format_share(share: float) -> str:
     return f"{share:.0%}"
 
 
-def format_signals(signals: StrategySignals) -> str:
-    text = (
-        f"{signals.side}: {signals.population_size} entities"
-        f"{' (random sample)' if signals.sampled_side == signals.side else ''}; "
-        f"coverage {format_share(signals.coverage)}, "
-        f"mean list length {signals.mean_list_length:.1f}, "
-        f"ambiguous at top rank {format_share(signals.ambiguous_at_top_rank)}, "
-        f"unique {format_share(signals.unique)}"
-    )
+def format_signals(signals: StrategySignals) -> Item:
+    children = [
+        Item(f"coverage: {format_share(signals.coverage)}"),
+        Item(f"mean list length: {signals.mean_list_length:.1f}"),
+        Item(f"ambiguous at top rank: {format_share(signals.ambiguous_at_top_rank)}"),
+        Item(
+            f"unique matches: {format_share(signals.unique)}"
+            + (" (upper estimate)" if signals.sampled_side == signals.side else "")
+            )
+    ]
     if signals.already_matched_at_top_rank:
-        text += f", already matched at top rank {format_share(signals.already_matched_at_top_rank)}"
-    if signals.sampled_side is not None and signals.sampled_side != signals.side:
-        text += " (distorted: sees only the sampled counterparts)"
-    elif signals.sampled_side == signals.side:
-        text += " (unique is an upper estimate)"
-    return text
+        children.append(
+            Item(
+                f"already matched at top rank: {format_share(signals.already_matched_at_top_rank)}"
+                )
+            )
+
+    if signals.sampled_side == signals.side:
+        sample_note = ", random sample"
+    elif signals.sampled_side is not None:
+        sample_note = "; distorted: sees only the sampled counterparts"
+    else:
+        sample_note = ""
+    return Item(
+        f"{signals.side} ({signals.population_size} entities{sample_note}):",
+        children
+        )
 
 
 def format_hub(hub: Hub, entity_displays: dict[Side, EntityDisplay]) -> str:
@@ -1114,38 +1137,60 @@ def format_hub(hub: Hub, entity_displays: dict[Side, EntityDisplay]) -> str:
     return f"{shared}: {hub.num_source_entities} source x {hub.num_target_entities} target entities"
 
 
-def format_hubs(hubs: Sequence[Hub], entity_displays: dict[Side, EntityDisplay]) -> Outline:
+def format_hubs(
+        hubs: Sequence[Hub], entity_displays: dict[Side, EntityDisplay]
+        ) -> list[SectionContent] | None:
     if not hubs:
-        return []
-    largest = sorted(hubs, key=lambda hub: hub.num_source_entities * hub.num_target_entities, reverse=True)
-    return [(
+        return
+    largest_hubs = sorted(
+        hubs,
+        key=lambda hub: hub.num_source_entities * hub.num_target_entities,
+        reverse=True
+        )
+    return [
         f"{len(hubs)} hubs (too many entity pairs, so they give no candidates), the largest:",
-        [format_hub(hub, entity_displays) for hub in largest[:NUM_SHOWN_HUBS]],
-    )]
+        *(Item(format_hub(hub, entity_displays)) for hub in largest_hubs[:NUM_SHOWN_HUBS]),
+    ]
 
 
-def format_match(match: Match, own_side: Side, entity_displays: dict[Side, EntityDisplay]) -> str:
-    """One match of a candidate, the entity's own value first."""
-    source_role, target_role = match.source_rows[0].role_name, match.target_rows[0].role_name
-    own_role, candidate_role = (source_role, target_role) if own_side == Side.SOURCE else (target_role, source_role)
-    roles = f"({own_role} - {candidate_role})"
+def format_match(
+        match: Match, own_side: Side, entity_displays: dict[Side, EntityDisplay]
+        ) -> str:
+    """
+    One match of a candidate, the entity's own value first.
+    """
+    source_role = match.source_rows[0].role_name
+    target_role = match.target_rows[0].role_name
+    own_role, candidate_role = (
+        (source_role, target_role) if own_side == Side.SOURCE
+        else (target_role, source_role)
+        )
+    roles = f"roles: ({own_role} - {candidate_role})"
     match match:
         case KeyMatch():
-            return f'key "{match.key}" on normalization level {match.level} {roles}'
+            return f'matched by key "{match.key}" on normalization level "{match.level}", {roles}'
         case VectorMatch():
-            own_text, candidate_text = ((match.source_text, match.target_text) if own_side == Side.SOURCE
-                                        else (match.target_text, match.source_text))
-            return f'"{own_text}" ~ "{candidate_text}", cosine {match.cosine:.2f} {roles}'
+            own_text, candidate_text = (
+                (match.source_text, match.target_text) if own_side == Side.SOURCE
+                else (match.target_text, match.source_text)
+                )
+            return f'matched by texts: "{own_text}" ~ "{candidate_text}", cosine {match.cosine:.2f}, {roles}'
         case NeighbourMatch():
             source_witness, target_witness = match.witness
-            witness = (f"{display_entity(entity_displays, Side.SOURCE, source_witness)} = "
-                       f"{display_entity(entity_displays, Side.TARGET, target_witness)}")
+            witness = (
+                f"{display_entity(entity_displays, Side.SOURCE, source_witness)} = "
+                f"{display_entity(entity_displays, Side.TARGET, target_witness)}"
+                )
             bucket = match.num_source_entities * match.num_target_entities
-            shared = (f", shared by {match.num_source_entities} source x {match.num_target_entities} "
-                      f"target entities" if bucket > 1 else "")
-            return f"witness {witness} over {match.relation_key}{shared}"
+            witness_shared_by = (
+                f", shared by {match.num_source_entities} source x {match.num_target_entities} "
+                f"target entities" if bucket > 1 else ""
+                )
+            return f"matched by witness {witness} over relation '{match.relation_key}'{witness_shared_by}"
         case _:
-            raise NotImplementedError(f"format_match does not support {type(match).__name__}")
+            raise NotImplementedError(
+                f"format_match does not support {type(match).__name__}"
+                )
 
 
 def format_candidate(
@@ -1153,75 +1198,136 @@ def format_candidate(
         mutual_candidates: frozenset[IRI],
         unique_candidate: IRI | None,
         entity_displays: dict[Side, EntityDisplay],
-        ) -> OutlineItem:
-    """The candidate entity with its marks and its best matches."""
+        ) -> Item:
+    """
+    The candidate entity with its marks and its best matches.
+    """
     candidate_side = Side.other_side(candidate.own_side)
     marks = [
         mark for mark, applies in [
-            ("unique", candidate.candidate_entity == unique_candidate),
-            ("mutual", candidate.candidate_entity in mutual_candidates),
-            ("already matched", candidate.candidate_already_matched),
+            ("unique match", candidate.candidate_entity == unique_candidate),
+            ("mutual match", candidate.candidate_entity in mutual_candidates),
+            ("already matched before", candidate.candidate_already_matched),
         ] if applies
     ]
-    groups = ", ".join(sorted(candidate.entity_pair.entity_groups()[candidate_side]))
-    text = f"{display_entity(entity_displays, candidate_side, candidate.candidate_entity)} (group {groups})"
+    group_names = sorted(candidate.entity_pair.entity_groups()[candidate_side])
+    groups = ", ".join(f"'{group_name}'" for group_name in group_names)
+    title = f"{display_entity(
+        entity_displays, candidate_side, candidate.candidate_entity
+        )} from group{'s' if len(group_names) > 1 else ''} {groups}"
     if marks:
-        text += f" [{', '.join(marks)}]"
+        title += f" [{', '.join(marks)}]"
     entity_pair = candidate.entity_pair
     if isinstance(entity_pair, NeighbourEntityPair) and entity_pair.witness_weighting != "count":
-        text += f", witness score {entity_pair.witness_score():.2f}"
-    matches = entity_pair.matches
-    shown: Outline = [format_match(match, candidate.own_side, entity_displays) for match in matches[:NUM_SHOWN_MATCHES]]
+        title += f", witness score {entity_pair.witness_score():.2f}"
+    matches = filter_informative_matches(entity_pair.matches)
+    shown_matches = [
+        Item(format_match(match, candidate.own_side, entity_displays))
+        for match in matches[:NUM_SHOWN_MATCHES]
+        ]
     if len(matches) > NUM_SHOWN_MATCHES:
-        shown.append(f"+{len(matches) - NUM_SHOWN_MATCHES} more matches")
-    return (text, shown)
+        shown_matches.append(
+            Item(f"+{len(matches) - NUM_SHOWN_MATCHES} more matches")
+            )
+    return Item(title, shown_matches)
 
 
-def format_rivals(entity_candidates: EntityCandidates) -> Outline:
-    """The counterparts that are no listed candidates, in summary."""
-    outline: Outline = []
+def format_rivals(entity_candidates: EntityCandidates) -> list[Item]:
+    """
+    The counterparts that are no listed candidates, in summary.
+    """
+    items: list[Item] = []
     for title, counts in [
         ("competing counterparts outside the population, by group",
-         entity_candidates.num_rivals_outside_population_by_group),
+         entity_candidates.num_counterparts_outside_population_by_group),
         ("counterparts in non-competing partitions, by partition",
-         entity_candidates.num_non_competing_rivals_by_partition),
+         entity_candidates.num_non_competing_counterparts_by_partition),
     ]:
         if counts:
-            outline.append(f"{title}: " + ", ".join(f"{name} {count}" for name, count in counts.most_common()))
-    return outline
+            items.append(Item(
+                f"{title}: " + ", ".join(f"{name} {count}"
+                                         for name, count in counts.most_common())
+                ))
+    return items
 
 
-def format_selected_candidates(selected: SelectedCandidates, entity_displays: dict[Side, EntityDisplay]) -> tuple[str, Outline]:
+def filter_informative_matches(matches: Sequence[Match]) -> list[Match]:
+    """
+    The matches without those implied by a finer one: a key match whose value
+    pairs all matched already on a finer normalization level says nothing new
+    (what matches on 'case' also matches on 'words').
+    """
+    seen_value_pairs: set[tuple[str, str]] = set()
+    informative: list[Match] = []
+    for match in sorted(
+            matches,
+            key=lambda match: normalization_level_order(match.level)
+            if isinstance(match, KeyMatch) else -1
+            ):
+        contained_value_pairs = {
+            (source_row.raw_projection_value, target_row.raw_projection_value)
+            for source_row in match.source_rows for target_row in match.target_rows
+            }
+        if isinstance(match, KeyMatch) and contained_value_pairs <= seen_value_pairs:
+            continue
+        seen_value_pairs |= contained_value_pairs
+        informative.append(match)
+    return informative
+
+
+def format_selected_candidates(
+    selected: SelectedCandidates, entity_displays: dict[Side, EntityDisplay]
+        ) -> Item:
     """
     The selection of one entity: its tie groups in rank order (rank 1 = best),
     each with its candidates, then the counterparts that are not listed.
     """
     collected = selected.collected
-    outline: Outline = []
-    for position, tie_group in enumerate(selected.tie_rank_groups, start=1):
-        rivals_outside = collected.num_rivals_outside_by_rank[tie_group[0].rank_key]
-        size = len(tie_group) + rivals_outside
-        title = f"rank {position}" + (f" (tie of {size}" if size > 1 else "")
-        if rivals_outside:
-            title += f", {rivals_outside} of them outside the population"
-        title += ")" if size > 1 else ""
-        outline.append((title, [
-            format_candidate(candidate, selected.mutual_candidates, selected.unique_candidate, entity_displays)
+    items: list[Item] = []
+
+    for rank, tie_group in enumerate(selected.tie_rank_groups, start=1):
+        num_rivals_outside = collected.num_counterparts_outside_population_by_rank[
+            tie_group[0].rank_key
+            ]
+        size = len(tie_group) + num_rivals_outside
+        candidate_items = [
+            format_candidate(
+                candidate,
+                selected.mutual_candidates,
+                selected.unique_candidate,
+                entity_displays
+                )
             for candidate in tie_group
-        ]))
+            ]
+        if size == 1:
+            # one candidate on this rank: the rank in its own line
+            items.append(Item(
+                f"candidate on rank {rank}: {candidate_items[0].text}",
+                candidate_items[0].children
+                ))
+            continue
+        title = f"candidates on rank {rank}" + (f" (tie of {size}")
+        if num_rivals_outside:
+            title += f", {num_rivals_outside} of them outside the population"
+        title += "):"
+        items.append(Item(title, candidate_items))
     if selected.dropped_tie_group_rank is not None:
         dropped = (sum(candidate.rank_key == selected.dropped_tie_group_rank for candidate in collected.candidates)
-                   + collected.num_rivals_outside_by_rank[selected.dropped_tie_group_rank])
-        outline.append(f"next tie group dropped: its {dropped} entities do not fit into top_k")
-    outline.extend(format_rivals(collected))
+                   + collected.num_counterparts_outside_population_by_rank[selected.dropped_tie_group_rank])
+        items.append(Item(f"next tie group dropped: its {dropped} entities do not fit into top_k"))
+    items.extend(format_rivals(collected))
     side = collected.side
-    return (f"{side} {display_entity(entity_displays, side, collected.entity)}", outline)
+    return Item(f"{side} {display_entity(entity_displays, side, collected.entity)}", items)
 
 
-def shown_entities(examples: list[SelectedCandidates], hubs: Sequence[Hub]) -> dict[Side, set[IRI]]:
-    """All entities a result may show, per side: the example entities, their
+def shown_entities(
+        examples: list[SelectedCandidates], hubs: Sequence[Hub]
+        ) -> dict[Side, set[IRI]]:
+    """
+    All entities a result may show, per side: the example entities, their
     selected candidates, and the witnesses of the candidates and hubs (more
-    than are shown: one query per side instead of one per entity)."""
+    than are shown: one query per side instead of one per entity).
+    """
     entities_by_side: dict[Side, set[IRI]] = {side: set() for side in SIDES}
 
     def add_witness(witness: tuple[IRI, IRI]) -> None:
@@ -1242,8 +1348,10 @@ def shown_entities(examples: list[SelectedCandidates], hubs: Sequence[Hub]) -> d
 
 
 def prefetch_shown_entities(
-        examples: list[SelectedCandidates], hubs: Sequence[Hub], entity_displays: dict[Side, EntityDisplay],
-        ) -> None:
+        examples: list[SelectedCandidates],
+        hubs: Sequence[Hub],
+        entity_displays: dict[Side, EntityDisplay]
+        ):
     for side, entities in shown_entities(examples, hubs).items():
         entity_displays[side].prefetch(entities)
 
@@ -1261,30 +1369,33 @@ def choose_examples(result: StrategyResult) -> list[SelectedCandidates]:
 
 
 def format_strategy_result(
+        title: str,
         result: StrategyResult,
         examples: list[SelectedCandidates],
         entity_displays: dict[Side, EntityDisplay],
-        ) -> Outline:
+        ) -> Section:
     """
     The LLM view of a run: the signals per side, the existing equivalences found
     again, the largest hubs, and the example entities with their selection
     (choose_examples; prefetch_shown_entities first). The full result stays in
     the task state (show_candidates).
     """
-    outline: Outline = [("signals", [format_signals(result.signals[side]) for side in SIDES])]
-    # sampled = any(signals.sampled_side is not None for signals in result.signals.values())
-    # if result.existing_equivalences and sampled:
-    #     # the sample holds no entity with an equivalence: none can be found again
-    #     outline.append("existing equivalences found again: not measured in a trial run on a sample")
-    # elif result.existing_equivalences:
-    #     outline.append(
-    #         f"finds {len(result.confirmed_equivalences)} of {result.existing_equivalences} "
-    #         f"existing equivalences again (as entity pairs, before the selection)"
-    #     )
-    outline.extend(format_hubs(result.hubs, entity_displays))
-    example_items: Outline = [format_selected_candidates(selected, entity_displays) for selected in examples]
-    outline.append(("examples", example_items) if example_items else "no entity has a candidate")
-    return outline
+    subsections = [
+        Section(
+            "Signals",
+            [format_signals(result.signals[side]) for side in SIDES]
+            )
+        ]
+    if result.hubs:
+        hubs_content = format_hubs(result.hubs, entity_displays)
+        if hubs_content:
+            subsections.append(Section("Hubs", hubs_content))
+    subsections.append(Section(
+        "Example entities",
+        [format_selected_candidates(selected, entity_displays) for selected in examples]
+        or ["no entity has a candidate"]
+        ))
+    return Section(title, subsections=subsections)
 
 
 # ---------------------------------------------------------------- ensemble evaluation
@@ -1294,14 +1405,14 @@ NUM_TOO_AMBIGUOUS_EXAMPLES = 5  # too ambiguous entities shown
 NUM_SHOWN_TIED_CANDIDATES = 3   # candidates of their first sublayer shown
 
 
-def format_run_ensemble(run_ensemble: RunEnsemble) -> str:
-    return ", ".join(
-        f"{run.run_id} ({run.role}, family {run.family_name})"
+def format_run_ensemble(run_ensemble: RunEnsemble) -> Section:
+    return Section("Runs", [
+        Item(f"{run.run_id}: {run.role}s, family {run.family_name}")
         for run in sorted(run_ensemble.runs, key=lambda run: run.run_id)
-    )
+    ])
 
 
-def format_families(cell: frozenset[str]) -> str:
+def format_venn_cell(cell: frozenset[str]) -> str:
     return "{" + ", ".join(sorted(cell)) + "}"
 
 
@@ -1331,72 +1442,114 @@ def prefetch_evaluation_entities(
             for side, entities in evaluation_entities(evaluation, merged).items():
                 entities_by_side[side].update(entities)
     for side, entities in entities_by_side.items():
-        entity_displays[side].prefetch(entities, SHORT_VIEW)
+        entity_displays[side].prefetch(entities)
 
 
 def format_merged_list(
-        side: Side, entity: IRI, marked_candidate: IRI, merged: MergedCandidates,
+        side: Side,
+        entity: IRI,
+        merged: MergedCandidates,
         entity_displays: dict[Side, EntityDisplay],
-        ) -> Outline:
-    """The merged list of an entity: per candidate its rank in the list (tied
+        ) -> list[Item]:
+    """
+    The merged list of an entity: per candidate its rank in the list (tied
     candidates of a sublayer share it) and its ranks in the runs; the
-    candidate of the example pair is marked."""
+    candidate of the example pair is marked.
+    """
     other_side = Side.other_side(side)
     ranks_by_candidate = merged.candidate_rank_index[(side, entity)]
-    items: Outline = []
+    items: list[Item] = []
     list_rank = 0
     for layer in merged.pareto_layers_by_entity[(side, entity)]:
         for sublayer in layer:
             list_rank += 1
             for candidate in sublayer:
                 run_ranks = ", ".join(
-                    f"{run_id}: {rank}" for run_id, rank in sorted(ranks_by_candidate[candidate].items()))
-                mark = "  <- the example pair" if candidate == marked_candidate else ""
-                items.append(f"{list_rank}. {entity_displays[other_side].show(candidate, SHORT_VIEW)} "
-                             f"(ranks {run_ranks}){mark}")
+                    f"{run_id}: {rank}"
+                    for run_id, rank in sorted(ranks_by_candidate[candidate].items())
+                    )
+                items.append(Item(
+                    f"{list_rank}. {entity_displays[other_side].show(candidate, SHORT_VIEW)} "
+                    f"(ranks: {run_ranks})"
+                    ))
     return items
 
 
-def format_ensemble_evaluation(
-        side: Side, evaluation: EnsembleEvaluation | None, merged: MergedCandidates,
+def format_ensemble_evaluation_of_side(
+        side: Side,
+        evaluation: EnsembleEvaluation | None,
+        merged: MergedCandidates,
         entity_displays: dict[Side, EntityDisplay],
-        ) -> OutlineItem:
-    """The LLM view of the merge on one side (prefetch_evaluation_entities first)."""
+        ) -> Section:
+    """
+    The LLM view of the merge on one side (prefetch_evaluation_entities first).
+    """
+    title = f"Evaluation of {side} side"
     if evaluation is None:
-        return (f"{side}: not measurable (a run compared only a sample of the other side, so the lists "
-                f"of this side lack candidates; or the side is a large KG)")
+        return Section(title, [
+            f"Not measurable: a run compared only a sample of the other side, so the lists "
+            f"of the {side} side lack candidates; or the {side} side is a large KG."
+            ])
     if evaluation.num_evaluated == 0:
-        return f"{side}: no entity was compared by every run whose population holds it"
+        return Section(title, [
+            f"No {side} entity was compared by every run whose population holds it."
+            ])
 
-    def of_evaluated(count: int) -> str:
-        return format_share(count / evaluation.num_evaluated)
-
-    outline: Outline = [
-        f"with a candidate list {of_evaluated(evaluation.num_with_list)}, too ambiguous "
-        f"{of_evaluated(evaluation.num_too_ambiguous)} (more than {MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER} "
-        f"candidates tied on the first rank: no list), without candidates "
-        f"{of_evaluated(evaluation.num_without_candidates)}; lists cut by the budget of "
-        f"{CANDIDATE_BUDGET_PER_ENTITY}: {of_evaluated(evaluation.num_cut_by_budget)}",
-    ]
+    items: list[Item] = [
+        Item(f"with a candidate list: {format_share(evaluation.num_with_list / evaluation.num_evaluated)}"),
+        Item(
+            f"too ambiguous: {format_share(evaluation.num_too_ambiguous / evaluation.num_evaluated)} "
+            f"(more than {MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER} candidates tied on the first rank: no list)"
+            ),
+        Item(f"without candidates: {format_share(evaluation.num_without_candidates / evaluation.num_evaluated)}"),
+        Item(
+            f"lists cut by the budget of {CANDIDATE_BUDGET_PER_ENTITY}: "
+            f"{format_share(evaluation.num_cut_by_budget / evaluation.num_evaluated)}"
+            ),
+        ]
     if evaluation.num_with_list:
-        outline.append("list length: " + " · ".join(
-            f"{name}: {format_share(count / evaluation.num_with_list)}"
-            for name, count in evaluation.list_length_counts.items()))
-        outline.append(("pairs by the families of the runs that selected them (Venn cells)", [
-            f"{format_families(cell)}: {num_pairs}" for cell, num_pairs in evaluation.pairs_by_cell]))
-        outline.append(("examples, a random pair of each of the largest cells", [
-            (f"{format_families(cell)}: {entity_displays[side].show(entity, SHORT_VIEW)}",
-             format_merged_list(side, entity, candidate, merged, entity_displays))
-            for cell, entity, candidate in evaluation.cell_examples]))
+        items.append(Item(
+            "list length (share of the lists):",
+            [
+                Item(f"{name}: {format_share(count / evaluation.num_with_list)}")
+                for name, count in evaluation.list_length_counts.items()
+                ]
+            ))
+        items.append(Item(
+            "pairs by the families of the runs that selected them (Venn cells)",
+            [
+                Item(f"{format_venn_cell(cell)}: {num_pairs} pairs")
+                for cell, num_pairs in evaluation.pairs_by_cell
+                ]
+            ))
+        items.append(Item(
+            "examples, a random pair of each of the largest cells",
+            [
+                Item(
+                    f"{format_venn_cell(cell)}: {entity_displays[side].show(entity, SHORT_VIEW)}",
+                    format_merged_list(side, entity, candidate, merged, entity_displays)
+                    )
+                for cell, entity, candidate in evaluation.cell_examples
+                ]
+            ))
     if evaluation.too_ambiguous_examples:
         other_side = Side.other_side(side)
-        outline.append(("too ambiguous, e.g.", [
-            f"{entity_displays[side].show(entity, SHORT_VIEW)}: {num_tied} candidates tied on the first "
-            f"rank, e.g. " + ", ".join(entity_displays[other_side].show(candidate, SHORT_VIEW)
-                                       for candidate in tied_candidates)
-            for entity, num_tied, tied_candidates in evaluation.too_ambiguous_examples]))
-    return (f"{side}: {evaluation.num_evaluated} entities evaluated (those compared by every run "
-            f"whose population holds them)", outline)
+        items.append(Item(
+            "too ambiguous, e.g.",
+            [
+                Item(
+                    f"{entity_displays[side].show(entity, SHORT_VIEW)}: {num_tied} candidates tied on the first "
+                    f"rank, e.g. " + ", ".join(entity_displays[other_side].show(candidate, SHORT_VIEW)
+                                               for candidate in tied_candidates)
+                    )
+                for entity, num_tied, tied_candidates in evaluation.too_ambiguous_examples
+                ]
+            ))
+    return Section(title, [
+        f"{evaluation.num_evaluated} {side} entities evaluated (those compared by every run "
+        f"whose population holds them).",
+        *items,
+        ])
 
 
 # ---------------------------------------------------------------- start message
@@ -1405,50 +1558,78 @@ NUM_EXAMPLE_EQUIVALENCES = 5
 
 
 def count_group_entities(
-        manager: KgManager, kg_profile: KgProfile, matched_entities: Collection[IRI],
+        manager: KgManager, kg_profile: KgProfile, matched_entities: Collection[IRI]
         ) -> dict[str, tuple[int, int]]:
-    """Per group of the profile: its entities and those already matched (an
-    entity in several groups counts in each). Not for a large KG."""
+    """
+    Per group of the profile: its entities and those already matched (an
+    entity in several groups counts in each). Not for a large KG.
+    """
     grouping = profile_groups_to_grouping(kg_profile)
     sizes = group_sizes(manager, grouping, kg_profile.entity_space)
-    matched = (counts_by_group(manager, grouping, kg_profile.entity_space, values_clause("entity", matched_entities))
-               if matched_entities else {})
-    return {group_name: (size, matched.get(group_name, 0)) for group_name, size in sizes.items()}
+    matched = (
+        retrieve_counts_by_group(
+            manager,
+            grouping,
+            kg_profile.entity_space,
+            values_clause("s", matched_entities)
+            )
+        if matched_entities else {}
+        )
+    return {
+        group_name: (size, matched.get(group_name, 0))
+        for group_name, size in sizes.items()
+        }
 
 
-def format_group_counts(state: CandidateTaskState, side: Side) -> OutlineItem:
+def format_group_counts(state: CandidateTaskState, side: Side) -> list[SectionContent]:
     kg_profile = state.alignment_state.get_kg_profile(side)
     if kg_profile.large:
-        return "groups not counted (large KG)"
+        return ["Groups are not counted (large KG)."]
     matched_entities = state.alignment_state.aligned_entities[side]
-    counts = count_group_entities(state.kg_managers[side], kg_profile, matched_entities)
+    counts = count_group_entities(
+        state.kg_managers[side], kg_profile, matched_entities
+        )
     excluded = set(kg_profile.excluded_group_names())
-    return (
-        (
-            "entities per group (all / already matched / not matched). "
+    content: list[SectionContent] = []
+    if excluded:
+        content.append(
             "Entities of excluded groups are left out everywhere: they get "
             "no candidates and are no candidates or rivals, also when "
             "they belong to other groups too. The counts are without them."
-            ), [
-            f"{group_name}: {size} / {matched} / {size - matched}" + (" (excluded)" if group_name in excluded else "")
-            for group_name, (size, matched) in sorted(counts.items(), key=lambda item: -item[1][0])
+            )
+    content.append(Table(
+        ("group", "contained entities", "already matched", "not matched", "excluded"),
+        [
+            (
+                group_name, str(size), str(matched), str(size - matched),
+                "yes" if group_name in excluded else ""
+                )
+            for group_name, (size, matched) in sorted(
+                counts.items(), key=lambda item: -item[1][0]
+                )
             ]
-    )
+        ))
+    return content
 
 
-def format_knowledge_graph(state: CandidateTaskState, side: Side) -> str:
+def format_knowledge_graph(state: CandidateTaskState, side: Side) -> Section:
+    """
+    The knowledge graph with its profile, the profile's parts directly under
+    the knowledge graph (no heading 'Profile' of its own), then the group counts.
+    """
     kg_profile = state.alignment_state.get_kg_profile(side)
     manager = state.kg_managers[side]
-    profile_notes: Outline = list(describe_profile(kg_profile, findings=False))
-    outline: Outline = [("profile", profile_notes), format_group_counts(state, side)]
-    text = f"{manager.description}\n\n" if manager.description else ""
-    return format_section(f"{manager.kg} ({side})", text + format_outline(outline), level=3)
+    profile = describe_profile(kg_profile, findings=True)
+    return Section(
+        f"{manager.kg} ({side})",
+        [manager.description or "", *profile.content],
+        [*profile.subsections, Section("Entities per group", format_group_counts(state, side))],
+        )
 
-
-def format_alignment_status(state: CandidateTaskState) -> str:
+def format_alignment_status(state: CandidateTaskState) -> Section:
     equivalences = state.alignment_state.equivalences
     if not equivalences:
-        return format_section("Equivalences found so far", "none", level=2)
+        return Section("Equivalences found so far", ["none"])
     partitions = state.partition_names_by_entity
     by_partition_pair = Counter(
         (partitions[Side.SOURCE].get(equivalence.entity_source, "?"),
@@ -1461,31 +1642,39 @@ def format_alignment_status(state: CandidateTaskState) -> str:
             equivalence.entity_source if side == Side.SOURCE else equivalence.entity_target
             for equivalence in examples
         )
-    outline: Outline = [
-        (f"{len(equivalences)} equivalences, by partition pair (source - target)", [
-            f"{source_partition} - {target_partition}: {count}"
-            for (source_partition, target_partition), count in by_partition_pair.most_common()
-        ]),
-        ("examples", [
-            f"{state.entity_displays[Side.SOURCE].show(equivalence.entity_source)} = "
-            f"{state.entity_displays[Side.TARGET].show(equivalence.entity_target)}"
-            for equivalence in examples
-        ]),
-    ]
-    return format_section("Equivalences found so far", format_outline(outline), level=2)
+    return Section("Equivalences found so far", [
+        Item(
+            f"{len(equivalences)} equivalences, by partition pair (source - target)",
+            [
+                Item(f"{source_partition} - {target_partition}: {count}")
+                for (source_partition, target_partition), count in by_partition_pair.most_common()
+                ]
+            ),
+        Item(
+            "examples",
+            [
+                Item(
+                    f"{state.entity_displays[Side.SOURCE].show(equivalence.entity_source)} = "
+                    f"{state.entity_displays[Side.TARGET].show(equivalence.entity_target)}"
+                    )
+                for equivalence in examples
+                ]
+            ),
+        ])
 
 
 def format_start_message(state: CandidateTaskState) -> str:
-    knowledge_graphs = "\n\n".join(
-        format_knowledge_graph(state, side) for side in SIDES
+    knowledge_graphs = Section(
+        "Knowledge graphs",
+        subsections=[format_knowledge_graph(state, side) for side in SIDES],
         )
     return (
-        format_section("Knowledge graphs", knowledge_graphs, level=2)
-        + "\n\n" + format_alignment_status(state)
+        format_display_content(knowledge_graphs)
+        + "\n\n" + format_display_content(format_alignment_status(state))
     )
 
-
 # ---------------------------------------------------------------- function definitions
+
 
 GROUP_REFS_SCHEMA = {
     "type": "array",
@@ -1493,12 +1682,12 @@ GROUP_REFS_SCHEMA = {
         {"type": "string"},
         {"type": "object", "properties": {
             "name": {"type": "string"},
-            "membership_sparql": {"type": "string", "description": "SPARQL group pattern over ?entity"},
+            "membership_sparql": {"type": "string", "description": "SPARQL group pattern over ?s"},
         }, "required": ["name", "membership_sparql"]},
     ]},
     "description": (
         f"Groups of the profile by name, {REST!r} for all groups that are not excluded, or a group "
-        "defined inline for this strategy (a new name and a SPARQL pattern over ?entity). "
+        "defined inline for this strategy (a new name and a SPARQL pattern over ?s). "
         "Entities of excluded groups are never compared."
     ),
 }
@@ -1709,15 +1898,14 @@ class OMCandidateTask(GraspTask):
     state: CandidateTaskState
 
     def setup(self, input: Any) -> str:
-        source_manager, target_manager = resolve_managers(self, input)
-        kg_managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
         alignment_state = resolve_alignment_state(input)
+        kg_managers = managers_by_side(self, alignment_state.source_kg_name, alignment_state.target_kg_name)
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
             partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
             entity_displays={
-                side: EntityDisplay.of_profile(kg_managers[side], alignment_state.get_kg_profile(side))
+                side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES
             },
         )

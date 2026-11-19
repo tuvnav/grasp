@@ -3,9 +3,7 @@ The search-verify judge (om-search-verify): an agent gets a unit (focus
 entities with their candidate lists, tasks/candidate_task.py and
 kg_operations/candidate_selection.py: build_judging_units), judges the
 candidates and searches beyond the lists with the KG functions; it sets
-equivalences and finishes. Grown from the old OM task (agentic_search_verify):
-its search instructions and its collision warnings stay, the relations other
-than equivalence and the alignment it kept itself are gone.
+equivalences and finishes.
 
 The variant (CandidateJudgeVariant) decides how the unit is shown: focused
 (the focus entities are named, each with its list) or clusters (two lists of
@@ -31,6 +29,7 @@ from typing import Any, Callable
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.sparql.types import AskResult
+from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import prepare_entity
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
@@ -44,15 +43,11 @@ from grasp.tasks.om.data_models.verification import (
 )
 from grasp.tasks.om.foundation.configuration import know_before_use, load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
-from grasp.tasks.om.kg_operations.entity_rendering import (
-    LONG_VIEW,
-    EntityDisplay,
-    shown_iris,
-)
-from grasp.tasks.om.sparql_access.lookups import ensure_known, to_sparql_term
+from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
+from grasp.tasks.om.sparql_access.lookups import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
-from grasp.tasks.om.tasks.task_input import resolve_managers
+from grasp.tasks.om.tasks.task_input import managers_by_side
 from grasp.utils import FunctionCallException, format_section
 
 SIDES = (Side.SOURCE, Side.TARGET)
@@ -97,7 +92,9 @@ func_reg = FunctionRegistry()
 # ---------------------------------------------------------------- what is shown
 
 def ordered_candidates(focus: FocusEntity, variant: CandidateJudgeVariant, seed: str) -> list[ListedCandidate]:
-    """The candidates of a focus entity in rank order, or shuffled (seeded by the unit)."""
+    """
+    The candidates of a focus entity in rank order, or shuffled (seeded by the unit).
+    """
     candidates = list(focus.candidates)
     if variant.candidate_order == "random":
         random.Random(f"{seed}|{focus.entity}").shuffle(candidates)
@@ -105,8 +102,10 @@ def ordered_candidates(focus: FocusEntity, variant: CandidateJudgeVariant, seed:
 
 
 def presented_entities(unit: JudgingUnit, variant: CandidateJudgeVariant) -> dict[Side, list[IRI]]:
-    """Per side the entities shown: the focus entities of the side and the
-    candidates of the other side's focus entities, each once."""
+    """
+    Per side the entities shown: the focus entities of the side and the
+    candidates of the other side's focus entities, each once.
+    """
     presented: dict[Side, list[IRI]] = {side: [] for side in SIDES}
     for focus in unit.focus:
         side, other_side = Side(focus.side), Side.other_side(Side(focus.side))
@@ -116,13 +115,17 @@ def presented_entities(unit: JudgingUnit, variant: CandidateJudgeVariant) -> dic
 
 
 def format_signals(candidate: ListedCandidate) -> str:
-    """e.g. 'Pareto layer 1; key: rank 1, vector: rank 3'."""
+    """
+    e.g. 'Pareto layer 1; key: rank 1, vector: rank 3'.
+    """
     ranks = ", ".join(f"{signal.family}: rank {signal.rank}" for signal in candidate.signals)
     return f"Pareto layer {candidate.pareto_layer}" + (f"; {ranks}" if ranks else "")
 
 
 def focused_input(state: SearchVerifyState) -> str:
-    """Each focus entity with its candidates."""
+    """
+    Each focus entity with its candidates.
+    """
     kg_names = state.kg_names
     sections = []
     with_candidates = any(focus.candidates for focus in state.unit.focus)
@@ -178,7 +181,7 @@ def ask(manager: KgManager, sparql: str) -> bool:
 
 
 def matches_membership(manager: KgManager, entity: IRI, membership_sparql: str) -> bool:
-    return ask(manager, f"ASK {{ VALUES ?entity {{ {to_sparql_term(manager, entity)} }} {membership_sparql} }}")
+    return ask(manager, f"ASK {{ VALUES ?s {{ {prepare_identifier_for_sparql(entity, manager.iri_literal_parser)} }} {membership_sparql} }}")
 
 
 def check_entity_space(state: SearchVerifyState, side: Side, entity: IRI) -> None:
@@ -444,16 +447,14 @@ class SearchVerifyTask(GraspTask):
         except Exception as error:
             raise ValueError(f"Input must be a serialized SearchVerifyInput: {error}") from error
         alignment_state = search_verify_input.alignment_state
-        source_manager, target_manager = resolve_managers(
-            self, source_kg=alignment_state.source_kg_name, target_kg=alignment_state.target_kg_name)
-        managers = {Side.SOURCE: source_manager, Side.TARGET: target_manager}
+        managers = managers_by_side(self, alignment_state.source_kg_name, alignment_state.target_kg_name)
         self.state = SearchVerifyState(
             kg_managers=managers,
             alignment_state=alignment_state,
             unit=search_verify_input.unit,
             variant=search_verify_input.variant,
             entity_displays={
-                side: EntityDisplay.of_profile(managers[side], alignment_state.get_kg_profile(side), LONG_VIEW)
+                side: EntityDisplay(managers[side], alignment_state.get_kg_profile(side), LONG_VIEW)
                 for side in SIDES
             },
             know_before_use=know_before_use(self.config),
@@ -467,7 +468,7 @@ class SearchVerifyTask(GraspTask):
             for entity in state.presented[side]:
                 self.known.add(entity)
                 if entity in display.contexts_by_entity:
-                    self.known.update(shown_iris(display.contexts_by_entity[entity]))
+                    self.known.update(display.shown_iris(entity))
         if state.variant.presentation == "focused":
             return focused_input(state)
         return clusters_input(state)

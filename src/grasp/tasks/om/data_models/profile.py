@@ -35,13 +35,14 @@ stages read them as unverified observations and report a contradiction as a
 flag instead of changing an earlier stage's result.
 """
 from enum import StrEnum, auto
+import re
 from typing import Any, Iterable, Literal, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
-from grasp.tasks.om.foundation.types import IRI, NameType
-from grasp.tasks.om.foundation.vocabulary import VOCABULARY_PREFIXES
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent
+from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.rdf_vocabulary import RDF_TYPE, VOCABULARY, VOCABULARY_PREFIXES
 
 INVERSE_PREFIX = "^"
 
@@ -56,6 +57,129 @@ class Stage(StrEnum):
 
 
 STAGES = list(Stage)  # in pipeline order
+
+
+class RelationAlgebra(BaseModel):
+    symmetric: bool = False
+    transitive: bool = False
+    inverse_of: str | None = None
+
+
+class PredicatePattern(BaseModel):
+    # unknown fields (e.g. a misspelled "pattern") are errors, not silently dropped
+    model_config = ConfigDict(extra="forbid")
+    patterns: list[str] = []  # SPARQL patterns over ?s and ?o
+    predicates: list[IRI] = []
+
+    @model_validator(mode='after')
+    def not_empty(self) -> "PredicatePattern":
+        if not self.patterns and not self.predicates:
+            raise ValueError("SPARQL pattern or predicates required")
+        return self
+
+    def branches_for_union(self) -> list[str]:
+        """
+        The alternatives for querying: each pattern, and each predicate on
+        its own (not a path <a>|<b>, because Qlever resolves single predicates
+        much faster than predicate paths).
+        """
+        return list(self.patterns) + [f"?s <{p}> ?o" for p in self.predicates]
+
+    def inverted(self) -> "PredicatePattern":
+        """
+        The pattern in the other direction: ?s and ?o 
+        swapped in every alternative (e.g. "the parts 
+        of ?s" from "?s is part of ?o").
+        """
+        return PredicatePattern(
+            patterns=[
+                swap(alternative) for alternative in self.branches_for_union()
+                ]
+            )
+
+
+def swap(pattern: str) -> str:
+    return re.sub(
+        r"\?(s|o)\b",
+        lambda match: "?o" if match.group(1) == "s" else "?s", pattern
+        )
+
+
+class StructureRelationKind(StrEnum):
+    SUBSUMPTION = auto()
+    MEMBERSHIP = auto()
+    PARTONOMY = auto()
+    DISJOINTNESS = auto()
+    OTHER = auto()
+
+
+DEFAULT_KIND_ALGEBRA = {
+    StructureRelationKind.SUBSUMPTION: {"transitive": True},
+    StructureRelationKind.DISJOINTNESS: {"symmetric": True},
+}
+
+
+class StructureRelation(RelationAlgebra):
+    name: str
+    kind: StructureRelationKind
+    predicate_pattern: PredicatePattern
+    corresponds_to: str | None = None
+    source: Literal["default", "declared", "llm"] = "default"
+
+    @model_validator(mode="after")
+    def kind_defaults(self) -> "StructureRelation":
+        manual_args = self.model_fields_set
+        for name, value in DEFAULT_KIND_ALGEBRA.get(self.kind, {}).items():
+            if name not in manual_args:
+                setattr(self, name, value)
+        return self
+
+
+def _structure(name: str, kind: StructureRelationKind, predicates: list[str] = [],
+               patterns: list[str] = [], **algebra) -> StructureRelation:
+    return StructureRelation(
+        name=name, kind=kind,
+        predicate_pattern=PredicatePattern(predicates=[IRI(p) for p in predicates], patterns=patterns),
+        **algebra,
+    )
+
+
+_RDFS = "http://www.w3.org/2000/01/rdf-schema#"
+
+
+_OWL = "http://www.w3.org/2002/07/owl#"
+
+
+_SKOS = "http://www.w3.org/2004/02/skos/core#"
+
+
+_PART_OF = "http://purl.obolibrary.org/obo/BFO_0000050"
+
+
+_NOT_VOCABULARY = " && ".join(f'!STRSTARTS(STR(?o), "{ns}")' for ns in VOCABULARY)
+
+
+# default structure relations, read from ?s (specific) to ?o (general); the
+# default profile keeps those used in a partition
+DEFAULT_STRUCTURE_RELATIONS = [
+    # without the blank nodes of OWL restrictions (part_of, existential_restriction)
+    _structure("subclass_of", StructureRelationKind.SUBSUMPTION,
+               patterns=[f"?s <{_RDFS}subClassOf> ?o . FILTER(isIRI(?o))"]),
+    _structure("subproperty_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subPropertyOf"]),
+    # skos:broader is not transitive by the SKOS specification, only skos:broaderTransitive
+    _structure("broader", StructureRelationKind.SUBSUMPTION, [_SKOS + "broader"], transitive=False),
+    _structure("broader_transitive", StructureRelationKind.SUBSUMPTION, [_SKOS + "broaderTransitive"]),
+    # types from the vocabulary (owl:Class, owl:NamedIndividual) declare the kind, not a membership
+    _structure("instance_of", StructureRelationKind.MEMBERSHIP,
+               patterns=[f"?s <{RDF_TYPE}> ?o . FILTER(isIRI(?o) && {_NOT_VOCABULARY})"]),
+    _structure("in_scheme", StructureRelationKind.MEMBERSHIP, [_SKOS + "inScheme"]),
+    _structure("part_of", StructureRelationKind.PARTONOMY, [_PART_OF],
+               patterns=[f"?s <{_RDFS}subClassOf> [ <{_OWL}onProperty> <{_PART_OF}> ; <{_OWL}someValuesFrom> ?o ]"]),
+    # any existential restriction; often a partonomy under a KG-specific property
+    # (e.g. UNDEFINED_part_of in the OAEI Anatomy track), which the profile task can tell
+    _structure("disjoint_with", StructureRelationKind.DISJOINTNESS,
+               [_OWL + "disjointWith", _OWL + "propertyDisjointWith"]),
+]
 
 
 class Roles(BaseModel):
@@ -104,7 +228,7 @@ class Roles(BaseModel):
         Raises ValueError for an unknown name.
         """
         if name in ROLE_FIELDS:
-            return getattr(self, name)  # my be 'None'
+            return getattr(self, name)  # may be 'None'
         relation_name = name.removeprefix(INVERSE_PREFIX)
         relation = next(
             (relation for relation in self.structure if relation.name == relation_name),
@@ -134,7 +258,7 @@ class Partition(BaseModel):
     entity belongs to the first whose membership matches."""
     model_config = ConfigDict(extra="forbid")
     name: str
-    membership_sparql: str  # SPARQL group pattern over ?entity
+    membership_sparql: str  # SPARQL group pattern over ?s
     features: str = ""      # what distinguishes its entities from the rest
 
 
@@ -165,7 +289,7 @@ class GroupDefinition(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
     name: str
-    membership_sparql: str  # SPARQL group pattern over ?entity
+    membership_sparql: str  # SPARQL group pattern over ?s
     origin: GroupOrigin = GroupOrigin.FORMED
     parent: str | None = None  # a group it is part of (for reading; membership is its own)
     features: str = ""         # what distinguishes its entities, to recognize them
@@ -179,7 +303,7 @@ class GroupProfile(BaseModel):
     # excluded group is not aligned even if it is in other groups
     excluded: bool = False
     exclusion_reason: str = ""
-    local_name_type: NameType | None = None  # set by stage e (or its default)
+    local_name_type: LocalNameType | None = None  # set by stage e (or its default)
     added: Roles = Roles()    # group-specific; a relation overrides the KG-wide one of its name
     removed: Roles = Roles()  # used in the group, but uninformative there
 
@@ -438,89 +562,191 @@ def check_structure(relations: list[StructureRelation]) -> list[str]:
 
 # --- description for prompts -------------------------------------------------------
 
+# TODO: Why not use GRASPs prefixed version?
 def short_iri(iri: str) -> str:
-    """Vocabulary IRIs by their prefixed name (rdfs:label), others as they are."""
+    """
+    Vocabulary IRIs by their prefixed name (rdfs:label), others as they are.
+    """
     for namespace, prefix in VOCABULARY_PREFIXES.items():
         if iri.startswith(namespace):
             return f"{prefix}:{iri[len(namespace):]}"
     return iri
 
 
-def describe_pattern(pattern: PredicatePattern) -> str:
-    return ", ".join([short_iri(predicate) for predicate in pattern.predicates]
-                     + [f"pattern {{ {sparql} }}" for sparql in pattern.patterns])
+def describe_predicate_pattern(pattern: PredicatePattern) -> str:
+    parts = []
+    if pattern.predicates:
+        parts.append("predicates: " + ", ".join(
+            short_iri(predicate) for predicate in pattern.predicates
+        ) + ".")
+    if pattern.patterns:
+        parts.append("sparql patterns: " + ", ".join(
+            f"{{{sparql}}}" for sparql in pattern.patterns
+            ) + ".")
+    return " ".join(parts)
 
 
-def describe_relation(relation: StructureRelation) -> str:
-    algebra = [property_name for property_name in ("transitive", "symmetric") if getattr(relation, property_name)]
+def describe_predicate_pattern_items(pattern: PredicatePattern) -> list[Item]:
+    """The predicates and the SPARQL patterns, one sub-item each."""
+    items = []
+    if pattern.predicates:
+        items.append(Item("predicates:", [Item(short_iri(predicate)) for predicate in pattern.predicates]))
+    if pattern.patterns:
+        items.append(Item("sparql patterns:", [Item(f"{{{sparql}}}") for sparql in pattern.patterns]))
+    return items
+
+
+ROLE_DESCRIPTIONS: dict[RoleName, str] = {
+    "names": "preferred names",
+    "synonyms": "alternative names",
+    "definitions": "textual definitions or descriptions",
+    "codes": "codes of the entity in its own system (notations, IDs)",
+    "cross_references": "codes or IRIs of the entity in other systems",
+    "noise": "values that say nothing about the meaning of an entity (e.g. formatting, provenance, media files)",
+}
+
+
+# how a structure relation of a kind reads from ?s to ?o
+RELATION_READINGS = {
+    StructureRelationKind.SUBSUMPTION: "?s is narrower than ?o",
+    StructureRelationKind.MEMBERSHIP: "?s is a member of ?o",
+    StructureRelationKind.PARTONOMY: "?s is part of ?o",
+    StructureRelationKind.DISJOINTNESS: "?s and ?o share no members",
+    StructureRelationKind.OTHER: "?s is related to ?o",
+}
+
+
+def describe_structure_relation_heading(relation: StructureRelation) -> str:
+    """
+    E.g. "'subclass_of' (subsumption: ?s is narrower than ?o; transitive)".
+    """
+    algebra_description = [
+        property_name for property_name in ("transitive", "symmetric")
+        if getattr(relation, property_name)
+        ]
     if relation.inverse_of:
-        algebra.append(f"inverse of {relation.inverse_of}")
-    return (f"{relation.name} ({relation.kind.value}{', ' + ', '.join(algebra) if algebra else ''}): "
-            f"{describe_pattern(relation.predicate_pattern)}")
+        algebra_description.append(f"inverse of {relation.inverse_of}")
+    algebra = "; " + ", ".join(algebra_description) if algebra_description else ""
+    return f"'{relation.name}' ({relation.kind.value}: {RELATION_READINGS[relation.kind]}{algebra})"
 
 
-def describe_roles(roles: Roles) -> list[str]:
-    lines = [f"{field.replace('_', ' ')}: {describe_pattern(pattern)}"
-             for field in ROLE_FIELDS if (pattern := getattr(roles, field)) is not None]
-    lines += [f"structure relation {describe_relation(relation)}" for relation in roles.structure]
-    return lines
+def describe_structure_relation(relation: StructureRelation) -> str:
+    """The relation in one line (e.g. in the role overview of the profile stages)."""
+    return (f"{describe_structure_relation_heading(relation)}: "
+            f"{describe_predicate_pattern(relation.predicate_pattern)}")
+
+
+def describe_roles(roles: Roles) -> list[Item]:
+    """Each role and structure relation with its predicates and patterns below it."""
+    items = [
+        Item(f"'{field.replace('_', ' ')}' ({ROLE_DESCRIPTIONS[field]}):", describe_predicate_pattern_items(pattern))
+        for field in ROLE_FIELDS
+        if (pattern := getattr(roles, field)) is not None
+        ]
+    items += [
+        Item(f"structure relation {describe_structure_relation_heading(relation)}:",
+             describe_predicate_pattern_items(relation.predicate_pattern))
+        for relation in roles.structure
+        ]
+    return items
 
 
 def describe_profile(profile: KgProfile,
                      findings: bool = True,
                      groups: Iterable[str] | None = None
-                     ) -> list[str]:
+                     ) -> Section:
     """
     The profile as short notes for prompts.
     Patterns read from ?s, the entity, to ?o; structure relations from the
     specific to the general entity. With groups, only the findings about the
     whole KG and about these groups (or partitions).
     """
-    notes = []
-    if profile.entity_space:
-        notes.append("Entities to align have IRIs starting with " + " or ".join(profile.entity_space) + ".")
+    title = "Profile"
+    content = []
+    subsections: list[Section] = []
+
+    if len(profile.entity_space) == 1:
+        content.append(f"Entities to align have IRIs starting with <{profile.entity_space[0]}>.")
+    elif profile.entity_space:
+        content += ["Entities to align have IRIs starting with:"]
+        content += [Item(f"<{space}>") for space in profile.entity_space]
+
     if profile.partitions:
-        parts = [f"{partition.name}: {partition.features}" if partition.features else partition.name
-                 for partition in profile.partitions]
-        notes.append("Partitions (exclusive kinds of entities): " + "; ".join(parts) + ".")
-    if profile.non_competing_pairs:
-        notes.append("Do not compete with each other: "
-                     + "; ".join(f"{pair.partition_a} and {pair.partition_b}" + (f" ({pair.reason})" if pair.reason else "")
-                                 for pair in profile.non_competing_pairs)
-                     + ".")
+        partition_subsection = Section(
+            "Partitions (exclusive ontological meta-categories)"
+            )
+        partition_content = ["Partition names and features:"]
+        partition_content += [
+            Item(f"{partition.name}: {partition.features}")
+            if partition.features
+            else Item(partition.name)
+            for partition in profile.partitions
+            ]
+        if profile.non_competing_pairs:
+            partition_content += ["Partitions which do not compete with each other:"]
+            # pairs of one partition with the same reason in one item
+            partners_by_reason: dict[tuple[str, str], list[str]] = {}
+            for pair in profile.non_competing_pairs:
+                partners_by_reason.setdefault((pair.partition_a, pair.reason), []).append(pair.partition_b)
+            partition_content += [
+                Item(f"{partition} and {', '.join(partners)}" + (f": {reason}" if reason else ""))
+                for (partition, reason), partners in partners_by_reason.items()
+            ]
+        partition_subsection.content = partition_content
+        subsections.append(partition_subsection)
+
     if profile.groups:
-        parts = []
+        groups_subsection = Section("Groups (thematic categories, may overlap)")
+        groups_content: list[SectionContent] = []
+        # groups that only copy a partition are named once, not described
+        partition_copies = [group.name for group in profile.groups
+                            if is_partition_copy(group) and not group.excluded]
+        if partition_copies:
+            groups_content.append(f"Each of these partitions is also a group: {', '.join(partition_copies)}.")
+        included_groups = ["Group names and features:"]
+        excluded_groups = ["Excluded groups:"]
         for group in profile.groups:
-            definition = group.definition
-            text = group.name
-            if definition.parent:
-                text += f" (part of {definition.parent})"
-            if definition.features:
-                text += f": {definition.features}"
-            if group.excluded:
-                text += " [excluded from the alignment" + (f": {group.exclusion_reason}" if group.exclusion_reason else "") + "]"
-            parts.append(text)
-        notes.append("Groups (may overlap): " + "; ".join(parts) + ".")
-    role_lines = describe_roles(profile.roles)
-    if role_lines:
-        notes.append("Roles of predicates (?s entity, ?o value): " + "; ".join(role_lines) + ".")
-    for group in profile.groups:
-        details = []
-        if group.local_name_type is not None:
-            details.append(f"local names of IRIs are {group.local_name_type.value}s"
-                           if group.local_name_type != NameType.OTHER else "local names of IRIs are mixed")
-        added, removed = describe_roles(group.added), describe_roles(group.removed)
-        if added:
-            details.append("in addition " + "; ".join(added))
-        if removed:
-            details.append("not informative here: " + "; ".join(removed))
-        if details:
-            notes.append(f"Group {group.name}: " + "; ".join(details) + ".")
-    if findings:
-        shown = None if groups is None else set(groups)
-        for finding in profile.findings:
-            if shown is not None and finding.group is not None and finding.group not in shown:
+            if is_partition_copy(group) and not group.excluded:
                 continue
-            scope = f" ({finding.group})" if finding.group else ""
-            notes.append(f"Observation{scope}: {finding.text}")
-    return notes
+            if group.excluded:
+                excluded_groups += [Item(
+                    f"{group.name}" + (f": {group.exclusion_reason}"
+                                       if group.exclusion_reason else "")
+                )]
+            else:
+                included_groups += [Item(
+                    f"{group.name}"
+                    + (f" (part of '{group.definition.parent}')"
+                       if group.definition.parent else "")
+                    + (f": {group.definition.features}"
+                       if group.definition.features else "")
+                )]
+        for group_descriptions in (included_groups, excluded_groups):
+            groups_content += group_descriptions if len(group_descriptions) > 1 else []
+
+        groups_subsection.content = groups_content
+        subsections.append(groups_subsection)
+
+    roles_items = describe_roles(profile.roles)
+    if roles_items:
+        roles_subsection = Section(
+            "Important Predicates",
+            ["Predicates map from ?s (entity) to ?o (value):", *roles_items]
+            )
+        subsections.append(roles_subsection)
+
+    if findings and profile.findings:
+        shown_findings = [finding for finding in profile.findings
+                          if groups is None or finding.group is None or finding.group in groups]
+        if shown_findings:
+            subsections.append(Section("Findings", [
+                Item(finding.text if finding.group is None else f"{finding.group}: {finding.text}")
+                for finding in shown_findings
+            ]))
+
+    return Section(title, content, subsections)
+
+
+def is_partition_copy(group: GroupProfile) -> bool:
+    """A group that is a partition, unchanged and without own features."""
+    return group.definition.origin == GroupOrigin.PARTITION and not group.definition.features

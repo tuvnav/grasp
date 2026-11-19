@@ -321,12 +321,12 @@ class EntityCandidates:
     candidates: list[Candidate] = field(default_factory=list)
     # group -> competing counterparts outside the population (a counterpart in two
     # groups counts in both)
-    num_rivals_outside_population_by_group: Counter[str] = field(default_factory=Counter)
+    num_counterparts_outside_population_by_group: Counter[str] = field(default_factory=Counter)
     # rank key of the pair -> competing counterparts outside the population
     # (each counted once); they take places in the tie groups of the selection
-    num_rivals_outside_by_rank: Counter[float] = field(default_factory=Counter)
+    num_counterparts_outside_population_by_rank: Counter[float] = field(default_factory=Counter)
     # partition -> counterparts whose partition does not compete with the entity's
-    num_non_competing_rivals_by_partition: Counter[str] = field(default_factory=Counter)
+    num_non_competing_counterparts_by_partition: Counter[str] = field(default_factory=Counter)
 
     @property
     def top_rank(self) -> float:
@@ -340,21 +340,34 @@ class EntityCandidates:
         """
         if not self.candidates:
             return False
+        top_rank = self.top_rank  # once: it goes over all candidates
         return any(candidate.candidate_already_matched for candidate in self.candidates
-                   if candidate.rank_key == self.top_rank)
+                   if candidate.rank_key == top_rank)
 
-    def entities_of_already_matched_at_top_rank(self) -> set[IRI]:
-        return set(
+    def iris_of_already_matched_at_top_rank(self) -> list[IRI]:
+        if not self.candidates:
+            return []
+        top_rank = self.top_rank  # once: it goes over all candidates
+        return sorted(
             candidate.candidate_entity for candidate in self.candidates
             if candidate.candidate_already_matched
-            and candidate.rank_key == self.top_rank
+            and candidate.rank_key == top_rank
             )
+
+    def get_top_rank_candidates(self) -> list[IRI]:
+        if not self.candidates:
+            return []
+        top_rank = self.top_rank
+        return sorted(
+            candidate.candidate_entity for candidate in self.candidates
+            if candidate.rank_key == top_rank
+        )
 
     @property
     def ambiguous_at_top_rank(self) -> bool:
         """More than one entity on the best rank: the strategy cannot tell which
         one is best. Rivals outside the population count too."""
         entries_by_rank = Counter(candidate.rank_key for candidate in self.candidates)
-        entries_by_rank.update(self.num_rivals_outside_by_rank)
+        entries_by_rank.update(self.num_counterparts_outside_population_by_rank)
         entries_by_rank = +entries_by_rank          # drops ranks with count 0
         return bool(entries_by_rank) and entries_by_rank[min(entries_by_rank)] > 1

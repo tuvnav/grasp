@@ -28,16 +28,19 @@ from typing import TYPE_CHECKING, Iterable
 
 from grasp.manager import KgManager
 from grasp.tasks.om.foundation.types import IRI
-from grasp.tasks.om.foundation.vocabulary import (
+from grasp.tasks.om.foundation.rdf_vocabulary import (
     LABEL_PREDICATES,
     RDF_TYPE,
     SYNONYM_PREDICATES,
     UNIVERSE,
     local_name,
 )
-from grasp.tasks.om.sparql_access.execution import select_rows
-from grasp.tasks.om.sparql_access.query_building import sparql_path, union_alternatives
-from grasp.tasks.om.sparql_access.values import values_clause
+from grasp.tasks.om.sparql_access.lookups import (
+    select_rows,
+    sparql_path,
+    extract_union_alternatives,
+    values_clause,
+)
 
 if TYPE_CHECKING:
     from grasp.tasks.om.kg_operations.grouping import Grouping
@@ -72,7 +75,7 @@ def is_large(triples: int | None) -> bool:
 
 
 def type_membership(type_iri: str) -> str:
-    return f"?entity <{RDF_TYPE}> <{type_iri}>"
+    return f"?s <{RDF_TYPE}> <{type_iri}>"
 
 
 def class_counts(manager: KgManager) -> dict[IRI, int]:
@@ -94,17 +97,17 @@ def spread_offsets(count: int, k: int, chunks: int) -> list[tuple[int, int]]:
 def draw_members(manager: KgManager, membership: str, count: int, k: int, chunks: int = SAMPLE_CHUNKS) -> list[IRI]:
     members: dict[IRI, None] = {}
     for offset, limit in spread_offsets(count, k, chunks):
-        rows = select_rows(manager, f"SELECT DISTINCT ?entity WHERE {{ {membership} FILTER(isIRI(?entity)) }} "
+        rows = select_rows(manager, f"SELECT DISTINCT ?s WHERE {{ {membership} FILTER(isIRI(?s)) }} "
                                     f"OFFSET {offset} LIMIT {limit}")
         for row in rows:
-            if "entity" in row:
-                members[IRI(row["entity"].value)] = None
+            if "s" in row:
+                members[IRI(row["s"].value)] = None
     return list(members)
 
 
 def count_members(manager: KgManager, membership: str) -> int | None:
     try:
-        rows = select_rows(manager, f"SELECT (COUNT(DISTINCT ?entity) AS ?n) WHERE {{ {membership} FILTER(isIRI(?entity)) }}")
+        rows = select_rows(manager, f"SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{ {membership} FILTER(isIRI(?s)) }}")
         return int(rows[0]["n"].value) if rows and "n" in rows[0] else None
     except Exception:
         return None
@@ -170,11 +173,11 @@ class KgSample:
         for start in range(0, len(unknown), MATCH_BATCH):
             batch = unknown[start:start + MATCH_BATCH]
             values = values_block(batch)
-            alternatives = union_alternatives(membership)
+            alternatives = extract_union_alternatives(membership)
             body = (f"{values}\n{alternatives[0]}" if len(alternatives) == 1
                     else " UNION ".join(f"{{ {values}\n{a} }}" for a in alternatives))
-            found = {IRI(r["entity"].value) for r in select_rows(
-                self.manager, f"SELECT DISTINCT ?entity WHERE {{ {body} }}") if "entity" in r}
+            found = {IRI(r["s"].value) for r in select_rows(
+                self.manager, f"SELECT DISTINCT ?s WHERE {{ {body} }}") if "s" in r}
             known.update({e: e in found for e in batch})
         return {e for e in entities if known.get(e)}
 
@@ -233,7 +236,7 @@ def current_sample(manager: KgManager) -> KgSample | None:
 
 
 def values_block(entities: list[IRI]) -> str:
-    return values_clause("entity", entities)
+    return values_clause("s", entities)
 
 
 # --- stage a: prefixes from class samples ---------------------------------------------
@@ -286,12 +289,12 @@ def large_prefix_counts(manager: KgManager, classes: dict[IRI, int]) -> PrefixCo
         sample = draw_members(manager, type_membership(type_iri), n, CLASS_SAMPLE, 3)
         if not sample:
             continue
-        with_name = {IRI(r["entity"].value) for r in select_rows(
-            manager, f"SELECT DISTINCT ?entity WHERE {{ {values_block(sample)} ?entity {names} ?name }}") if "entity" in r}
+        with_name = {IRI(r["s"].value) for r in select_rows(
+            manager, f"SELECT DISTINCT ?s WHERE {{ {values_block(sample)} ?s {names} ?name }}") if "s" in r}
         # number of sampled classes of each entity, so that it counts once in the totals
-        n_classes = {IRI(r["entity"].value): int(r["k"].value) for r in select_rows(
-            manager, f"SELECT ?entity (COUNT(DISTINCT ?t) AS ?k) WHERE {{ {values_block(sample)} {class_values} "
-                     f"?entity <{RDF_TYPE}> ?t }} GROUP BY ?entity") if "entity" in r and "k" in r}
+        n_classes = {IRI(r["s"].value): int(r["k"].value) for r in select_rows(
+            manager, f"SELECT ?s (COUNT(DISTINCT ?t) AS ?k) WHERE {{ {values_block(sample)} {class_values} "
+                     f"?s <{RDF_TYPE}> ?t }} GROUP BY ?s") if "s" in r and "k" in r}
         label = local_name(type_iri) or type_iri
         weight = n / len(sample)
         for entity in sample:

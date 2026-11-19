@@ -18,8 +18,12 @@ from typing import Annotated, Literal, Self
 from grasp.tasks.om.foundation.types import Side
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from grasp.tasks.om.data_models.patterns import StructureRelation, StructureRelationKind
-from grasp.tasks.om.data_models.profile import INVERSE_PREFIX, Roles
+from grasp.tasks.om.data_models.profile import (
+    StructureRelation,
+    StructureRelationKind,
+    INVERSE_PREFIX,
+    Roles,
+)
 from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatternSource, ValuePatterns
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 

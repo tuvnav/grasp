@@ -45,7 +45,7 @@ class Anchor:
     source_entity: IRI
     target_entity: IRI
     families: frozenset[str]   # families of the runs that found it
-    level: NormalizationLevel  # finest normalization level of its key over these runs
+    normalization_level: NormalizationLevel  # finest normalization level of its key over these runs
     specificity: AnchorSpecificity
     # lexical information content of its name (Seco 2004), the minimum over both
     # sides; 1: specific, lower: extended by more names; None: not applicable
@@ -58,7 +58,7 @@ class Anchor:
     @property
     def extended(self) -> bool:
         """Unique only on a coarse level (word set, plural, inflection)."""
-        return self.level in EXTENDED_LEVELS
+        return self.normalization_level in EXTENDED_LEVELS
 
 
 @dataclass(frozen=True)

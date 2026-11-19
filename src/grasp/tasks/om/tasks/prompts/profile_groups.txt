@@ -10,7 +10,7 @@ Check, in this order:
 3. Remove a group only if it does not help; its entities that are in no other group are then no longer aligned.
 Only define a group if its features are clear and it has enough entities to matter; leave the groups as they are when they fit.
 
-Membership patterns are SPARQL group patterns over ?entity; write alternatives as { A } UNION { B }. The features of a group say how to recognize its entities.
+Membership patterns are SPARQL group patterns over ?s; write alternatives as { A } UNION { B }. The features of a group say how to recognize its entities.
 
 Steps:
 1. Read the groups and their distinguishing features. Inspect examples of each group with the SPARQL functions, including entities without names.

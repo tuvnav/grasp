@@ -6,14 +6,15 @@ from typing import Collection, Iterable, Iterator
 
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding
-from grasp.tasks.om.data_models.patterns import PredicatePattern, StructureRelation
-from grasp.tasks.om.data_models.profile import KgProfile, Roles
+from grasp.tasks.om.data_models.profile import KgProfile, Roles, PredicatePattern, StructureRelation
 from grasp.tasks.om.data_models.scope import ValuePatternSource
 from grasp.tasks.om.data_models.value_rows import ValueRow
-from grasp.tasks.om.foundation.types import IRI, BindingType, Side
+from grasp.tasks.om.foundation.types import IRI, BindingType
 from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query, profile_partitions_to_grouping
-from grasp.tasks.om.sparql_access.execution import stream_rows
-from grasp.tasks.om.sparql_access.values import values_clause
+from grasp.tasks.om.sparql_access.lookups import (
+    stream_rows,
+    values_clause,
+)
 
 
 def retrieve_value_rows(
@@ -27,19 +28,19 @@ def retrieve_value_rows(
 
     if object_iris is not None and not object_iris:
         return  # restricted to no values (e.g. no witnesses yet): no query
-    branches = value_branches(value_source, roles, object_iris)
+    branches = prepare_value_branches_for_sparql(value_source, roles, object_iris)
 
     if not branches:
         return  # none of the roles is set in the profile: no values
 
     query_sparql = grouping_to_sparql_query(
         manager, grouping, entity_space,
-        "?entity ?group ?o ?role",
+        "?s ?group ?o ?role",
         branches=branches
         )
     rows = stream_rows(manager, query_sparql)
     for row in rows:
-        entity = IRI(Binding.from_dict(row["entity"]).identifier())
+        entity = IRI(Binding.from_dict(row["s"]).identifier())
         group = Binding.from_dict(row["group"]).value
         role = Binding.from_dict(row["role"]).value
         value_binding = Binding.from_dict(row["o"])
@@ -57,18 +58,18 @@ def retrieve_value_rows(
             )
 
 
-def value_branches(
+def prepare_value_branches_for_sparql(
         value_source: ValuePatternSource,
         roles: Roles,
-        object_iris: Collection[IRI] | None = None,
+        restrict_to_object_iris: Collection[IRI] | None = None,
         new_role_name: str = "own"
         ) -> list[str]:
     """
     SPARQL alternatives over ?s (entity) and ?o (value), each binding ?role.
     """
     restriction_to_values = (
-        f"{values_clause('o', object_iris)}\n"
-        if object_iris is not None else ""
+        f"{values_clause('o', restrict_to_object_iris)}\n"
+        if restrict_to_object_iris is not None else ""
         )
     return [
         f'{restriction_to_values}{branch} BIND("{role_name}" AS ?role)'
@@ -112,8 +113,8 @@ def retrieve_entities(
     The entities of a grouping, each once, sorted (so that a sample drawn
     from them with a fixed seed is the same in every run).
     """
-    query = grouping_to_sparql_query(manager, grouping, entity_space, "DISTINCT ?entity")
-    return sorted({IRI(Binding.from_dict(row["entity"]).identifier()) for row in stream_rows(manager, query)})
+    query = grouping_to_sparql_query(manager, grouping, entity_space, "DISTINCT ?s")
+    return sorted({IRI(Binding.from_dict(row["s"]).identifier()) for row in stream_rows(manager, query)})
 
 
 def retrieve_linked_entities(
@@ -131,12 +132,12 @@ def retrieve_linked_entities(
     linked_entities: set[IRI] = set()
     for batch in batched(sorted(linked_to), batch_size):
         query = grouping_to_sparql_query(
-            manager, grouping, entity_space, "DISTINCT ?entity",
+            manager, grouping, entity_space, "DISTINCT ?s",
             where=f"{values_clause('linked', batch)}\n"
-                  "{ ?entity ?predicate ?linked } UNION { ?linked ?predicate ?entity }"
+                  "{ ?s ?p ?linked } UNION { ?linked ?p ?s }"
             )
         linked_entities.update(
-            IRI(Binding.from_dict(row["entity"]).identifier()) for row in stream_rows(manager, query)
+            IRI(Binding.from_dict(row["s"]).identifier()) for row in stream_rows(manager, query)
             )
     return linked_entities
 
@@ -149,7 +150,7 @@ def retrieve_partitions_by_entity(
     partitions_grouping = profile_partitions_to_grouping(kg_profile)
     query = grouping_to_sparql_query(
         manager, partitions_grouping,
-        entity_space, "?entity ?group"
+        entity_space, "?s ?group"
     )
 
     rows = stream_rows(manager, query)
@@ -157,7 +158,7 @@ def retrieve_partitions_by_entity(
     partition_names_by_entity: dict[IRI, str] = {}
 
     for row in rows:
-        entity = IRI(Binding.from_dict(row["entity"]).identifier())
+        entity = IRI(Binding.from_dict(row["s"]).identifier())
         partition = Binding.from_dict(row["group"]).value
         partition_names_by_entity[entity] = partition
 

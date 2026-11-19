@@ -27,8 +27,8 @@ from grasp.tasks.om.data_models.profile import (
     unknown_name_message,
 )
 from grasp.tasks.om.foundation.configuration import configured_namespaces
-from grasp.tasks.om.foundation.types import IRI, NameType
-from grasp.tasks.om.foundation.vocabulary import (
+from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNCATEGORIZED,
     namespace_of,
 )
@@ -166,6 +166,9 @@ class SpaceTask(ProfileStageTask):
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.space_editor.functions()
+
+    def refers_to_groups(self) -> bool:
+        return False  # partitions and groups come only in later stages
 
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         space = self.space_editor.checked_entity_space()
@@ -324,7 +327,7 @@ class GroupTask(ProfileStageTask):
     group_name: str
     edit_mode: GroupEditMode
     role_editor: RoleEditor
-    name_type: NameType  # the default local name type
+    name_type: LocalNameType  # the default local name type
 
     def prepare(self, input: dict) -> str:
         profile = self.input_profile
@@ -376,14 +379,14 @@ class GroupTask(ProfileStageTask):
 
     def finish_properties(self) -> dict[str, dict]:
         return {"local_name_type": {
-            "type": "string", "enum": [t.value for t in NameType],
+            "type": "string", "enum": [t.value for t in LocalNameType],
             "description": "If the default is wrong: label if local names are names, code if identifiers, other if mixed.",
         }}
 
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         self.role_editor.check_roles()
         added, removed = self.role_editor.group_deviation()
-        name_type = NameType(fn_args.get("local_name_type") or self.name_type)
+        name_type = LocalNameType(fn_args.get("local_name_type") or self.name_type)
         current = self.default.get_group(self.group_name)
         updated = current.model_copy(update={"local_name_type": name_type, "added": added, "removed": removed})
         profile = self.default.with_replaced_group(updated)

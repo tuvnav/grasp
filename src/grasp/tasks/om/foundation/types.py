@@ -25,9 +25,6 @@ IRI = NewType("IRI", str)
 
 type EntityKey = tuple[Side, IRI]
 
-# an IRI or literal prepared for insertion into SPARQL text, e.g. <http://human.owl#NCI_C12432>
-SparqlTerm = NewType("SparqlTerm", str)
-
 
 class BindingType(StrEnum):
     """Values of Binding.type (SPARQL JSON results); equal to the plain strings
@@ -41,7 +38,7 @@ class BindingType(StrEnum):
 type BlankNodeTree = dict[str, list[tuple[IRI, Binding]]]
 
 
-class NameType(StrEnum):
+class LocalNameType(StrEnum):
     LABEL = "label"
     CODE = "code"
     OTHER = "other"

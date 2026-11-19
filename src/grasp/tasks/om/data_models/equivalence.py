@@ -260,7 +260,3 @@ def status_of_history(history: list[EquivalenceEvent]) -> CandidateStatus:
         status = status_after(status, event.kind)
     return status
 
-
-class PotentialEquivalences(BaseModel):
-    source_entity: Entity
-    candidates: list[Entity]

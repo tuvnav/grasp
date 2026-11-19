@@ -40,7 +40,7 @@ def select_tie_rank_groups(
     candidates_by_rank: dict[float, list[Candidate]] = defaultdict(list)
     for candidate in entity_candidates.candidates:
         candidates_by_rank[candidate.rank_key].append(candidate)
-    rivals_by_rank = entity_candidates.num_rivals_outside_by_rank
+    rivals_by_rank = entity_candidates.num_counterparts_outside_population_by_rank
     ranks = sorted(set(candidates_by_rank) | set(rivals_by_rank))
 
     tie_rank_groups: list[list[Candidate]] = []
@@ -95,7 +95,7 @@ def find_alone_candidate(
     candidate = tie_groups[0][0]
     rival_at_this_rank_or_better = any(
         count > 0 and rank <= candidate.rank_key
-        for rank, count in entity_candidates.num_rivals_outside_by_rank.items()
+        for rank, count in entity_candidates.num_counterparts_outside_population_by_rank.items()
         )
     return None if rival_at_this_rank_or_better else candidate.candidate_entity
 
@@ -740,7 +740,7 @@ def merge_run_anchors(pair: tuple[IRI, IRI], found: list[RunAnchor]) -> Anchor:
     return Anchor(
         source_entity=pair[0], target_entity=pair[1],
         families=frozenset(family for family, _, _, _ in found),
-        level=min((level for _, level, _, _ in found), key=normalization_level_order),
+        normalization_level=min((level for _, level, _, _ in found), key=normalization_level_order),
         specificity=specificity,
         information_content=min(information_contents) if information_contents else None,
     )
@@ -780,7 +780,7 @@ def anchor_stratum_label(anchor: Anchor) -> str:
     return "-".join(parts)
 
 
-def anchor_strata(anchor_merge: AnchorMerge) -> list[Stratum]:
+def get_anchor_strata(anchor_merge: AnchorMerge) -> list[Stratum]:
     """The anchors in certification strata: by the families that found them, and
     by head/specific and extended."""
     pairs_by_stratum: dict[tuple[frozenset[str], str], list[tuple[IRI, IRI]]] = defaultdict(list)

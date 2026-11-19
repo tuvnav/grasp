@@ -10,8 +10,10 @@ from grasp.tasks.om.foundation.types import IRI
 
 @dataclass(frozen=True)
 class ValueRow:
-    """One value of an entity. An entity in several groups of a population, or
-    with several values, has several rows."""
+    """
+    One value of an entity. An entity in several groups of a population, or
+    with several values, has several rows.
+    """
     entity: IRI
     group_name: str             # group of the population the entity was retrieved for
     role_name: str              # role of the value: "names", "synonyms", ... or "own" (own pattern)
