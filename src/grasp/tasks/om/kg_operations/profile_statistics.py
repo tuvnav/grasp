@@ -21,10 +21,13 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.tasks.om.data_models.profile import (
     DEFAULT_STRUCTURE_RELATIONS,
+    GroupProfile,
+    KgProfile,
     PredicatePattern,
     ElementKey,
     Roles,
     Usage,
+    effective_roles,
     role_elements,
     roles_from_elements,
     swap,
@@ -47,14 +50,15 @@ from grasp.tasks.om.kg_operations.grouping import (
     retrieve_counts_by_group,
     grouping_to_sparql_query,
     grouping_to_sparql_subquery,
+    single_group_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import current_sample, values_block
-from grasp.tasks.om.sparql_access.lookups import (
+from grasp.tasks.om.sparql_access import (
     select_rows,
     stream_rows,
     make_sparql_prologue,
     sparql_filter_by_space,
-    sparql_path,
+    union_of,
     down_pushed_union,
     as_batched_values_blocks,
 )
@@ -72,37 +76,21 @@ CANON = {
 # a canon element enters the default roles if it covers this share of a partition
 # (keeps out e.g. two stray hasDbXref in an ontology of thousands of classes)
 MIN_DEFAULT_COVERAGE = 0.01
-
-
 # features whose shares inside and outside differ less are not shown
 MIN_CONTRAST = 0.05
-
-
 # local names per partition compared with names. 200 is enough to tell a share
 # of 0.2 from one of 0.8: the 95 % Clopper-Pearson interval of a share is at
 # most +-7 percentage points wide at n=200, whatever the share.
 SAMPLE_SIZE = 200
-
-
 SAMPLE_SEED = 0
-
-
 # minimum named entities in the sample to judge local names by their names
 MIN_LABELLED = 20
-
-
 # local name agrees with a name: share of its tokens found in the name
 MIN_TOKEN_AGREEMENT = 0.5
-
-
 # share of local names that agree with names / look speaking, above which
 # local names count as names and below which (speaking only) as codes
 NAME_SHARE = 0.8
-
-
 AGREEMENT_SHARE = 0.5
-
-
 CODE_SHARE = 0.2
 
 
@@ -110,27 +98,27 @@ CODE_SHARE = 0.2
 # follows (http://dbkwik.webdatacommons.org/stexpanded.wikia.com/), otherwise
 # scheme and host (http://mouse.owl#MA_0000001 -> http://mouse.owl); without a
 # host, up to the last # or / (as namespace_of)
-_HOST = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+).*$", "$1")'
-
-
-_HOST_AND_SEGMENT = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+/[^/#?]+/).*$", "$1")'
-
-
+HOST_EXPRESSION = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+).*$", "$1")'
+HOST_AND_SEGMENT_EXPRESSION = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+/[^/#?]+/).*$", "$1")'
 PREFIX_EXPRESSION = (
-    f'IF(REGEX(STR(?s), "^[^:/]+://[^/#?]+/[^/#?]+/"), {_HOST_AND_SEGMENT}, '
-    f'IF(CONTAINS(STR(?s), "://"), {_HOST}, REPLACE(STR(?s), "[^#/]*$", "")))'
+    f'IF(REGEX(STR(?s), "^[^:/]+://[^/#?]+/[^/#?]+/"), {HOST_AND_SEGMENT_EXPRESSION}, '
+    f'IF(CONTAINS(STR(?s), "://"), {HOST_EXPRESSION}, REPLACE(STR(?s), "[^#/]*$", "")))'
 )
-
-
 # characters not allowed in a SPARQL IRI reference
 INVALID_IRI_CHARACTERS = re.compile(r'[\s<>"{}|^`\\]')
 
 
-def prefix_counts(manager: KgManager, named_only: bool) -> dict[tuple[str, str], int]:
-    """(prefix, kind) -> entities, optionally only entities with a
-    canon name or synonym (keeps out e.g. image files of wiki KGs)."""
-    named = (f"FILTER EXISTS {{ ?s {sparql_path(LABEL_PREDICATES + SYNONYM_PREDICATES)} ?name }}"
-             if named_only else "")
+def prefix_counts(
+        manager: KgManager, named_only: bool
+        ) -> dict[tuple[str, str], int]:
+    """
+    (prefix, kind) -> entities, optionally only entities with a
+    canon name or synonym (keeps out e.g. image files of wiki KGs).
+    """
+    named = (
+        f"FILTER EXISTS {{ ?s {union_of(LABEL_PREDICATES + SYNONYM_PREDICATES)} ?name }}"
+        if named_only else ""
+        )
     sparql = grouping_to_sparql_query(
         manager, None, (), "?prefix ?group (COUNT(DISTINCT ?s) AS ?n)",
         f"{named}\nBIND({PREFIX_EXPRESSION} AS ?prefix)", "GROUP BY ?prefix ?group",
@@ -162,27 +150,46 @@ def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[
     return [], "no entities found"
 
 
-class Coverage(BaseModel):
+def ensure_space(
+        kg_manager: KgManager,
+        kg_profile: KgProfile,
+        config: GraspConfig | None = None
+        ) -> list[str]:
+    if kg_profile.entity_space:
+        return list(kg_profile.entity_space)
+    if config:
+        space, _ = default_entity_space(kg_manager, config)
+        return space
+    raise ValueError(
+        "Given KgProfile doesn't contain entity namespace and no GraspConfig was given."
+        "Either is required."
+        )
+
+
+class PredicateCoverage(BaseModel):
     entities: int        # entities with at least one value
     values: int = 0      # triples
     literals: int = 0    # triples with a literal value
     blanks: int = 0      # triples with a blank node value; the rest have an IRI
 
 
-def predicate_coverage(manager: KgManager, grouping: Grouping | None, space: Iterable[str]
-                       ) -> dict[str, dict[IRI, Coverage]]:
-    """group -> outgoing predicate (entities of the group as subject)
-    -> coverage, with the kinds of its values (objects)."""
+def predicate_coverage(
+    manager: KgManager, grouping: Grouping | None, space: Iterable[str]
+        ) -> dict[str, dict[IRI, PredicateCoverage]]:
+    """
+    group -> outgoing predicate (entities of the group as subject)
+    -> coverage, with the kinds of its values (objects).
+    """
     sparql = grouping_to_sparql_query(
         manager, grouping, space,
         "?group ?p (COUNT(DISTINCT ?s) AS ?n) (COUNT(?o) AS ?m) "
         "(SUM(IF(isLiteral(?o), 1, 0)) AS ?lit) (SUM(IF(isBlank(?o), 1, 0)) AS ?blank)",
         "?s ?p ?o .", "GROUP BY ?group ?p",
     )
-    coverage: dict[str, dict[IRI, Coverage]] = defaultdict(dict)
+    coverage: dict[str, dict[IRI, PredicateCoverage]] = defaultdict(dict)
     for row in select_rows(manager, sparql):
         if "group" in row and "p" in row:
-            coverage[row["group"].value][IRI(row["p"].value)] = Coverage(
+            coverage[row["group"].value][IRI(row["p"].value)] = PredicateCoverage(
                 entities=int(row["n"].value), values=int(row["m"].value),
                 literals=int(row["lit"].value) if "lit" in row else 0,
                 blanks=int(row["blank"].value) if "blank" in row else 0,
@@ -190,15 +197,18 @@ def predicate_coverage(manager: KgManager, grouping: Grouping | None, space: Ite
     return dict(coverage)
 
 
-def type_coverage(manager: KgManager, grouping: Grouping | None, space: Iterable[str]
-                  ) -> dict[str, dict[IRI, int]]:
+def type_coverage(
+    manager: KgManager, grouping: Grouping | None, space: Iterable[str]
+        ) -> dict[str, dict[IRI, int]]:
     """group -> rdf:type value -> entities."""
     sparql = grouping_to_sparql_query(
         manager, grouping, space, "?group ?t (COUNT(DISTINCT ?s) AS ?n)",
         f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?group ?t",
     )
     coverage: dict[str, dict[IRI, int]] = defaultdict(dict)
-    for (group, t), n in count_rows(select_rows(manager, sparql), "group", "t").items():
+    for (group, t), n in count_rows(
+            select_rows(manager, sparql), "group", "t"
+            ).items():
         coverage[group][IRI(t)] = n
     return dict(coverage)
 
@@ -215,23 +225,37 @@ class Feature:
         return self.inside - self.outside
 
 
-def distinguishing_features(inside: dict[str, int], size_inside: int,
-                            outside: dict[str, int], size_outside: int, k: int) -> list[Feature]:
-    """The k features with the largest difference of shares, in either direction
-    (common inside and rare outside, or the reverse), at least MIN_CONTRAST."""
+def distinguishing_features(
+    inside: dict[str, int],
+    size_inside: int,
+        outside: dict[str, int],
+        size_outside: int,
+        k: int
+        ) -> list[Feature]:
+    """
+    The k features with the largest difference of shares, in either direction
+    (common inside and rare outside, or the reverse), at least MIN_CONTRAST.
+    """
     if not size_inside:
         return []
     features = [
-        Feature(key, inside.get(key, 0) / size_inside, outside.get(key, 0) / size_outside if size_outside else 0.0)
+        Feature(
+            key,
+            inside.get(key, 0) / size_inside,
+            outside.get(key, 0) / size_outside if size_outside else 0.0
+            )
         for key in set(inside) | set(outside)
     ]
     features = [f for f in features if abs(f.contrast) >= MIN_CONTRAST]
     return sorted(features, key=lambda f: (-abs(f.contrast), f.key))[:k]
 
 
-def complement(counts: dict[str, dict[str, int]], sizes: dict[str, int], group: str
-               ) -> tuple[dict[str, int], int]:
-    """Counts and size of all members of an exclusive grouping except one, summed."""
+def complement(
+    counts: dict[str, dict[str, int]], sizes: dict[str, int], group: str
+        ) -> tuple[dict[str, int], int]:
+    """
+    Counts and size of all members of an exclusive grouping except one, summed.
+    """
     total: Counter[str] = Counter()
     for other, other_counts in counts.items():
         if other != group:
@@ -240,12 +264,19 @@ def complement(counts: dict[str, dict[str, int]], sizes: dict[str, int], group: 
 
 
 def rest(total: dict[str, int], total_size: int, inside: dict[str, int], size: int) -> tuple[dict[str, int], int]:
-    """Counts and size of the entities of a total outside a part of it (a group
-    of an overlapping grouping within all its entities)."""
-    return {k: max(0, n - inside.get(k, 0)) for k, n in total.items()}, max(0, total_size - size)
+    """
+    Counts and size of the entities of a total outside a part of it (a group
+    of an overlapping grouping within all its entities).
+    """
+    return {
+        k: max(0, n - inside.get(k, 0))
+        for k, n in total.items()
+        }, max(0, total_size - size)
 
 
-def members_query(membership: str, space: Iterable[str], manager: KgManager | None = None) -> str:
+def members_query(
+        membership: str, space: Iterable[str], manager: KgManager | None = None
+        ) -> str:
     sample = current_sample(manager) if manager is not None else None
     if sample is not None:
         # large KG: the sampled members
@@ -253,31 +284,44 @@ def members_query(membership: str, space: Iterable[str], manager: KgManager | No
     return f"{{ SELECT DISTINCT ?s WHERE {{ {membership} }} }}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}"
 
 
-def membership_overlap(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
-                       membership: str) -> tuple[int, dict[str, int]]:
-    """(entities matching a membership pattern, those per current group or
+def membership_overlap(
+    manager: KgManager,
+    grouping: Grouping | None,
+    space: Iterable[str],
+        membership: str
+        ) -> tuple[int, dict[str, int]]:
+    """
+    (entities matching a membership pattern, those per current group or
     partition, UNCATEGORIZED for matches in none); in a large KG for the
-    sampled matches."""
+    sampled matches.
+    """
     sample = current_sample(manager)
     if sample is not None:
         matches = sample.sample(membership).in_space
-        counts: Counter[str] = Counter(g for _, g in sample.assignments(grouping, matches))
+        counts: Counter[str] = Counter(
+            g for _, g in sample.assignments(grouping, matches)
+            )
         assigned = {e for e, _ in sample.assignments(grouping, matches)}
         counts[UNCATEGORIZED] += sum(e not in assigned for e in matches)
         return len(matches), {g: n for g, n in counts.items() if n}
     prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
-    sparql = (f"{make_sparql_prologue(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-              f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
-              f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part')
+    sparql = (
+        f"{make_sparql_prologue(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
+        f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
+        f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part'
+        )
     overlap = {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
     size = select_rows(manager, f"{make_sparql_prologue(prefixes)}\nSELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-                                f"{members_query(membership, space, manager)}\n}}")
+                       f"{members_query(membership, space, manager)}\n}}")
     return (int(size[0]["n"].value) if size and "n" in size[0] else 0), overlap
 
 
-def member_coverage(manager: KgManager, space: Iterable[str], membership: str
-                    ) -> tuple[dict[str, int], dict[str, int]]:
-    """(predicate -> entities, rdf:type value -> entities) among the matches of a membership pattern."""
+def member_coverage(
+    manager: KgManager, space: Iterable[str], membership: str
+        ) -> tuple[dict[str, int], dict[str, int]]:
+    """
+    (predicate -> entities, rdf:type value -> entities) among the matches of a membership pattern.
+    """
     members = members_query(membership, space, manager)
     predicates = select_rows(manager, f"SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n?s ?p ?o }} GROUP BY ?p")
     types = select_rows(manager, (f"SELECT ?t (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n"
@@ -287,7 +331,9 @@ def member_coverage(manager: KgManager, space: Iterable[str], membership: str
 
 
 def canon_roles() -> Roles:
-    """All canon predicates and structure relations, used or not."""
+    """
+    All canon predicates and structure relations, used or not.
+    """
     return Roles(
         structure=list(DEFAULT_STRUCTURE_RELATIONS),
         **{field: PredicatePattern(predicates=list(predicates)) for field, predicates in CANON.items()},
@@ -316,18 +362,20 @@ type Sides = dict[ElementKey, tuple[int, int]]
 
 def element_usage(manager: KgManager, grouping: Grouping | None, space: Iterable[str], roles: Roles,
                   sides: dict[str, Sides] | None = None) -> dict[str, Usage]:
-    """group -> element of the roles -> entities using it: as ?s for
+    """
+    group -> element of the roles -> entities using it: as ?s for
     predicates and patterns; as ?s or ?o for structure relations, whichever
     side has more (e.g. classes are only ?o of instance_of), with both sides
     in sides if given. Predicates in one query, every pattern in its own,
-    every relation in two."""
+    every relation in two.
+    """
     usage: dict[str, Usage] = defaultdict(dict)
     elements = role_elements(roles)
     predicates = sorted({key[2] for key in elements if key[1] == "predicate"})
     if predicates:
         values = " ".join(f"<{p}>" for p in predicates)
         sparql = grouping_to_sparql_query(manager, grouping, space, "?group ?p (COUNT(DISTINCT ?s) AS ?n)",
-                                 f"VALUES ?p {{ {values} }}\n?s ?p ?o .", "GROUP BY ?group ?p")
+                                          f"VALUES ?p {{ {values} }}\n?s ?p ?o .", "GROUP BY ?group ?p")
         by_predicate = count_rows(select_rows(manager, sparql), "group", "p")
         for key in elements:
             if key[1] == "predicate":
@@ -352,7 +400,10 @@ def element_usage(manager: KgManager, grouping: Grouping | None, space: Iterable
 
 
 def default_roles(usage: dict[str, Usage], sizes: dict[str, int], active: Iterable[str]) -> Roles:
-    """Canon elements covering at least MIN_DEFAULT_COVERAGE of an active group or partition."""
+    """
+    Canon elements covering at least MIN_DEFAULT_COVERAGE of 
+    an active group or partition.
+    """
     keep = {
         key for group in active if sizes.get(group)
         for key, n in usage.get(group, {}).items() if n / sizes[group] >= MIN_DEFAULT_COVERAGE
@@ -361,17 +412,26 @@ def default_roles(usage: dict[str, Usage], sizes: dict[str, int], active: Iterab
 
 
 class LocalNameStats(BaseModel):
-    """Local names of a sample of a group compared with the entities' names."""
+    """
+    Local names of a sample of a group compared with the entities' names.
+    """
     sample_size: int = 0
     labelled: int = 0
     agreement: float | None = None  # share of named entities whose local name agrees with a name
     speaking: float | None = None   # share of local names that look like words
 
 
-def sample_entities(manager: KgManager, grouping: Grouping | None, space: Iterable[str],
-                    k: int = SAMPLE_SIZE, seed: int = SAMPLE_SEED, where: str = "") -> dict[str, list[IRI]]:
-    """Up to k random entities per group, drawn while streaming (reservoir
-    sampling), so memory stays at k per group whatever the KG size."""
+def sample_entities(
+        manager: KgManager,
+        grouping: Grouping | None,
+        space: Iterable[str],
+        k: int = SAMPLE_SIZE,
+        seed: int = SAMPLE_SEED,
+        where: str = "") -> dict[str, list[IRI]]:
+    """
+    Up to k random entities per group, drawn while streaming (reservoir
+    sampling), so memory stays at k per group whatever the KG size.
+    """
     rng = random.Random(seed)
     samples: dict[str, list[IRI]] = defaultdict(list)
     seen: Counter[str] = Counter()
@@ -388,8 +448,12 @@ def sample_entities(manager: KgManager, grouping: Grouping | None, space: Iterab
     return dict(samples)
 
 
-def retrieve_values(manager: KgManager, entities: Iterable[IRI], pattern: PredicatePattern | None,
-                    literals_only: bool = True) -> dict[IRI, list[str]]:
+def retrieve_values(
+        manager: KgManager,
+        entities: Iterable[IRI],
+        pattern: PredicatePattern | None,
+        literals_only: bool = True
+        ) -> dict[IRI, list[str]]:
     """?o of the pattern per entity (?s)."""
     values: dict[IRI, list[str]] = defaultdict(list)
     if pattern is None:
@@ -412,10 +476,12 @@ def name_tokens(text: str) -> list[str]:
 
 
 def is_speaking_name(name: str) -> bool:
-    """Whether a local name looks like words rather than a code (MA_0000001,
+    """
+    Whether a local name looks like words rather than a code (MA_0000001,
     NCI_C12345, relation_22321): more than half of its tokens are words of at
     least three letters with a vowel. Single letters are not counted (Class_N),
-    numbers are. Form only: a speaking name may still be an identifier."""
+    numbers are. Form only: a speaking name may still be an identifier.
+    """
     tokens = [t for t in name_tokens(name) if len(t) > 1 or t.isdigit()]
     if not tokens:
         return False
@@ -459,3 +525,44 @@ def local_name_stats(manager: KgManager, sample: list[IRI], names: PredicatePatt
             agrees_with_label(local_names[entity], entity_names[entity]) for entity in sample if entity in entity_names
         ) / stats.labelled
     return stats
+
+
+def group_name_stats(
+    manager: KgManager,
+    grouping: Grouping,
+    space: list[str],
+    group: str,
+        roles: Roles
+        ) -> LocalNameStats:
+    sample = sample_entities(manager, grouping, space, where=f'FILTER(?group = "{group}")')
+    return local_name_stats(manager, sample.get(group, []), roles.names)
+
+
+def group_defaults(
+        manager: KgManager, profile: KgProfile, group: str
+        ) -> tuple[GroupProfile, LocalNameStats]:
+    """
+    Profile of a group without LLM: the local name type from its sample, its delta unchanged.
+    """
+    grouping = single_group_grouping(profile, group)
+    current = profile.get_group(group)
+    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
+    effective = effective_roles(profile.roles, current, usage)
+    stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
+    return current.model_copy(update={"local_name_type": local_name_type(stats)}, deep=True), stats
+
+
+
+def unassigned_predicates(
+        roles: Roles, coverage: dict[str, PredicateCoverage]
+        ) -> list[tuple[str, PredicateCoverage]]:
+    """
+    Predicates of a group in no element of its roles (as predicate or
+    inside a pattern), most frequent first.
+    """
+    elements = role_elements(roles)
+    predicates = {key[2] for key in elements if key[1] == "predicate"}
+    patterns = [element_sparql(key, value) for key, value in elements.items() if key[1] != "predicate"]
+    covered = lambda p: p in predicates or any(f"<{p}>" in pattern for pattern in patterns)
+    return [(p, c) for p, c in sorted(coverage.items(), key=lambda x: -x[1].entities) if not covered(p)]
+

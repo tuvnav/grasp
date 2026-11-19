@@ -37,7 +37,9 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     WithinKgNonCompetingPartitionPair,
 )
-from grasp.tasks.om.data_models.scope import Population
+from grasp.tasks.om.data_models.candidates import (
+    Population,
+)
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 

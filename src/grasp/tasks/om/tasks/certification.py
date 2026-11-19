@@ -30,7 +30,10 @@ from grasp.manager import KgManager
 from grasp.model import Message, get_model
 from grasp.tasks import get_task
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.candidate_selection import ParetoIndex, Stratum
+from grasp.tasks.om.data_models.candidates import (
+    ParetoIndex,
+    Stratum,
+)
 from grasp.tasks.om.data_models.verification import (
     RECALL_STRATA,
     CertificationParams,
@@ -51,7 +54,10 @@ from grasp.tasks.om.data_models.verification import (
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.kg_operations.grouping import groups_to_grouping, profile_partitions_to_grouping
-from grasp.tasks.om.kg_operations.value_retrieval import retrieve_entities, retrieve_linked_entities
+from grasp.tasks.om.kg_operations.candidate_generation import (
+    retrieve_entities,
+    retrieve_linked_entities,
+)
 from grasp.tasks.om.tasks.candidate_task import sample_position
 from grasp.tasks.om.kg_operations.candidate_selection import flatten_layers
 from grasp.utils import format_enumerate, format_section

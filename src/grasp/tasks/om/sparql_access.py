@@ -1,3 +1,13 @@
+"""
+Layer 2: generic SPARQL access (execution, VALUES, query building, lookups),
+without domain logic.
+
+Variable convention of all queries and patterns: ?s is the entity a query is
+about (also where the entity is the object of a triple, e.g. incoming edges
+?o ?p ?s), ?o its value, ?p the predicate between them. Any further entity gets
+a speaking name (e.g. ?linked, ?usage_subject).
+"""
+
 import re
 import hashlib
 from dataclasses import dataclass
@@ -26,13 +36,6 @@ PREFIX_RE = re.compile(
 IRI_REFERENCE = re.compile(r"<[^\s<>\"{}|^`\\]*>")
 # statistics queries of the profile may take longer than a query of the model
 STATS_TIMEOUT = (6, 120)
-
-
-def sparql_path(predicates: list[IRI]) -> str:
-    """
-    Alternative property path over the given predicates, e.g. <a>|<b>.
-    """
-    return "|".join(f"<{p}>" for p in predicates)
 
 
 def split_prologue(

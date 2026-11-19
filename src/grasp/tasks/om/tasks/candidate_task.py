@@ -41,13 +41,39 @@ from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.candidate_generators import CandidateStrategy, CandidateStrategyType, Generator, KeyStrategy, NeighbourStrategy, Selection, VectorStrategy
-from grasp.tasks.om.data_models.candidate_selection import (
-    CandidateStageResult, EnsembleEvaluation, MergedCandidates, RunEnsemble, RunRole, SelectedCandidates, StrategyResult, StrategySignals, TriedRun,
-)
-from grasp.tasks.om.data_models.entity_pairs import (
-    Candidate, EntityCandidates, Hub, KeyHub, KeyMatch, Match, NeighbourEntityPair, NeighbourHub, NeighbourMatch,
-    VectorHub, VectorMatch,
+from grasp.tasks.om.data_models.candidates import (
+    CandidateStrategy,
+    CandidateStrategyType,
+    Generator,
+    KeyStrategy,
+    NeighbourStrategy,
+    Selection,
+    VectorStrategy,
+    CandidateStageResult,
+    EnsembleEvaluation,
+    MergedCandidates,
+    RunEnsemble,
+    RunRole,
+    SelectedCandidates,
+    StrategyResult,
+    StrategySignals,
+    TriedRun,
+    Candidate,
+    EntityCandidates,
+    Hub,
+    KeyHub,
+    KeyMatch,
+    Match,
+    NeighbourEntityPair,
+    NeighbourHub,
+    NeighbourMatch,
+    VectorHub,
+    VectorMatch,
+    REST,
+    GroupRef,
+    Population,
+    ValuePatternSource,
+    ValueRow,
 )
 from grasp.tasks.om.data_models.profile import (
     StructureRelationKind,
@@ -55,10 +81,14 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     describe_profile,
 )
-from grasp.tasks.om.data_models.scope import REST, GroupRef, Population, ValuePatternSource
-from grasp.tasks.om.data_models.value_rows import ValueRow
 from grasp.tasks.om.foundation.configuration import load_task_instructions
-from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table
+from grasp.tasks.om.foundation.rendering import (
+    Item,
+    Section,
+    SectionContent,
+    Table,
+    format_display_content,
+)
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
     TRANSFORM_OPERATIONS,
@@ -69,26 +99,33 @@ from grasp.tasks.om.foundation.text_normalization import (
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    evaluate_merged_candidates, flatten_layers, merge_runs, select_candidates, summarize_candidate_selection,
+    evaluate_merged_candidates, flatten_layers, merge_candidate_runs, select_candidates, summarize_candidate_selection,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
     Grouping, retrieve_counts_by_group, group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
-from grasp.tasks.om.kg_operations.value_comparison import (
-    NeighbourIndex, ValueIndex, ExistingEquivalences, build_side_indices, build_side_witness_index,
-    compare_value_indices_by_vectors, compare_witness_indices, find_confirmed_equivalences,
+from grasp.tasks.om.kg_operations.candidate_generation import (
+    NeighbourIndex,
+    ValueIndex,
+    ExistingEquivalences,
+    build_side_indices,
+    build_side_witness_index,
+    compare_value_indices_by_vectors,
+    compare_witness_indices,
+    find_confirmed_equivalences,
     intersect_level_indices,
-    key_entity_pairs_to_candidates, neighbour_entity_pairs_to_candidates, relation_keys_by_role_name,
+    key_entity_pairs_to_candidates,
+    neighbour_entity_pairs_to_candidates,
+    relation_keys_by_role_name,
     vector_entity_pairs_to_candidates,
+    retrieve_entities,
+    retrieve_partitions_by_entity,
+    retrieve_value_rows,
 )
-from grasp.tasks.om.kg_operations.value_retrieval import (
-    retrieve_entities, retrieve_partitions_by_entity, retrieve_value_rows,
-)
-from grasp.tasks.om.sparql_access.lookups import values_clause
+from grasp.tasks.om.sparql_access import values_clause
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.foundation.rendering import format_display_content
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
 from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
 from grasp.utils import FunctionCallException, format_section
@@ -786,7 +823,7 @@ def run_full_ensemble(
         for run_name in run_ensemble.run_ids()
     }
 
-    return merge_runs(
+    return merge_candidate_runs(
         run_ensemble,
         strategy_results_by_run,
         CANDIDATE_BUDGET_PER_ENTITY,
@@ -934,7 +971,7 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
     entities where it equals a merge of full runs.
     """
     run_ensemble = parse_run_ensemble(state, fn_args.get("runs"))
-    merged = merge_runs(
+    merged = merge_candidate_runs(
         run_ensemble,
         {run_id: result for run_id, (_, result) in state.runs.items()},
         CANDIDATE_BUDGET_PER_ENTITY,
@@ -1453,8 +1490,7 @@ def format_merged_list(
         ) -> list[Item]:
     """
     The merged list of an entity: per candidate its rank in the list (tied
-    candidates of a sublayer share it) and its ranks in the runs; the
-    candidate of the example pair is marked.
+    candidates of a sublayer share it) and its ranks in the runs.
     """
     other_side = Side.other_side(side)
     ranks_by_candidate = merged.candidate_rank_index[(side, entity)]
@@ -1527,7 +1563,7 @@ def format_ensemble_evaluation_of_side(
             [
                 Item(
                     f"{format_venn_cell(cell)}: {entity_displays[side].show(entity, SHORT_VIEW)}",
-                    format_merged_list(side, entity, candidate, merged, entity_displays)
+                    format_merged_list(side, entity, merged, entity_displays)
                     )
                 for cell, entity, candidate in evaluation.cell_examples
                 ]
@@ -1625,6 +1661,7 @@ def format_knowledge_graph(state: CandidateTaskState, side: Side) -> Section:
         [manager.description or "", *profile.content],
         [*profile.subsections, Section("Entities per group", format_group_counts(state, side))],
         )
+
 
 def format_alignment_status(state: CandidateTaskState) -> Section:
     equivalences = state.alignment_state.equivalences

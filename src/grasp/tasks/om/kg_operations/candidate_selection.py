@@ -16,10 +16,12 @@ from collections.abc import Callable, Sequence
 import math
 import random
 
-from grasp.tasks.om.data_models.anchors import Anchor, AnchorMerge, AnchorSpecificity
-from grasp.tasks.om.data_models.candidate_generators import Generator, KeyStrategy, Selection
-from grasp.tasks.om.data_models.candidate_selection import CandidateRankIndex, EnsembleEvaluation, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, StrategyResult, StrategySignals, Stratum, VennIndex
-from grasp.tasks.om.data_models.entity_pairs import Candidate, EntityCandidates, KeyCandidate, KeyEntityPair
+from grasp.tasks.om.data_models.candidates import (
+    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyStrategy, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, Selection,
+    EntityCandidates,
+    Candidate, StrategyResult, StrategySignals, Stratum, VennIndex,
+
+    )
 from grasp.tasks.om.data_models.verification import CandidateSignal, FocusEntity, JudgingUnit, ListedCandidate
 from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
@@ -436,7 +438,7 @@ def evaluable_entities(
         )
 
 
-def merge_runs(
+def merge_candidate_runs(
         run_ensemble: RunEnsemble,
         strategy_results_by_run: dict[str, StrategyResult],
         budget: int,
@@ -473,7 +475,10 @@ LIST_LENGTH_CLASSES: list[tuple[int, float, str]] = [
 
 
 def list_length_class(length: int) -> str:
-    return next(name for smallest, largest, name in LIST_LENGTH_CLASSES if smallest <= length <= largest)
+    return next(
+        name for smallest, largest, name in LIST_LENGTH_CLASSES
+        if smallest <= length <= largest
+        )
 
 
 def flatten_layers(layers: list[list[list[IRI]]]) -> list[IRI]:
@@ -481,18 +486,25 @@ def flatten_layers(layers: list[list[list[IRI]]]) -> list[IRI]:
     The candidates of an entity's layers in rank order; tied ones (within a
     sublayer) sorted, so that the order is the same in every run.
     """
-    return [candidate for layer in layers for sublayer in layer for candidate in sorted(sublayer)]
+    return [
+        candidate for layer in layers for sublayer in layer
+        for candidate in sorted(sublayer)
+        ]
 
 
 def only_best_candidate(layers: list[list[list[IRI]]]) -> IRI | None:
-    """The candidate alone in the first sublayer of the first layer, if one."""
+    """
+    The candidate alone in the first sublayer of the first layer, if one.
+    """
     if layers and layers[0] and len(layers[0][0]) == 1:
         return layers[0][0][0]
     return None
 
 
 def to_entity_pair(side: Side, entity: IRI, candidate: IRI) -> tuple[IRI, IRI]:
-    """(source IRI, target IRI) of an entity of the side and its candidate."""
+    """
+    (source IRI, target IRI) of an entity of the side and its candidate.
+    """
     return (entity, candidate) if side == Side.SOURCE else (candidate, entity)
 
 
@@ -582,7 +594,9 @@ def build_verification_strata(
 
 
 def families_by_pair(venn_index: VennIndex) -> dict[tuple[IRI, IRI], frozenset[str]]:
-    """The Venn cell (run families) of each pair of the cut lists."""
+    """
+    The Venn cell (run families) of each pair of the cut lists.
+    """
     return {pair: families for families, pairs in venn_index.items() for pair in pairs}
 
 
@@ -601,7 +615,9 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
     family_by_run = {run.run_id: run.family or run.run_id for run in merged_candidates.run_ensemble.runs}
 
     def listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
-        """The candidates in list order, with their Pareto layer and the best rank per family."""
+        """
+        The candidates in list order, with their Pareto layer and the best rank per family.
+        """
         ranks_by_candidate = merged_candidates.candidate_rank_index.get((side, entity), {})
         listed = []
         for layer_number, layer in enumerate(layers_by_entity[(side, entity)], start=1):
@@ -618,10 +634,14 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
         return listed
 
     def focus_entity(side: Side, entity: IRI) -> FocusEntity:
-        return FocusEntity(side=side, entity=entity, candidates=listed_candidates(side, entity))
+        return FocusEntity(
+            side=side, entity=entity, candidates=listed_candidates(side, entity)
+            )
 
-    def cell_name(side: Side, entity: IRI, candidate: IRI) -> str:
-        return "+".join(sorted(cell_of.get(to_entity_pair(side, entity, candidate), frozenset())))
+    def venn_cell_name(side: Side, entity: IRI, candidate: IRI) -> str:
+        return "+".join(sorted(cell_of.get(
+            to_entity_pair(side, entity, candidate), frozenset()
+            )))
 
     units: list[tuple[JudgingUnit, str]] = []
     for (side, entity), layers in sorted(layers_by_entity.items()):
@@ -630,7 +650,7 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
             continue
         units.append((
             JudgingUnit(focus=[focus_entity(side, entity)]),
-            f"{Side(side).value}/{cell_name(side, entity, candidates[0])}/{list_length_class(len(candidates))}"
+            f"{Side(side).value}/{venn_cell_name(side, entity, candidates[0])}/{list_length_class(len(candidates))}"
             ))
         best = only_best_candidate(layers)
         if Side(side) == Side.SOURCE and best is not None:
@@ -638,7 +658,7 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
             if only_best_candidate(partner_layers) == entity:
                 units.append((
                     JudgingUnit(focus=[focus_entity(Side.SOURCE, entity), focus_entity(Side.TARGET, best)]),
-                    f"mutual/{cell_name(side, entity, best)}"
+                    f"mutual/{venn_cell_name(side, entity, best)}"
                     ))
     return units
 
@@ -650,14 +670,20 @@ NAME_ROLES = frozenset({"names", "synonyms"})
 
 
 def lexical_information_content(extensions: int, num_wordsets: int) -> float:
-    """Seco et al. (2004): 1 - log(extensions + 1) / log(N); 1: no other word set extends it."""
+    """
+    Seco et al. (2004): 1 - log(extensions + 1) / log(N); 1: 
+    no other word set extends it.
+    """
     if num_wordsets <= 1:
         return 1.0
     return 1 - math.log(extensions + 1) / math.log(num_wordsets)
 
 
 def extension_counter(wordsets: frozenset[frozenset[str]]) -> Callable[[frozenset[str]], int]:
-    """Counts the word sets that properly extend a given one ({paper} by {poster, paper})."""
+    """
+    Counts the word sets that properly extend a given one
+    ({paper} by {poster, paper}).
+    """
     wordsets_by_word: dict[str, set[frozenset[str]]] = defaultdict(set)
     for wordset in wordsets:
         for word in wordset:
@@ -683,14 +709,18 @@ def compares_names(generator: Generator) -> bool:
         )
 
 
-def anchor_wordset(entity_pair: KeyEntityPair, level: NormalizationLevel) -> frozenset[str]:
+def anchor_wordset(
+        entity_pair: KeyEntityPair, level: NormalizationLevel
+        ) -> frozenset[str]:
     """The word set of an anchor's name: the largest among the values behind its key on that level."""
     rows = [row for match in entity_pair.matches if match.level == level
             for row in (*match.source_rows, *match.target_rows)]
     return max((frozenset(words(row.raw_projection_value)) for row in rows), key=len, default=frozenset())
 
 
-def unique_key_candidates(result: StrategyResult) -> dict[tuple[IRI, IRI], KeyCandidate]:
+def unique_key_candidates(
+        result: StrategyResult
+        ) -> dict[tuple[IRI, IRI], KeyCandidate]:
     """The unique pairs of a key run (the anchor rule), with the source entity's candidate."""
     pairs: dict[tuple[IRI, IRI], KeyCandidate] = {}
     for (side, entity), selected in result.selected.items():
@@ -703,11 +733,15 @@ def unique_key_candidates(result: StrategyResult) -> dict[tuple[IRI, IRI], KeyCa
     return pairs
 
 
-type RunAnchor = tuple[str, NormalizationLevel, AnchorSpecificity, float | None]  # family, level, specificity, IC
+# family, level, specificity, IC
+type RunAnchor = tuple[str, NormalizationLevel, AnchorSpecificity, float | None]
 
 
 def run_anchors(family: str, generator: Generator, result: StrategyResult) -> dict[tuple[IRI, IRI], RunAnchor]:
-    """The anchors of one key run with their level, specificity and information content."""
+    """
+    The anchors of one key run with their level,
+    specificity and information content.
+    """
     counters = None
     if compares_names(generator) and result.value_wordsets is not None:
         counters = {side: (extension_counter(result.value_wordsets[side]), len(result.value_wordsets[side]))
@@ -727,8 +761,10 @@ def run_anchors(family: str, generator: Generator, result: StrategyResult) -> di
 
 
 def merge_run_anchors(pair: tuple[IRI, IRI], found: list[RunAnchor]) -> Anchor:
-    """One anchor from the runs that found it: the finest level; head if one run
-    sees a head, specific if one sees it specific, else not applicable."""
+    """
+    One anchor from the runs that found it: the finest level; head if one run
+    sees a head, specific if one sees it specific, else not applicable.
+    """
     specificities = {specificity for _, _, specificity, _ in found}
     information_contents = [ic for _, _, _, ic in found if ic is not None]
     if AnchorSpecificity.HEAD in specificities:
@@ -773,7 +809,10 @@ def merge_anchors(run_ensemble: RunEnsemble, runs: dict[str, tuple[Generator, St
 
 
 def anchor_stratum_label(anchor: Anchor) -> str:
-    """head or specific (names only), and extended for a coarse level; empty: neither."""
+    """
+    head or specific (names only), and extended for a
+    coarse level; empty: neither.
+    """
     parts = [] if anchor.specificity == AnchorSpecificity.NOT_APPLICABLE else [anchor.specificity.value]
     if anchor.extended:
         parts.append("extended")
@@ -781,8 +820,10 @@ def anchor_stratum_label(anchor: Anchor) -> str:
 
 
 def get_anchor_strata(anchor_merge: AnchorMerge) -> list[Stratum]:
-    """The anchors in certification strata: by the families that found them, and
-    by head/specific and extended."""
+    """
+    The anchors in certification strata: by the families that found them, and
+    by head/specific and extended.
+    """
     pairs_by_stratum: dict[tuple[frozenset[str], str], list[tuple[IRI, IRI]]] = defaultdict(list)
     for anchor in anchor_merge.anchors:
         pairs_by_stratum[(anchor.families, anchor_stratum_label(anchor))].append(anchor.pair)

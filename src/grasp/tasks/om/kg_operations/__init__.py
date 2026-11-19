@@ -1,1 +1,1 @@
-"""Layer 4: domain queries and computations on KGs (groupings, profile statistics, value retrieval, key comparison)."""
+"""Layer 4: knows both KGs (KgManager) and module specific data models (KgProfile, Candidates ...)"""

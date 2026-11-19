@@ -27,32 +27,30 @@ from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.anchors import (
+from grasp.tasks.om.data_models.candidates import (
     Anchor,
     AnchorMerge,
     AnchorSpecificity,
     AnchorStageResult,
-)
-from grasp.tasks.om.data_models.candidate_generators import (
     CandidateStrategyType,
     Generator,
     KeyStrategy,
     Selection,
-)
-from grasp.tasks.om.data_models.candidate_selection import (
     ParetoIndex,
     RunEnsemble,
     StrategyResult,
     Stratum,
     TriedRun,
+    Normalization,
+    Population,
+    ValuePatterns,
 )
-from grasp.tasks.om.data_models.scope import Normalization, Population, ValuePatterns
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
     get_anchor_strata,
     merge_anchors,
-    merge_runs,
+    merge_candidate_runs,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
 from grasp.tasks.om.tasks.candidate_task import (
@@ -146,7 +144,7 @@ def run_full_anchor_ensemble(
         for run_id in run_ensemble.run_ids()
         }
     anchor_merge = merge_anchors(run_ensemble, runs)
-    competitor_merge = merge_runs(
+    competitor_merge = merge_candidate_runs(
         run_ensemble,
         {run_id: reselect_result(result, COMPETITOR_SELECTION) for run_id, (_, result) in runs.items()},
         CANDIDATE_BUDGET_PER_ENTITY,

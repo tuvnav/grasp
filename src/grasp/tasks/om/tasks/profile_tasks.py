@@ -64,7 +64,7 @@ from grasp.tasks.om.tasks.profile_stage import (
     format_predicate_overview,
     format_values,
     group_name_stats,
-    share,
+    format_share,
     size_stats,
     size_text,
     unassigned_predicates,
@@ -355,7 +355,7 @@ class GroupTask(ProfileStageTask):
                   and key not in role_elements(group_profile.added)]
         coverage = predicate_coverage(self.kg_manager, grouping, entity_space).get(group_name, {})
         size = sizes.get(group_name, 0)
-        others = [f"  {short_iri(p)}  as ?s: {share(c.entities, size)}  |  values: {format_values(c.values, c.literals, c.blanks)}"
+        others = [f"  {short_iri(p)}  as ?s: {format_share(c.entities, size)}  |  values: {format_values(c.values, c.literals, c.blanks)}"
                   for p, c in unassigned_predicates(effective, coverage)][:NUM_PREDICATES]
         definition = group_profile.definition
         agreement = "–" if stats.agreement is None else f"{stats.agreement:.0%}"

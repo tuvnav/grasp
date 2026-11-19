@@ -66,46 +66,44 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
 from grasp.tasks.om.kg_operations.entity_rendering import clip
 from grasp.tasks.om.kg_operations.grouping import (
     Grouping,
+    default_non_competing_pairs,
+    get_assigned_default_partitions,
+    ensure_groups,
+    ensure_partitions,
     estimated_group_sizes,
     group_sizes,
     grouping_to_sparql_query,
     groups_to_grouping,
-    kind_partitions,
+    get_default_partitions,
     partitions_to_grouping,
+    single_group_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import (
     KgSample,
-    class_counts,
     current_sample,
-    default_class_groups,
-    type_membership,
     use_sample,
     values_block,
 )
 from grasp.tasks.om.kg_operations.profile_statistics import (
-    Coverage,
-    LocalNameStats,
+    PredicateCoverage,
     Sides,
     canon_roles,
     complement,
-    default_entity_space,
     default_roles,
     distinguishing_features,
-    element_sparql,
     element_usage,
-    local_name_stats,
-    local_name_type,
+    ensure_space,
     member_coverage,
     members_query,
     membership_overlap,
     predicate_coverage,
     rest,
-    sample_entities,
     type_coverage,
+    unassigned_predicates,
 )
-from grasp.tasks.om.sparql_access.lookups import (
+from grasp.tasks.om.sparql_access import (
     select_rows,
-    sparql_path,
+    union_of,
 )
 from grasp.tasks.om.tasks.prompting import load_prompt
 from grasp.utils import FunctionCallException, format_enumerate, format_section
@@ -124,11 +122,15 @@ NUM_EXAMPLES = 8
 MAX_VALUE_CHARS = 80
 
 
-def inline_schema(model: type[BaseModel], drop: set[str] = frozenset()) -> dict:
-    """JSON schema of a model with its $defs inlined (not every model API
+def inline_schema(
+        model: type[BaseModel], drop: frozenset[str] = frozenset()
+        ) -> dict:
+    """
+    JSON schema of a model with its $defs inlined (not every model API
     resolves $ref), without titles, without the given properties and without
     discriminator mappings (they point into $defs; the const kind of each
-    alternative of a oneOf is enough)."""
+    alternative of a oneOf is enough).
+    """
     schema = model.model_json_schema()
     defs = schema.pop("$defs", {})
 
@@ -149,11 +151,11 @@ def inline_schema(model: type[BaseModel], drop: set[str] = frozenset()) -> dict:
     return resolve(schema)
 
 
-def share(n: int, size: int) -> str:
+def format_share(n: int, size: int) -> str:
     return f"{n}/{size} ({n / size:.0%})" if size else str(n)
 
 
-def run_rows(manager: KgManager, sparql: str) -> list[dict]:
+def run_retrieve_rows(manager: KgManager, sparql: str) -> list[dict]:
     try:
         return select_rows(manager, sparql)
     except Exception as e:
@@ -163,38 +165,42 @@ def run_rows(manager: KgManager, sparql: str) -> list[dict]:
 # --- helpers of the stages and editors ------------------------------------------------
 
 # defaults of the profile parts
-
 NUM_NAMESPACES = 15
-
-
 # kinds or classes listed per prefix
 NUM_KINDS = 8
-
-
 NUM_FEATURES = 10
-
-
 NUM_PREDICATES = 25
-
-
-NAME = re.compile(r"^[a-z][a-z0-9_]*$")
-
-
-# stage a counts entities per prefix by kind, without the subjects outside all kinds
-SPACE_GROUPING = partitions_to_grouping(kind_partitions(), mark_uncategorized_as_rest=False)
-
-
+NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# stage a) counts entities per prefix by kind,
+# without the subjects outside all kinds
+SPACE_GROUPING = partitions_to_grouping(
+    get_default_partitions(), mark_uncategorized_as_rest=False
+    )
 # name of all entities of a grouping, to compare a group with the rest
 ALL = "_all"
 
 
-def entity_examples(manager: KgManager, grouping: Grouping, space: list[str], where: str, k: int) -> list[str]:
-    """Up to k entities with a name and their partition or group."""
-    names = sparql_path(LABEL_PREDICATES)
-    rows = run_rows(manager, grouping_to_sparql_query(
-        manager, grouping, space, "?s ?group ?name",
-        f"{where}\nOPTIONAL {{ ?s {names} ?name }}", f"LIMIT {k * 4}",
-    ))
+def entity_examples(
+        manager: KgManager,
+        grouping: Grouping,
+        space: list[str],
+        where: str,
+        k: int
+        ) -> list[str]:
+    """
+    Up to k entities with a name and their partition or group.
+    """
+    names_sparql = union_of(LABEL_PREDICATES)
+    rows = run_retrieve_rows(
+        manager,
+        grouping_to_sparql_query(
+            manager,
+            grouping,
+            space,
+            "?s ?group ?name",
+            f"{where}\nOPTIONAL {{ ?s {names_sparql} ?name }}", f"LIMIT {k * 4}",
+            )
+        )
     seen, lines = set(), []
     for row in rows:
         entity = row["s"].value
@@ -208,84 +214,15 @@ def entity_examples(manager: KgManager, grouping: Grouping, space: list[str], wh
     return lines
 
 
-def ensure_space(
-        kg_manager: KgManager,
-        kg_profile: KgProfile,
-        config: GraspConfig | None = None
-        ) -> list[str]:
-    if kg_profile.entity_space:
-        return list(kg_profile.entity_space)
-    if config:
-        space, _ = default_entity_space(kg_manager, config)
-        return space
-    raise ValueError(
-        "Given KgProfile doesn't contain entity namespace and no GraspConfig was given."
-        "Either is required."
-        )
-
-
-def default_partitions(kg_manager: KgManager, kg_profile: KgProfile, entity_space: list[str]) -> dict[str, Partition]:
-    """The kind partitions with entities (in a large KG without the alternatives
-    that cannot be evaluated there)."""
-    large = kg_profile.large
-    partitions = kind_partitions(large=large)
-    sizes = estimated_group_sizes(
-        kg_manager, partitions_to_grouping(
-            partitions, mark_uncategorized_as_rest=False
-            ), entity_space
-        )
-    return {p.name: p for p in partitions if sizes.get(p.name)}
-
-
-def ensure_partitions(
-        kg_manager: KgManager, kg_profile: KgProfile, entity_space: list[str]
-        ) -> dict[str, Partition]:
-    if kg_profile.partitions:
-        return {p.name: p for p in kg_profile.partitions}
-    return default_partitions(kg_manager, kg_profile, entity_space)
-
-
-def default_non_competing_pairs(partitions: dict[str, Partition]) -> list[WithinKgNonCompetingPartitionPair]:
-    """Properties do not compete with the other kinds (the default before stage b decides)."""
-    if "property" not in partitions:
-        return []
-    return [WithinKgNonCompetingPartitionPair(partition_a="property", partition_b=name,
-                                              reason="properties and entities are not equivalent")
-            for name in partitions if name != "property"]
-
-
-def ensure_groups(
-        kg_manager: KgManager, kg_profile: KgProfile, entity_space: list[str]
-        ) -> dict[str, GroupDefinition]:
-    """The groups of the input profile; otherwise one per partition and, in a
-    large KG, one per large class."""
-    profile = kg_profile
-    if profile.groups:
-        return {g.name: g.definition for g in profile.groups}
-    groups = {name: GroupDefinition(name=p.name, membership_sparql=p.membership_sparql, origin=GroupOrigin.PARTITION,
-                                    features=p.features)
-              for name, p in ensure_partitions(
-                  kg_manager, kg_profile, entity_space
-                  ).items()}
-    if profile.large:
-        for name, type_iri, _ in default_class_groups(
-                kg_manager, tuple(entity_space), class_counts(kg_manager)
-                ):
-            if name not in groups:
-                groups[name] = GroupDefinition(
-                    name=name,
-                    membership_sparql=type_membership(type_iri),
-                    origin=GroupOrigin.CLASS,
-                    features=f"typed {short_iri(type_iri)}"
-                    )
-    return groups
-
-
 # sizes, features and definitions of partitions and groups
 
 
-def size_text(manager: KgManager, sizes: dict[str, int], estimates: dict[str, int], name: str) -> str:
-    """Size of a partition or group: counted, or in a large KG estimated with the size of its sample."""
+def size_text(
+        manager: KgManager, sizes: dict[str, int], estimates: dict[str, int], name: str
+        ) -> str:
+    """
+    Size of a partition or group: counted, or in a large KG estimated with the size of its sample.
+    """
     if current_sample(manager) is None:
         return f"{sizes.get(name, 0)} entities"
     estimate = estimates.get(name)
@@ -310,8 +247,13 @@ def run_sizes(manager: KgManager, grouping: Grouping, space: list[str]) -> dict[
         raise FunctionCallException(f"The SPARQL query failed: {e}") from e
 
 
-def format_features(inside: dict[str, int], size_inside: int, outside: dict[str, int], size_outside: int,
-                    other: str) -> list[str]:
+def format_features(
+        inside: dict[str, int],
+        size_inside: int,
+        outside: dict[str, int],
+        size_outside: int,
+        other: str
+        ) -> list[str]:
     return [f"  {short_iri(f.key)}: {f.inside:.0%} inside, {f.outside:.0%} in {other}"
             for f in distinguishing_features(inside, size_inside, outside, size_outside, NUM_FEATURES)]
 
@@ -324,7 +266,7 @@ def membership_argument(fn_args: dict) -> str:
 
 
 def valid_name(name: str, unit: str) -> str:
-    if not NAME.match(name or "") or name in (UNCATEGORIZED, ALL):
+    if not NAME_RE.match(name or "") or name in (UNCATEGORIZED, ALL):
         raise FunctionCallException(f"Invalid {unit} name {name!r}: lower case letters, digits and _")
     return name
 
@@ -362,7 +304,7 @@ def format_values(values: int, literals: int, blanks: int) -> str:
     return ", ".join(parts)
 
 
-def format_predicate_overview(coverage: dict[str, dict[str, Coverage]], sizes: dict[str, int],
+def format_predicate_overview(coverage: dict[str, dict[str, PredicateCoverage]], sizes: dict[str, int],
                               members: list[str], roles: Roles, k: int) -> str:
     """The predicates with the highest coverage in some partition: the share of
     each partition's entities that are its subject (as ?s), the kinds of its
@@ -391,31 +333,6 @@ def format_predicate_overview(coverage: dict[str, dict[str, Coverage]], sizes: d
 # exclude_group warns if the excluded groups cover more of the entity space
 LARGE_EXCLUSION_SHARE = 0.5
 
-
-def single_grouping(profile: KgProfile, group: str) -> Grouping:
-    """The grouping of one group only, without the entities of excluded groups
-    (they are not aligned): stage e looks at no other group."""
-    excluded = tuple(profile.get_group(name).definition.membership_sparql
-                     for name in profile.excluded_group_names() if name != group)
-    return Grouping(((group, profile.get_group(group).definition.membership_sparql),), exclusive=False, minus=excluded)
-
-
-def group_name_stats(manager: KgManager, grouping: Grouping, space: list[str], group: str,
-                     roles: Roles) -> LocalNameStats:
-    sample = sample_entities(manager, grouping, space, where=f'FILTER(?group = "{group}")')
-    return local_name_stats(manager, sample.get(group, []), roles.names)
-
-
-def group_defaults(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupProfile, LocalNameStats]:
-    """Profile of a group without LLM: the local name type from its sample, its delta unchanged."""
-    grouping = single_grouping(profile, group)
-    current = profile.get_group(group)
-    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
-    effective = effective_roles(profile.roles, current, usage)
-    stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
-    return current.model_copy(update={"local_name_type": local_name_type(stats)}, deep=True), stats
-
-
 # stage e runs in full mode for a group with at least MIN_UNASSIGNED predicates
 # without a role, each covering MIN_UNASSIGNED_SHARE of its entities as subject
 # (vocabulary predicates such as rdf:type not counted), or for a group formed in
@@ -437,19 +354,13 @@ MIN_GROUP_SIZE_FOR_GROUP_STAGE = 50
 MAX_GROUP_TASK_STEPS_BY_MODE = {GroupEditMode.FULL: 30, GroupEditMode.LIGHT: 12}
 
 
-def unassigned_predicates(roles: Roles, coverage: dict[str, Coverage]) -> list[tuple[str, Coverage]]:
-    """Predicates of a group in no element of its roles (as predicate or
-    inside a pattern), most frequent first."""
-    elements = role_elements(roles)
-    predicates = {key[2] for key in elements if key[1] == "predicate"}
-    patterns = [element_sparql(key, value) for key, value in elements.items() if key[1] != "predicate"]
-    covered = lambda p: p in predicates or any(f"<{p}>" in pattern for pattern in patterns)
-    return [(p, c) for p, c in sorted(coverage.items(), key=lambda x: -x[1].entities) if not covered(p)]
-
-
-def group_mode(manager: KgManager, profile: KgProfile, group: str) -> tuple[GroupEditMode, list[str]]:
-    """(mode of stage e for a group, the unassigned predicates that count)."""
-    grouping = single_grouping(profile, group)
+def group_mode(
+        manager: KgManager, profile: KgProfile, group: str
+        ) -> tuple[GroupEditMode, list[str]]:
+    """
+    (mode of stage e for a group, the unassigned predicates that count).
+    """
+    grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)
     usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
@@ -564,12 +475,12 @@ class EntitySpaceEditor(Editor):
         sizes = run_sizes(self.kg_manager, SPACE_GROUPING, [prefix])
         if not sizes:
             return f"No entities with IRIs starting with {prefix}."
-        named = run_rows(self.kg_manager, grouping_to_sparql_query(
+        named = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?s) AS ?n)",
-            f"FILTER EXISTS {{ ?s {sparql_path(LABEL_PREDICATES)} ?name }}",
+            f"FILTER EXISTS {{ ?s {union_of(LABEL_PREDICATES)} ?name }}",
         ))
         named_count = int(named[0]["n"].value) if named and "n" in named[0] else 0
-        types = run_rows(self.kg_manager, grouping_to_sparql_query(
+        types = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?s) AS ?n)",
             f"?s <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
         ))
@@ -603,8 +514,8 @@ class EntitySpaceEditor(Editor):
         if not pairs:
             return []
         names: dict[str, str] = {}
-        rows = run_rows(self.kg_manager, f"SELECT ?s ?name WHERE {{ {values_block([e for e, _ in pairs])} "
-                        f"?s {sparql_path(LABEL_PREDICATES)} ?name }}")
+        rows = run_retrieve_rows(self.kg_manager, f"SELECT ?s ?name WHERE {{ {values_block([e for e, _ in pairs])} "
+                                 f"?s {union_of(LABEL_PREDICATES)} ?name }}")
         for row in rows:
             names.setdefault(row["s"].value, row["name"].value)
         return [f"  {e}" + (f' "{clip(names[e], 50)}"' if e in names else "") + f" ({c})" for e, c in pairs]
@@ -741,7 +652,7 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
                           key=lambda member: overlap[member], default=None)
         where = f"by current {self.unit} (share of the {self.unit} that matches)"
         lines = [size_line + where + ": "
-                 + ", ".join(f"{p} {share(n, self.sizes.get(p, 0))}" for p, n in sorted(overlap.items(), key=lambda x: -x[1]))]
+                 + ", ".join(f"{p} {format_share(n, self.sizes.get(p, 0))}" for p, n in sorted(overlap.items(), key=lambda x: -x[1]))]
         if compare is not None:
             rest_size = self.sizes.get(compare, 0) - overlap.get(compare, 0)
             for title, counts, ins in (("Predicates", self.predicates, inside), ("Types", self.types, inside_types)):
@@ -749,8 +660,8 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
                 lines.append(f"{title} (share of the matches vs. the rest of {compare}):")
                 lines += format_features(ins, size, outside, rest_size, f"rest of {compare}")[:NUM_FEATURES if title == "Predicates" else 5]
         lines.append("Examples:")
-        names = sparql_path(LABEL_PREDICATES)
-        rows = run_rows(self.kg_manager, (
+        names = union_of(LABEL_PREDICATES)
+        rows = run_retrieve_rows(self.kg_manager, (
             f"SELECT DISTINCT ?s ?name WHERE {{ {members_query(membership, self.entity_space, self.kg_manager)} "
             f"OPTIONAL {{ ?s {names} ?name }} }} LIMIT 6"
         ))
@@ -1126,7 +1037,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         self.exclusions.pop(name, None)
         self.local_name_types.pop(name, None)
         alone = overlap.get(UNCATEGORIZED, 0)
-        return (f"Group {name} removed; {share(alone, size)} of its entities are in no other group and are no "
+        return (f"Group {name} removed; {format_share(alone, size)} of its entities are in no other group and are no "
                 f"longer aligned.\n{self.format_sizes()}")
 
     def set_local_name_type(self, fn_args: dict) -> str:
@@ -1208,7 +1119,7 @@ class RoleEditor(Editor):
         if not partitions:
             if not create_missing:
                 raise ValueError("The profile has no partitions")
-            partitions = list(default_partitions(kg_manager, kg_profile, entity_space).values())
+            partitions = list(get_assigned_default_partitions(kg_manager, kg_profile, entity_space).values())
         grouping = partitions_to_grouping(partitions, mark_uncategorized_as_rest=False)
         partition_names = [partition.name for partition in partitions]
         sizes = group_sizes(kg_manager, grouping, entity_space)
@@ -1326,7 +1237,7 @@ class RoleEditor(Editor):
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"relation": inline_schema(StructureRelation, drop={"source"})},
+                    "properties": {"relation": inline_schema(StructureRelation, drop=frozenset("source"))},
                     "required": ["relation"],
                     "additionalProperties": False,
                 },
@@ -1362,7 +1273,7 @@ class RoleEditor(Editor):
         self.counted |= set(new)
 
     def format_coverage(self, key: ElementKey) -> str:
-        counts = [f"{p} {share(self.usage.get(p, {}).get(key, 0), self.sizes.get(p, 0))}"
+        counts = [f"{p} {format_share(self.usage.get(p, {}).get(key, 0), self.sizes.get(p, 0))}"
                   for p in self.scope]
         return "; ".join(counts)
 
@@ -1377,7 +1288,7 @@ class RoleEditor(Editor):
     def format_relation(self, relation: StructureRelation, origin: Callable[[ElementKey], str] | None = None) -> str:
         key = ("structure", "relation", relation.name)
         mark = f" [{origin(key)}]" if origin else ""
-        side = lambda i: "; ".join(f"{p} {share(self.sides.get(p, {}).get(key, (0, 0))[i], self.sizes.get(p, 0))}"
+        side = lambda i: "; ".join(f"{p} {format_share(self.sides.get(p, {}).get(key, (0, 0))[i], self.sizes.get(p, 0))}"
                                    for p in self.scope)
         return f"  {describe_structure_relation(relation)}{mark}\n    as ?s: {side(0)}\n    as ?o: {side(1)}"
 
@@ -1398,7 +1309,7 @@ class RoleEditor(Editor):
         member = fn_args.get("show_examples_from")
         if member is not None and member not in self.scope:
             raise FunctionCallException(f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}")
-        rows = run_rows(self.kg_manager, grouping_to_sparql_query(
+        rows = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, self.grouping, self.entity_space,
             "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
             "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
@@ -1409,7 +1320,7 @@ class RoleEditor(Editor):
         lines = [f"Pattern: {describe_predicate_pattern(pattern)}"]
         for p in self.scope:
             row = counts.get(p, {})
-            lines.append(f"{self.unit.capitalize()} {p}: {share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
+            lines.append(f"{self.unit.capitalize()} {p}: {format_share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
                          f"{value(row, 'n')} matches, {value(row, 'objects')} distinct ?o, "
                          f"{value(row, 'literals')} literal matches.")
         if member is None:
@@ -1423,8 +1334,8 @@ class RoleEditor(Editor):
     def format_examples(self, member: str, parts: list[str]) -> list[str]:
         """Example matches with a name of ?s and of ?o (codes alone say little)."""
         names = self.roles.names.predicates if self.roles.names else []
-        names_path = sparql_path(list(dict.fromkeys(names + LABEL_PREDICATES)))
-        rows = run_rows(self.kg_manager, grouping_to_sparql_query(
+        names_path = union_of(list(dict.fromkeys(names + LABEL_PREDICATES)))
+        rows = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, self.grouping, self.entity_space, "?s ?o ?s_name ?o_name",
             f'FILTER(?group = "{member}")\n'
             f"OPTIONAL {{ ?s {names_path} ?s_name }}\nOPTIONAL {{ ?o {names_path} ?o_name }}",
@@ -1524,20 +1435,26 @@ NO_GROUP_VALUES = frozenset({"", "null", "none"})
 
 
 def group_reference(value: Any) -> str | None:
-    """The group (or partition) a finding or flag names; None for no group,
-    also if the model wrote one as text (e.g. "null")."""
+    """
+    The group (or partition) a finding or flag names; None for no group,
+    also if the model wrote one as text (e.g. "null").
+    """
     if value is None or (isinstance(value, str) and value.strip().lower() in NO_GROUP_VALUES):
         return None
     return value
 
 
 def next_flag_id(stage: Stage, existing: int) -> str:
-    """Id of a new flag of a stage, after the existing flags of the profile."""
+    """
+    Id of a new flag of a stage, after the existing flags of the profile.
+    """
     return f"{stage.value}-{existing + 1}"
 
 
 def format_flag(flag: Flag) -> str:
-    """A flag for the input: id, status, who raised it about what, and its resolution."""
+    """
+    A flag for the input: id, status, who raised it about what, and its resolution.
+    """
     about = flag.concerns_stage.value + (f", {flag.concerns_group}" if flag.concerns_group else "")
     text = f"{flag.id} [{flag.status.value}; {flag.raised_by_stage.value} on {about}] {flag.content}"
     if flag.resolution_description:

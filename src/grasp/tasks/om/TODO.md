@@ -2,18 +2,13 @@
 - Klarstellen: Welche Ablation brauche ich, welche nicht + Trennung Ablation von echten Konfigurationen für Endprodukt (JudgeType etc.)
 - partition_names_by_entity zentralisieren (nur einmal abrufen)
 - Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
-- SPARQL-Variablen einstellbar machen, "s", "o", "entity", "group" etc. überall aus dem Hartcode rausnehmen und dort auf Konstanten verweisen
 - Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
 - Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
-- Dateistruktur verständlicher machen: Dateien zusammenlegen/umbenennen
-- Strukturrollen streichen: Identity, Association, Other nur bei Ausnahmen setzen. Oder Identity beibehalten und bei Key- und Äquivalenzkollisionen bei Judge bedenken (gefährlicher als wegschmeiße ).
-- Ziele der Strukturrollen erklären.
+- Ziele der Strukturrollen im Prompt erklären.
 - 'other'-Rollen irgendwie zwischen KGs ablgeichen. Oder besser: Source- und Targetgenerator eigene Relationen verwenden lassen!
 - Berechenbare Relationen berechnen statt setzen: Subsumption ↔ Membership: Aus den Partitionen ableitbar: ?s Instanz und ?o Klasse → Membership; beide in derselben Partition → Subsumption
 - Funde in Prompts als 'KG notes' integrieren
-- EntityContext überarbeiten: noise rausstreichen, nochmal Regeln überdenken
 - Transforms aus Ankerstufe entfernen...
-- Anzeige in allen Aufgaben überarbeiten: describe profile, Texte für die Judges...
 - 'x entities aus Strategie ausgelassen, weil sie schon gematcht sind' in Ergebnisübersicht pro Kandidatenstrategie
 - Familien wählen in den Prompt: unabhängige Informationsquellen = Fehler korrelieren nicht mit Beispielen: "Give runs the same family if they draw on the same information of the entities (the same values, or values derived from or containing one another), whatever their technique, population or selection; mutual runs take the family of the run they select from. Use a new family only for information whose errors are unlikely to coincide with those of the existing families."
 - Kandidatenstrata in Reihenfolge der Stratumstärke bewerten mit Abbruchkriterium bei abfallenden Matches, pro Gruppe/Partition je nach Gruppengröße -> Recallrunde gleich schneiden!
@@ -32,9 +27,9 @@
 ## Optimierungsideen aus Probeläufen
 ### Profiling:
 - Roles: 
-    - Tool für Namen aus lokalen Namen? Oder explizit verbieten
+    - Tool für Namen aus lokalen Namen?
     - Präfixierte Prädikate in PredicatePattern korrekt behandeln!
-- Belegpflicht für Funde
+- Belegpflicht für Funde?
 - Funde optional machen!!
 - Strukturrollen, die über Blank Nodes gehen, zusätzlich ein Beispielpaar zeigen, das das Modell bestätigen muss
 - Shortcut für Profilierung bei standartisierten KGs:

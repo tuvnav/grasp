@@ -44,7 +44,7 @@ from grasp.tasks.om.data_models.verification import (
 from grasp.tasks.om.foundation.configuration import know_before_use, load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
-from grasp.tasks.om.sparql_access.lookups import ensure_known
+from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
 from grasp.tasks.om.tasks.task_input import managers_by_side

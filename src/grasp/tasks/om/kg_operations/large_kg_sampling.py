@@ -35,9 +35,9 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNIVERSE,
     local_name,
 )
-from grasp.tasks.om.sparql_access.lookups import (
+from grasp.tasks.om.sparql_access import (
     select_rows,
-    sparql_path,
+    union_of,
     extract_union_alternatives,
     values_clause,
 )
@@ -282,7 +282,7 @@ def large_prefix_counts(manager: KgManager, classes: dict[IRI, int]) -> PrefixCo
     totals: Counter[str] = Counter()
     named_totals: Counter[str] = Counter()
     examples: dict[str, list[tuple[IRI, str]]] = {}
-    names = sparql_path(LABEL_PREDICATES + SYNONYM_PREDICATES)
+    names = union_of(LABEL_PREDICATES + SYNONYM_PREDICATES)
     sampled = dict(sorted(classes.items(), key=lambda x: -x[1])[:MAX_SAMPLED_CLASSES])
     class_values = "VALUES ?t { " + " ".join(f"<{t}>" for t in sampled) + " }"
     for type_iri, n in sampled.items():

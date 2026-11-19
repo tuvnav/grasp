@@ -41,15 +41,17 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     local_name,
 )
 from grasp.tasks.om.kg_operations.grouping import groups_by_entity
-from grasp.tasks.om.kg_operations.value_retrieval import named_value_patterns
-from grasp.tasks.om.sparql_access.lookups import (
+from grasp.tasks.om.kg_operations.candidate_generation import (
+    named_value_patterns,
+)
+from grasp.tasks.om.sparql_access import (
     select_rows,
     ValueGroup,
     retrieve_blank_nodes,
     retrieve_value_groups,
     down_pushed_union,
     sparql_literal,
-    sparql_path,
+    union_of,
     as_batched_values_blocks,
     values_clause,
 )
@@ -270,7 +272,9 @@ def role_branches(roles: Roles, role_names: Iterable[str]) -> list[str]:
 
 @dataclass
 class PredicateUsage:
-    """Entity is used as a predicate/property"""
+    """
+    Entity is used as a predicate/property
+    """
     triple_count: int
     subject_types: list[tuple[IRI, int]]  # most common subject types with count
     object_types: list[tuple[IRI, int]]  # most common object types with count
@@ -352,7 +356,7 @@ def retrieve_predicate_usage(
         return [
             (IRI(r["t"].value), int(r["n"].value)) for r in select_rows(
                 manager,
-                f"SELECT ?t (COUNT(*) AS ?n) WHERE {{ ?usage_subject {term} ?usage_object . ?{position} {sparql_path(type_predicates)} ?t }} "
+                f"SELECT ?t (COUNT(*) AS ?n) WHERE {{ ?usage_subject {term} ?usage_object . ?{position} {union_of(type_predicates)} ?t }} "
                 f"GROUP BY ?t ORDER BY DESC(?n) LIMIT 3",
             )
         ]
@@ -627,6 +631,9 @@ class EntityDisplay:
             f" [{'; '.join(notes)}]" if notes else ""
             )
 
+    # TODO: return Section or Item, must only change last
+    # line for this. Render with format_display_content
+    # in callers or directly here.
     def render_context(self, context: EntityContext, view: EntityView) -> str:
         """
         The line of the entity, then its context in a fixed order of
@@ -646,8 +653,12 @@ class EntityDisplay:
         for line in (
             shown_values("further names", names[1:], len(names)),
             shown_values("synonyms", synonyms, view.num_synonyms),
-            shown_values("definitions",
-                         definitions, view.num_values, view.max_chars_per_literal),
+            shown_values(
+                "definitions",
+                definitions,
+                view.num_values,
+                view.max_chars_per_literal
+                ),
         ):
             if line:
                 lines.append(line)
@@ -660,7 +671,11 @@ class EntityDisplay:
         # the edges of all other predicates: predicates with few values first
         for direction, groups in (("", context.outgoing), ("incoming ", context.incoming)):
             for predicate, group in sorted(groups.items(), key=lambda item: item[1].total_count):
-                lines.append(self.render_value_group(direction + local_name(predicate), group, context, view))
+                lines.append(
+                    self.render_value_group(
+                        direction + local_name(predicate), group, context, view
+                        )
+                    )
 
         # usage by other entities
         if context.used_as_predicate:

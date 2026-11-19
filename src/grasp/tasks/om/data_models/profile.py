@@ -312,6 +312,8 @@ class GroupProfile(BaseModel):
         return self.definition.name
 
 
+
+
 class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     stage: Stage
