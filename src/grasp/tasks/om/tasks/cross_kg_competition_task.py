@@ -23,7 +23,6 @@ from grasp.tasks.om.data_models.alignment_state import (
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.types import Side
-from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.tasks.profile_stage import PartitionEditor
 from grasp.tasks.om.tasks.prompting import load_prompt
 from grasp.utils import FunctionCallException, format_section
@@ -84,10 +83,9 @@ class CrossKgCompetitionTask(GraspTask):
         return self.input_text()
 
     def read_partitions(self, side: Side) -> PartitionEditor:
-        """The partitions of one KG with their statistics (a large KG on samples)."""
+        """The partitions of one KG with their statistics."""
         profile = self.alignment_state.get_kg_profile(side)
         manager, _ = find_manager(self.managers, profile.kg_name)
-        use_sample(manager, KgSample(manager, tuple(profile.entity_space)) if profile.large else None)
         return PartitionEditor.from_kg_profile(manager, profile, create_missing=False)
 
     # --- input ---
@@ -102,7 +100,7 @@ class CrossKgCompetitionTask(GraspTask):
                      + (f" ({manager.description})" if manager.description else ""),
                      editor.input_for_llm()]
             parts += [editor.describe_member(name, f"Partition {name}")
-                      for name in editor.names() if editor.sizes.get(name)]
+                      for name in editor.names() if editor.group_sizes.get(name)]
             sections.append(format_section(f"Partitions of the {side.value} knowledge graph", "\n\n".join(parts)))
         sections.append(format_section("Partitions of the two knowledge graphs that do not compete",
                                        self.format_cross_kg_pairs()))

@@ -470,7 +470,7 @@ def anchor_function_definitions() -> list[dict]:
         {
             "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
             "description": (
-                "Tries a key strategy in a trial run (on a sample of a large knowledge graph) and shows its "
+                "Tries a key strategy in a trial run and shows its "
                 "anchors: pairs whose key no other competing entity of either knowledge graph shares. It "
                 "shows how many entities get an anchor, how many share a key but stay ambiguous, how many "
                 "anchors are head anchors (their name is part of longer names, e.g. 'paper' of 'poster "

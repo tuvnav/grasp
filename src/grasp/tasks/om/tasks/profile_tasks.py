@@ -30,26 +30,20 @@ from grasp.tasks.om.data_models.profile import (
 )
 from grasp.tasks.om.foundation.configuration import configured_namespaces
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
-from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.types import LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNCATEGORIZED,
     namespace_of,
 )
-from grasp.tasks.om.kg_operations.grouping import (
-    estimated_group_sizes,
-)
-from grasp.tasks.om.kg_operations.large_kg_sampling import (
-    class_counts,
+from grasp.tasks.om.kg_operations.profile_statistics import (
+    LARGE_TRIPLES,
     count_triples,
     is_large,
-    large_prefix_counts,
-)
-from grasp.tasks.om.kg_operations.profile_statistics import (
     canon_roles,
     local_name_type,
     predicate_coverage,
     group_name_stats,
-    prefix_counts,
+    prefix_per_group_counts,
     prefix_totals,
 )
 from grasp.tasks.om.tasks.profile_stage import (
@@ -78,30 +72,25 @@ from grasp.utils import FunctionCallException
 # --- a. entity space ----------------------------------------------------------------
 class SpaceTask(ProfileStageTask):
     """
-    Stage a: the entity space. prepare counts the entities per IRI prefix (in
-    a large KG, estimated from class samples) for the input text; the editor
-    gets the samples to inspect prefixes of a large KG.
+    Stage a: the entity space. prepare counts the
+    entities per IRI prefix for the input text.
     """
     name = "om-profile-space"
     stage = Stage.SPACE
     prompt_file = "profile_space.txt"
     space_editor: EntitySpaceEditor
     triples: int | None
-    large: bool
 
     def prepare(self, input: dict) -> Section:
         self.triples = count_triples(self.kg_manager)
-        self.large = is_large(self.triples)
-        prefix_examples: dict[str, list[tuple[IRI, str]]] = {}
-        class_prefix_counts: dict[tuple[str, str], int] = {}
-        if self.large:
-            # a full count per prefix does not finish: estimate it from class samples
-            large_counts = large_prefix_counts(self.kg_manager, class_counts(self.kg_manager))
-            all_counts, named_totals, totals = large_counts.counts, large_counts.named_totals, large_counts.totals
-            prefix_examples, class_prefix_counts = large_counts.examples, all_counts
-        else:
-            named, all_counts = prefix_counts(self.kg_manager, True), prefix_counts(self.kg_manager, False)
-            named_totals, totals = prefix_totals(named), prefix_totals(all_counts)
+        if is_large(self.triples):
+            raise ValueError(
+                f"Large knowledge graphs (more than {LARGE_TRIPLES:_} triples, or whose triples cannot "
+                "be counted) are not supported yet."
+                )
+        named = prefix_per_group_counts(self.kg_manager, True)
+        all_counts = prefix_per_group_counts(self.kg_manager, False)
+        named_totals, totals = prefix_totals(named), prefix_totals(all_counts)
 
         # the default space
         configured = configured_namespaces(self.config, self.kg_manager.kg)
@@ -115,29 +104,30 @@ class SpaceTask(ProfileStageTask):
             space, source = [totals.most_common(1)[0][0]], "prefix with the most entities"
         else:
             space, source = [], "no entities found"
-        self.stats = {"triples": self.triples, "large": self.large, "prefixes": dict(totals.most_common()),
-                      "named": dict(named_totals.most_common())}
+        self.stats = {
+            "triples": self.triples,
+            "prefixes": dict(totals.most_common()),
+            "named": dict(named_totals.most_common())
+            }
         self.default = self.input_profile.model_copy(
-            update={"entity_space": space, "triples": self.triples, "large": self.large}, deep=True)
+            update={"entity_space": space, "triples": self.triples}, deep=True)
 
         # the default is chosen above from the counts made anyway, not by the editor
         self.space_editor = EntitySpaceEditor.from_kg_profile(
             self.kg_manager, self.default, create_missing=False,
-            prefix_examples=prefix_examples, class_prefix_counts=class_prefix_counts,
         )
 
         # the input: entities per host and prefix, examples
         hosts: dict[str, list[str]] = {}
         for prefix, _ in totals.most_common():
             hosts.setdefault(namespace_of(prefix), []).append(prefix)
-        approx = "~" if self.large else ""
 
         def prefix_item(prefix: str) -> Item:
             kinds = sorted(((k, n) for (other, k), n in all_counts.items() if other == prefix), key=lambda x: -x[1])
             more = f", ... {len(kinds) - NUM_KINDS} more" if len(kinds) > NUM_KINDS else ""
-            kinds_text = ", ".join(f"{k} {approx}{n}" for k, n in kinds[:NUM_KINDS]) + more
-            return Item(f"{prefix}: {approx}{totals[prefix]} entities ({kinds_text}), "
-                        f"{approx}{named_totals.get(prefix, 0)} with a canon name")
+            kinds_text = ", ".join(f"{k} {n}" for k, n in kinds[:NUM_KINDS]) + more
+            return Item(f"{prefix}: {totals[prefix]} entities ({kinds_text}), "
+                        f"{named_totals.get(prefix, 0)} with a canon name")
 
         prefix_items: list[SectionContent] = []
         for host, prefixes in sorted(hosts.items(), key=lambda x: -sum(totals[p] for p in x[1]))[:NUM_NAMESPACES]:
@@ -148,29 +138,27 @@ class SpaceTask(ProfileStageTask):
             if len(prefixes) > NUM_NAMESPACES:
                 children.append(Item(f"... {len(prefixes) - NUM_NAMESPACES} more prefixes"))
             prefix_items.append(Item(
-                f"{host}: {approx}{sum(totals[p] for p in prefixes)} entities, "
-                f"{approx}{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name", children))
+                f"{host}: {sum(totals[p] for p in prefixes)} entities, "
+                f"{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name", children))
         if len(hosts) > NUM_NAMESPACES:
             prefix_items.append(Item(f"... {len(hosts) - NUM_NAMESPACES} more hosts"))
         example_items: list[SectionContent] = [
-            Item(f"{prefix}:", self.space_editor.sampled_examples(prefix, 4) if self.large
-                 else entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 4))
+            Item(
+                f"{prefix}:",
+                entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 4)
+                )
             for prefix, _ in totals.most_common(3)
             ]
-        size = (f"Size: {self.triples} triples." if self.triples is not None
-                else "Size: the triples cannot be counted (the query times out).")
-        if self.large:
-            size += (" This is a large knowledge graph: entities are counted per class (rdf:type) and "
-                     "estimated from samples of each class (~); untyped entities are not counted.")
-            group = "class (rdf:type)"
-        else:
-            group = "kind"
+        size = f"Size: {self.triples} triples."
+
         return Section("Current stage: entity space", [
             size,
             f"Default entity space ({source}): " + (", ".join(space) or "none"),
             ], [
-            Section(f"Entities per IRI prefix (host, and below it the first path segment) and {group}",
-                    prefix_items),
+            Section(
+                f"Entities per IRI prefix (host, and below it the first path segment) and kind",
+                prefix_items
+                ),
             Section("Examples", example_items),
             ])
 
@@ -183,7 +171,7 @@ class SpaceTask(ProfileStageTask):
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         space = self.space_editor.checked_entity_space()
         profile = self.input_profile.model_copy(
-            update={"entity_space": space, "triples": self.triples, "large": self.large}, deep=True)
+            update={"entity_space": space, "triples": self.triples}, deep=True)
         return profile, f"Entity space: {', '.join(space)}"
 
 
@@ -205,7 +193,7 @@ class PartitionsTask(ProfileStageTask):
 
         subsections = list(self.partition_editor.input_for_llm())
         for name in self.partition_editor.names() + [UNCATEGORIZED]:
-            if self.partition_editor.sizes.get(name):
+            if self.partition_editor.group_sizes.get(name):
                 title = (f"Partition {name}" if name != UNCATEGORIZED
                          else f"Subjects that match no partition, {UNCATEGORIZED}, not aligned")
                 subsections.append(self.partition_editor.describe_member(name, title))
@@ -244,9 +232,8 @@ class RolesTask(ProfileStageTask):
         default = self.role_editor.roles
         entity_space, grouping = self.role_editor.entity_space, self.role_editor.grouping
         partition_names, sizes = self.role_editor.scope, self.role_editor.unit_sizes
-        estimates = estimated_group_sizes(self.kg_manager, grouping, entity_space)
         self.default = self.input_profile.model_copy(update={"entity_space": entity_space, "roles": default}, deep=True)
-        self.stats = size_stats(self.kg_manager, sizes, estimates)
+        self.stats = size_stats(sizes)
 
         coverage = predicate_coverage(self.kg_manager, grouping, entity_space)
         canon = ", ".join(
@@ -257,7 +244,7 @@ class RolesTask(ProfileStageTask):
             if not (element.is_structure_relation and element.kind != RoleElementKind.RELATION_PROPERTIES)
             )
         partition_sizes = ", ".join(
-            f"{name} ({size_text(self.kg_manager, sizes, estimates, name)})" for name in partition_names
+            f"{name} ({size_text(sizes, name)})" for name in partition_names
             )
         return Section("Current stage: KG-wide roles", [
             "Partitions: " + partition_sizes,
@@ -310,7 +297,7 @@ class GroupsTask(ProfileStageTask):
                 Section("Profile of the other knowledge graph of the task", notes.content, notes.subsections))
         subsections += self.group_editor.input_for_llm()
         for name in self.group_editor.names():
-            if self.group_editor.sizes.get(name):
+            if self.group_editor.group_sizes.get(name):
                 subsections.append(self.group_editor.describe_member(name, f"Group {name}"))
         return Section("Current stage: groups", subsections=subsections)
 
@@ -360,12 +347,11 @@ class GroupTask(ProfileStageTask):
         self.role_editor = RoleEditor.from_group_profile(self.kg_manager, profile, group_name)
         effective = self.role_editor.roles
         entity_space, grouping, sizes = self.role_editor.entity_space, self.role_editor.grouping, self.role_editor.unit_sizes
-        estimates = estimated_group_sizes(self.kg_manager, grouping, entity_space)
         group_profile = profile.get_group(group_name)
 
         stats = group_name_stats(self.kg_manager, grouping, entity_space, group_name, effective)
         self.name_type = local_name_type(stats)
-        self.stats = {"size": size_stats(self.kg_manager, sizes, estimates)["sizes"].get(group_name, 0),
+        self.stats = {"size": sizes.get(group_name, 0),
                       "mode": self.edit_mode.value, "local_names": stats.model_dump()}
         self.default = profile.with_replaced_group(group_profile.model_copy(update={"local_name_type": self.name_type}))
 
@@ -384,7 +370,7 @@ class GroupTask(ProfileStageTask):
         agreement = "–" if stats.agreement is None else f"{stats.agreement:.0%}"
         speaking = "–" if stats.speaking is None else f"{stats.speaking:.0%}"
         return Section(f"Current stage: group {group_name}", [
-            f"Group {group_name}: {size_text(self.kg_manager, sizes, estimates, group_name)}"
+            f"Group {group_name}: {size_text(sizes, group_name)}"
             + (f"; {definition.features}" if definition.features else ""),
             Item(f"membership: {{ {definition.membership_sparql} }}"),
             f"Local names (sample of {stats.sample_size}, {stats.labelled} with a name predicate): {agreement} agree with "
@@ -453,9 +439,6 @@ class ProfileRevisionTask(ProfileStageTask):
     together). A group's role editor is created on first use; rebuilt, it
     keeps its deviation (added, removed) and derives the rest from the
     current KG-wide roles again (a rebase).
-
-    In a large KG, the entity space cannot be changed: its class samples
-    are not in the profile.
     """
     name = "om-profile-revision"
     stage = Stage.REVISION
@@ -468,7 +451,7 @@ class ProfileRevisionTask(ProfileStageTask):
     flags: list[Flag]                             # working copies, with the resolutions
     findings: list[Finding]                       # working copy, replaced by set_findings
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         profile = self.input_profile
         try:
             self.entity_space_editor = EntitySpaceEditor.from_kg_profile(
@@ -486,16 +469,11 @@ class ProfileRevisionTask(ProfileStageTask):
         self.default = profile.model_copy(deep=True)
         self.stats = {"open_flags": len(self.open_flag_ids()), "findings": len(self.findings)}
 
-        entity_space_sections = self.entity_space_editor.input_for_llm()
-        if profile.large:
-            entity_space_sections[0].content = [
-                *entity_space_sections[0].content,
-                "A large knowledge graph: the entity space cannot be changed here."]
         open_flags = [Item(format_flag(flag)) for flag in self.flags if flag.status == FlagStatus.OPEN]
         return Section("Current stage: revision", [
             "The whole profile with its statistics. The roles of a group: show_roles with the group.",
             ], [
-            *entity_space_sections,
+            *self.entity_space_editor.input_for_llm(),
             *self.partition_editor.input_for_llm(),
             *self.group_editor.input_for_llm(),
             *self.partition_role_editor.input_for_llm(),
@@ -706,10 +684,8 @@ class ProfileRevisionTask(ProfileStageTask):
     # --- stage interface ---
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
-        functions = []
-        if not self.input_profile.large:
-            functions += self.rebuilding(self.entity_space_editor.functions(), SPACE_CHANGES,
-                                         self.rebuild_after_space_change)
+        functions = self.rebuilding(self.entity_space_editor.functions(), SPACE_CHANGES,
+                                    self.rebuild_after_space_change)
         functions += self.rebuilding(self.partition_editor.functions(), PARTITION_CHANGES,
                                      self.rebuild_partition_role_editor)
         functions += self.rebuilding(self.group_editor.functions(), GROUP_CHANGES, self.rebuild_group_role_editors)

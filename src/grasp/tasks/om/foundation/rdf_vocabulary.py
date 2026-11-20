@@ -133,8 +133,7 @@ KIND_ALTERNATIVES: dict[str, tuple[str, ...]] = {
         "?s rdf:type ?type VALUES ?type { owl:NamedIndividual owl:Thing }",
         f"?s rdf:type ?type {_NOT_VOCABULARY_TYPE}",
         # untyped individuals (e.g. wiki articles): data beyond names; helper nodes
-        # that only carry a label match no kind (in a large KG left out: the
-        # negations would be evaluated on the whole KG)
+        # that only carry a label match no kind
         "?s ?p ?o FILTER(?p NOT IN (rdf:type, rdfs:label, rdfs:comment, skos:prefLabel, skos:altLabel)) "
         "FILTER NOT EXISTS { ?s rdf:type ?anyType } FILTER NOT EXISTS { ?anyInstance rdf:type ?s } "
         "FILTER NOT EXISTS { ?s rdfs:subClassOf ?anySuper } FILTER NOT EXISTS { ?anySub rdfs:subClassOf ?s } "

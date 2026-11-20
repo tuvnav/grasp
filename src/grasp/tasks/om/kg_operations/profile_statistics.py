@@ -53,7 +53,6 @@ from grasp.tasks.om.kg_operations.grouping import (
     grouping_to_sparql_subquery,
     single_group_grouping,
 )
-from grasp.tasks.om.kg_operations.large_kg_sampling import current_sample, values_block
 from grasp.tasks.om.sparql_access import (
     select_rows,
     stream_rows,
@@ -63,6 +62,25 @@ from grasp.tasks.om.sparql_access import (
     down_pushed_union,
     as_batched_values_blocks,
 )
+
+# a KG with more triples, or whose triples cannot be counted, is not supported yet
+LARGE_TRIPLES = 100_000_000
+
+
+def count_triples(manager: KgManager) -> int | None:
+    """
+    Triples of the KG, None if the server cannot count them (e.g. a timeout).
+    """
+    try:
+        rows = select_rows(manager, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+        return int(rows[0]["n"].value) if rows and "n" in rows[0] else None
+    except Exception:
+        return None
+
+
+def is_large(triples: int | None) -> bool:
+    return triples is None or triples > LARGE_TRIPLES
+
 
 # canon predicates per role field of Roles
 CANON = {
@@ -109,7 +127,7 @@ PREFIX_EXPRESSION = (
 INVALID_IRI_CHARACTERS = re.compile(r'[\s<>"{}|^`\\]')
 
 
-def prefix_counts(
+def prefix_per_group_counts(
         manager: KgManager, named_only: bool
         ) -> dict[tuple[str, str], int]:
     """
@@ -149,7 +167,7 @@ def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[
         return list(configured), "configured"
     for named_only, source in ((True, "prefix with the most named entities"),
                                (False, "prefix with the most entities")):
-        totals = prefix_totals(prefix_counts(manager, named_only))
+        totals = prefix_totals(prefix_per_group_counts(manager, named_only))
         if totals:
             return [totals.most_common(1)[0][0]], source
     return [], "no entities found"
@@ -289,13 +307,7 @@ def rest(total: dict[str, int], total_size: int, inside: dict[str, int], size: i
         }, max(0, total_size - size)
 
 
-def members_query(
-        membership: str, space: Iterable[str], manager: KgManager | None = None
-        ) -> str:
-    sample = current_sample(manager) if manager is not None else None
-    if sample is not None:
-        # large KG: the sampled members
-        return values_block(sample.sample(membership).in_space)
+def members_query(membership: str, space: Iterable[str]) -> str:
     return f"{{ SELECT DISTINCT ?s WHERE {{ {membership} }} }}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}"
 
 
@@ -307,27 +319,17 @@ def membership_overlap(
         ) -> tuple[int, dict[str, int]]:
     """
     (entities matching a membership pattern, those per current group or
-    partition, UNCATEGORIZED for matches in none); in a large KG for the
-    sampled matches.
+    partition, UNCATEGORIZED for matches in none).
     """
-    sample = current_sample(manager)
-    if sample is not None:
-        matches = sample.sample(membership).in_space
-        counts: Counter[str] = Counter(
-            g for _, g in sample.assignments(grouping, matches)
-            )
-        assigned = {e for e, _ in sample.assignments(grouping, matches)}
-        counts[UNCATEGORIZED] += sum(e not in assigned for e in matches)
-        return len(matches), {g: n for g, n in counts.items() if n}
     prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
     sparql = (
         f"{make_sparql_prologue(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-        f"{members_query(membership, space, manager)}\nOPTIONAL {subquery}\n"
+        f"{members_query(membership, space)}\nOPTIONAL {subquery}\n"
         f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part'
         )
     overlap = {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
     size = select_rows(manager, f"{make_sparql_prologue(prefixes)}\nSELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-                       f"{members_query(membership, space, manager)}\n}}")
+                       f"{members_query(membership, space)}\n}}")
     return (int(size[0]["n"].value) if size and "n" in size[0] else 0), overlap
 
 
@@ -337,7 +339,7 @@ def member_coverage(
     """
     (predicate -> entities, rdf:type value -> entities) among the matches of a membership pattern.
     """
-    members = members_query(membership, space, manager)
+    members = members_query(membership, space)
     predicates = select_rows(manager, f"SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n?s ?p ?o }} GROUP BY ?p")
     types = select_rows(manager, (f"SELECT ?t (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n"
                                   f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t)) }} GROUP BY ?t"))

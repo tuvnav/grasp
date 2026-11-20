@@ -9,7 +9,7 @@ Flags and findings are unverified, just like the results they question. A flag i
 The first message shows the profile (entity space, partitions with the pairs that do not compete, groups with exclusions, the KG-wide roles with their coverage), the findings and the open flags with their ids. The roles of a group are not shown; call show_roles with the group.
 
 You can change every part of the profile, with the functions of the stages:
-- entity space: inspect_namespace, set_entity_space (not in a very large knowledge graph)
+- entity space: inspect_namespace, set_entity_space
 - partitions: test_partition, set_partition, remove_partition, set_competition
 - groups: test_group, set_group, exclude_group, remove_group, set_local_name_type
 - roles: show_roles, try_pattern, edit_role, set_structure_relation, remove_structure_relation. Without group they work on the KG-wide roles; with group on that group only, which then deviates from the KG-wide roles. If an element is wrong for the whole knowledge graph, change it KG-wide; if it is wrong in one group only, change it for that group.

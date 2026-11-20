@@ -418,8 +418,7 @@ def evaluable_entities(
     compared. An entity a run did not draw into its sample would miss that
     run's candidates. Of full runs: all entities of the populations.
     None: the side is not measurable, because a run compared only a sample of
-    the other side (the lists of this side then lack counterparts) or the side
-    is a large KG (no population retrieved).
+    the other side (the lists of this side then lack counterparts).
     """
     results = [strategy_results_by_run[run_id] for run_id in ensemble.run_ids()]
     other_side = Side.other_side(side)
@@ -427,10 +426,7 @@ def evaluable_entities(
         return None
     populations_and_compared: list[tuple[frozenset[IRI], frozenset[IRI]]] = []
     for result in results:
-        population = result.population[side]
-        if population is None:
-            return None
-        populations_and_compared.append((population, result.compared_entities[side]))
+        populations_and_compared.append((result.population[side], result.compared_entities[side]))
     union_of_populations = frozenset().union(*(population for population, _ in populations_and_compared))
     return frozenset(
         entity for entity in union_of_populations

@@ -1,8 +1,7 @@
 """
 Groupings: named membership patterns over ?s, as exclusive partitions or
 overlapping groups, and the queries over their entities (?s ?group) that
-every statistic and value retrieval builds on. In a large KG the members are
-the sampled entities (large_kg_sampling).
+every statistic and value retrieval builds on.
 """
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -16,7 +15,6 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     Partition,
     WithinKgNonCompetingPartitionPair,
-    short_iri,
 )
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     KIND_ALTERNATIVES,
@@ -24,7 +22,6 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNIVERSE,
     VOCABULARY_PROLOGUE,
 )
-from grasp.tasks.om.kg_operations.large_kg_sampling import class_counts, current_sample, default_class_groups, type_membership
 from grasp.tasks.om.sparql_access import (
     select_rows,
     sparql_literal,
@@ -34,16 +31,11 @@ from grasp.tasks.om.sparql_access import (
     union_of,
     down_pushed_union,
     as_batched_values_blocks,
-    values_table,
 )
 from grasp.tasks.om.foundation.types import IRI
 
 # kinds of the default partitions (stage b1), in order: the first match wins
 KINDS = tuple(KIND_ALTERNATIVES)
-
-
-# kind alternatives left out in a large KG (their negations are evaluated on the whole KG)
-LARGE_KG_SKIPPED_ALTERNATIVES = {"instance": 2}
 
 
 @dataclass(frozen=True)
@@ -76,20 +68,13 @@ class Grouping:
         return Grouping(new_members, self.exclusive, new_minus)
 
 
-def default_partition_sparql(kind: str, large: bool = False) -> str:
-    alternatives = list(KIND_ALTERNATIVES[kind])
-    if large and kind in LARGE_KG_SKIPPED_ALTERNATIVES:
-        alternatives.pop(LARGE_KG_SKIPPED_ALTERNATIVES[kind])
-    return union_of(alternatives)
-
-
 def get_default_partitions(
-        kinds: Iterable[str] = KINDS, large: bool = False
+        kinds: Iterable[str] = KINDS
         ) -> list[Partition]:
     return [
         Partition(
             name=kind,
-            membership_sparql=default_partition_sparql(kind, large)
+            membership_sparql=union_of(KIND_ALTERNATIVES[kind])
             )
         for kind in kinds
         ]
@@ -97,16 +82,13 @@ def get_default_partitions(
 
 def get_assigned_default_partitions(
         kg_manager: KgManager,
-        kg_profile: KgProfile,
         entity_space: list[str]
         ) -> dict[str, Partition]:
     """
-    The kind partitions with entities (in a large KG without the alternatives
-    that cannot be evaluated there).
+    The kind partitions with entities
     """
-    large = kg_profile.large
-    partitions = get_default_partitions(large=large)
-    sizes = estimated_group_sizes(
+    partitions = get_default_partitions()
+    sizes = retrieve_group_sizes(
         kg_manager,
         partitions_to_grouping(partitions, mark_uncategorized_as_rest=False),
         entity_space
@@ -119,7 +101,7 @@ def partitions_to_grouping(
         ) -> Grouping:
     """
     The partitions, exclusive; with rest, the subjects outside all of them as
-    UNCATEGORIZED (not in a large KG, see grouping_subquery).
+    UNCATEGORIZED.
     """
     members = tuple((p.name, p.membership_sparql) for p in partitions)
     return Grouping(
@@ -130,8 +112,8 @@ def partitions_to_grouping(
         )
 
 
-def default_partitions_to_grouping(large: bool = False) -> Grouping:
-    return partitions_to_grouping(get_default_partitions(large=large))
+def default_partitions_to_grouping() -> Grouping:
+    return partitions_to_grouping(get_default_partitions())
 
 
 def groups_to_grouping(
@@ -172,17 +154,12 @@ def grouping_to_sparql_subquery(
     Generates a SPARQL query with prefixes as dict. Returns:
     ({shortened_prefix: <http://full_prefix_iri>}, sparql_subquery_for_grouping).
     binding ?s ?group within the entity space.
-    Without a grouping: the kind partitions. In a large KG, the sampled members
-    (large_kg_sampling), assigned in Python, as a VALUES table.
+    Without a grouping: the kind partitions.
     """
     grouping = grouping or default_partitions_to_grouping()
     prefixes, _ = split_prologue(
         manager, VOCABULARY_PROLOGUE + "\nSELECT * WHERE { ?s ?p ?o }"
         )
-    sample = current_sample(manager)
-    if sample is not None:
-        rows = [(f"<{e}>", sparql_literal(g)) for e, g in sample.assignments(grouping)]
-        return prefixes, f"{{ {values_table(['s', 'group'], rows)} }}"
     branches = " UNION ".join(
         f"{{ {{ SELECT DISTINCT ?s WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
         for rank, (_, membership) in enumerate(grouping.members)
@@ -214,8 +191,8 @@ def grouping_to_sparql_query(
     given patterns; with branches, joined with the alternatives of a pattern
     over ?s (the entity).
     """
-    # TODO: down push only cheap parts, not whole subquery for non large KGs.
-    # E. g. proceed as in large KGs (reach down only value-tables).
+    # TODO: down push only cheap parts, not whole subquery.
+    # E. g. reach down only value-tables.
     prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
     body = (
         down_pushed_union(subquery, branches)
@@ -259,13 +236,11 @@ def groups_by_entity(
     return {entity: frozenset(names) for entity, names in group_names.items()}
 
 
-
 def ensure_groups(
         kg_manager: KgManager, kg_profile: KgProfile, entity_space: list[str]
         ) -> dict[str, GroupDefinition]:
     """
-    The groups of the input profile; otherwise one per partition and, in a
-    large KG, one per large class.
+    The groups of the input profile; otherwise one per partition
     """
     profile = kg_profile
     if profile.groups:
@@ -275,17 +250,6 @@ def ensure_groups(
               for name, p in ensure_partitions(
                   kg_manager, kg_profile, entity_space
                   ).items()}
-    if profile.large:
-        for name, type_iri, _ in default_class_groups(
-                kg_manager, tuple(entity_space), class_counts(kg_manager)
-                ):
-            if name not in groups:
-                groups[name] = GroupDefinition(
-                    name=name,
-                    membership_sparql=type_membership(type_iri),
-                    origin=GroupOrigin.CLASS,
-                    features=f"typed {short_iri(type_iri)}"
-                    )
     return groups
 
 
@@ -294,7 +258,7 @@ def ensure_partitions(
         ) -> dict[str, Partition]:
     if kg_profile.partitions:
         return {p.name: p for p in kg_profile.partitions}
-    return get_assigned_default_partitions(kg_manager, kg_profile, entity_space)
+    return get_assigned_default_partitions(kg_manager, entity_space)
 
 
 def default_non_competing_pairs(
@@ -349,19 +313,6 @@ def retrieve_group_sizes(
         manager: KgManager, grouping: Grouping | None, space: Iterable[str]
         ) -> dict[str, int]:
     return retrieve_counts_by_group(manager, grouping, space, "")
-
-
-def estimated_group_sizes(
-        manager: KgManager, grouping: Grouping, space: Iterable[str]
-        ) -> dict[str, int]:
-    """
-    Entities per member of a grouping: counted in a small KG, estimated from
-    the samples of the memberships in a large one (large_kg_sampling).
-    """
-    sample = current_sample(manager)
-    if sample is None:
-        return retrieve_group_sizes(manager, grouping, space)
-    return sample.estimated_sizes(grouping)
 
 
 def profile_groups_to_grouping(

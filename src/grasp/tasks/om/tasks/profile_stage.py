@@ -11,7 +11,7 @@ for the role stages).
 """
 import re
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Callable, ClassVar, Literal, Self
@@ -61,7 +61,7 @@ from grasp.tasks.om.foundation.configuration import (
     load_task_instructions,
 )
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
-from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.types import LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     DEFAULT_LABEL_PREDICATES,
     RDF_TYPE,
@@ -75,19 +75,12 @@ from grasp.tasks.om.kg_operations.grouping import (
     get_assigned_default_partitions,
     ensure_groups,
     ensure_partitions,
-    estimated_group_sizes,
     retrieve_group_sizes,
     grouping_to_sparql_query,
     groups_to_grouping,
     get_default_partitions,
     partitions_to_grouping,
     single_group_grouping,
-)
-from grasp.tasks.om.kg_operations.large_kg_sampling import (
-    KgSample,
-    current_sample,
-    use_sample,
-    values_block,
 )
 from grasp.tasks.om.kg_operations.profile_statistics import (
     PredicateCoverage,
@@ -107,7 +100,6 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     unassigned_predicates,
 )
 from grasp.tasks.om.sparql_access import (
-    down_pushed_union,
     select_rows,
     union_of,
 )
@@ -115,13 +107,6 @@ from grasp.tasks.om.tasks.prompting import load_prompt
 from grasp.utils import FunctionCallException, format_section
 
 FINISH = "finish"
-LARGE_KG_NOTE = (
-    "This knowledge graph is very large. Sizes of partitions and groups are estimates (~); all other "
-    "statistics (coverage, value kinds, examples, local names, try_pattern) are computed on samples "
-    "(up to 200 entities per membership pattern), so shares are estimates too. In your own "
-    "SPARQL queries, always restrict the entities, e.g. to a class or to a few IRIs, and use LIMIT: "
-    "queries that scan the whole graph time out."
-)
 # findings per finish: only the most useful ones end up in prompts of later stages
 MAX_FINDINGS = 5
 NUM_EXAMPLES = 8
@@ -228,33 +213,22 @@ def entity_examples(
 # sizes, features and definitions of partitions and groups
 
 def size_text(
-        manager: KgManager,
         sizes: dict[str, int],
-        estimates: dict[str, int],
         name: str
         ) -> str:
     """
-    Size of a partition or group: counted, or in a
-    large KG estimated with the size of its sample.
+    Size of a partition or group.
     """
-    if current_sample(manager) is None:
-        return f"{sizes.get(name, 0)} entities"
-    estimate = estimates.get(name)
-    return f"""{
-        '~' + str(estimate) if estimate is not None
-        else 'unknown number of'
-        } entities, sample {sizes.get(name, 0)}"""
+    return f"{sizes.get(name, 0)} entities"
 
 
 def size_stats(
-        manager: KgManager, sizes: dict[str, int], estimates: dict[str, int]
+        sizes: dict[str, int]
         ) -> dict[str, dict[str, int]]:
     """
-    Sizes for the output: estimates in a large KG, with the sample sizes.
+    Sizes for the output.
     """
-    if current_sample(manager) is None:
-        return {"sizes": sizes}
-    return {"sizes": estimates, "sample_sizes": sizes}
+    return {"sizes": sizes}
 
 
 def run_sizes(
@@ -471,16 +445,8 @@ class Editor(ABC):
 @dataclass(eq=False)
 class EntitySpaceEditor(Editor):
     """
-    The entity space: IRI prefixes of the entities to align. In a large KG,
-    the prefixes are inspected on the class samples that the space stage
-    draws (prefix_examples, class_prefix_counts); without them, a large KG's
-    space cannot be inspected.
+    The entity space: IRI prefixes of the entities to align.
     """
-    large_kg: bool
-    # large KG: prefix -> sampled (entity, class) pairs
-    prefix_examples: dict[str, list[tuple[IRI, str]]] = field(default_factory=dict)
-    # large KG: (prefix, class) -> estimated entities
-    class_prefix_counts: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.entity_space = list(self.entity_space)
@@ -493,24 +459,17 @@ class EntitySpaceEditor(Editor):
             *,
             create_missing: bool,
             config: GraspConfig | None = None,
-            prefix_examples: dict[str, list[tuple[IRI, str]]] | None = None,
-            class_prefix_counts: dict[tuple[str, str], int] | None = None,
             ) -> Self:
         """
         The entity space of the profile. create_missing: without one, the
         default space (configured namespaces or the prefix with the most named
-        entities; needs config); otherwise the editor starts empty. The class
-        samples of a large KG are not in the profile: the space stage hands
-        them in.
+        entities; needs config); otherwise the editor starts empty.
         """
         entity_space = (ensure_space(kg_manager, kg_profile, config) if create_missing
                         else list(kg_profile.entity_space))
         return cls(
             kg_manager=kg_manager,
             entity_space=entity_space,
-            large_kg=kg_profile.large,
-            prefix_examples=prefix_examples or {},
-            class_prefix_counts=class_prefix_counts or {},
         )
 
     def input_for_llm(self) -> list[Section]:
@@ -545,8 +504,6 @@ class EntitySpaceEditor(Editor):
         prefix = fn_args.get("prefix") or ""
         if not prefix:
             raise FunctionCallException("prefix required")
-        if self.large_kg:
-            return self.inspect_sampled(prefix)
         sizes = run_sizes(self.kg_manager, SPACE_GROUPING, [prefix])
         if not sizes:
             return format_display_content(Section(f"Namespace {prefix}", ["No entities with IRIs starting with it."]))
@@ -575,63 +532,8 @@ class EntitySpaceEditor(Editor):
             Item("examples:", entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 8)),
         ]))
 
-    def inspect_sampled(self, prefix: str) -> str:
-        """inspect_namespace of a large KG, from the class samples."""
-        classes: Counter[str] = Counter()
-        for (other, class_iri), count in self.class_prefix_counts.items():
-            if other.startswith(prefix) or prefix.startswith(other):
-                classes[class_iri] += count
-        examples = self.sampled_examples(prefix, 8)
-        if not examples:
-            return format_display_content(Section(f"Namespace {prefix}", [
-                "No sampled entity has an IRI starting with it. (In this large knowledge graph, "
-                "entities are only sampled per class; untyped entities are not seen.)"]))
-        return format_display_content(Section(f"Namespace {prefix}", [
-            Item("classes of the sampled entities under this prefix or its namespace (estimated members): "
-                 + ", ".join(f"{c} ~{n}" for c, n in classes.most_common(NUM_NAMESPACES))),
-            Item("examples:", examples),
-        ]))
-
-    def sampled_examples(self, prefix: str, k: int) -> list[Item]:
-        """
-        Sampled entities under a prefix (large KG) with a name and their class.
-        """
-        pairs = [
-            (entity, class_iri) for other, sampled in self.prefix_examples.items()
-            if other.startswith(prefix) or prefix.startswith(other)
-            for entity, class_iri in sampled if entity.startswith(prefix)
-            ][:k]
-        if not pairs:
-            return []
-        names: dict[str, str] = {}
-        rows = run_retrieve_rows(
-            self.kg_manager,
-            "SELECT ?s ?name WHERE {" + down_pushed_union(
-                values_block([e for e, _ in pairs]),
-                [f"?s <{p}> ?name" for p in DEFAULT_LABEL_PREDICATES]
-                ) + "}"
-            )
-        for row in rows:
-            names.setdefault(row["s"].value, row["name"].value)
-        return [
-            Item(
-                f"{e}"
-                + (f' "{clip(names[e], 50)}"' if e in names else "")
-                + f" ({c})"
-                )
-            for e, c in pairs
-            ]
-
     def has_entities(self, prefix: str) -> bool:
-        if not self.large_kg:
-            return bool(run_sizes(self.kg_manager, SPACE_GROUPING, [prefix]))
-        if any(e.startswith(prefix) for sampled in self.prefix_examples.values() for e, _ in sampled):
-            return True
-        try:
-            return bool(select_rows(
-                self.kg_manager, f'SELECT ?s WHERE {{ ?s ?p ?o FILTER(STRSTARTS(STR(?s), "{prefix}")) }} LIMIT 1'))
-        except Exception:
-            return True  # cannot tell in time; trust the model
+        return bool(run_sizes(self.kg_manager, SPACE_GROUPING, [prefix]))
 
     def set_entity_space(self, fn_args: dict) -> str:
         prefixes = [prefix for prefix in fn_args.get("prefixes") or [] if prefix]
@@ -661,8 +563,7 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
     unit: ClassVar[Literal["partition", "group"]]  # in texts for the model
     definitions: dict[str, T]  # name -> definition, in order
     tested: set[str] = field(init=False)  # membership patterns tested with test_<unit>
-    sizes: dict[str, int] = field(init=False)  # counted; in a large KG on the sample
-    estimates: dict[str, int] = field(init=False)  # estimated in a large KG, else counted
+    group_sizes: dict[str, int] = field(init=False)
     predicates: dict[str, dict[str, int]] = field(init=False)  # member -> predicate -> entities
     types: dict[str, dict[str, int]] = field(init=False)  # member -> type -> entities
 
@@ -683,16 +584,15 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
         return list(self.definitions)
 
     def size_stats(self) -> dict:
-        return size_stats(self.kg_manager, self.sizes, self.estimates)
+        return size_stats(self.group_sizes)
 
     def size_text(self, name: str) -> str:
-        return size_text(self.kg_manager, self.sizes, self.estimates, name)
+        return size_text(self.group_sizes, name)
 
     def update_statistics(self) -> None:
         grouping = self.grouping()
         try:
-            self.sizes = retrieve_group_sizes(self.kg_manager, grouping, self.entity_space)
-            self.estimates = estimated_group_sizes(self.kg_manager, grouping, self.entity_space)
+            self.group_sizes = retrieve_group_sizes(self.kg_manager, grouping, self.entity_space)
             self.predicates = {member: {predicate: c.entities for predicate, c in counts.items()}
                                for member, counts in predicate_coverage(self.kg_manager, grouping, self.entity_space).items()}
             self.types = type_coverage(self.kg_manager, grouping, self.entity_space)
@@ -701,7 +601,7 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
 
     def describe_member(self, name: str, title: str) -> Section:
         """A member with examples and the predicates and types that distinguish it."""
-        size = self.sizes.get(name, 0)
+        size = self.group_sizes.get(name, 0)
         outside, size_outside = self.outside("predicates", name)
         content: list[SectionContent] = [
             f"{self.size_text(name)}.",
@@ -748,28 +648,21 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
         title = f"Test of the membership pattern {{ {membership} }}"
         if not size:
             return format_display_content(Section(title, ["No entity of the entity space matches."]))
-        sample = current_sample(self.kg_manager)
-        if sample is not None:
-            matches = sample.sample(membership)
-            estimate = (f"~{round(matches.count * matches.space_share)}" if matches.count is not None
-                        else "an unknown number of")
-            size_line = f"{estimate} entities of the entity space match (statistics on a sample of {size}); "
-        else:
-            size_line = f"{size} entities match; "
+        size_line = f"{size} entities match; "
         compare = fn_args.get("compare_with")
         if compare is not None:
             self.known_name(compare)
         else:
-            compare = max((member for member in overlap if member in self.sizes),
+            compare = max((member for member in overlap if member in self.group_sizes),
                           key=lambda member: overlap[member], default=None)
         where = f"by current {self.unit} (share of the {self.unit} that matches)"
         content: list[SectionContent] = [
             size_line + where + ": "
-            + ", ".join(f"{p} {format_share(n, self.sizes.get(p, 0))}"
+            + ", ".join(f"{p} {format_share(n, self.group_sizes.get(p, 0))}"
                         for p, n in sorted(overlap.items(), key=lambda x: -x[1]))
             ]
         if compare is not None:
-            rest_size = self.sizes.get(compare, 0) - overlap.get(compare, 0)
+            rest_size = self.group_sizes.get(compare, 0) - overlap.get(compare, 0)
             for kind, counts, ins in (("predicates", self.predicates, inside), ("types", self.types, inside_types)):
                 outside = {k: max(0, n - ins.get(k, 0)) for k, n in counts.get(compare, {}).items()}
                 usage_items = [item for item in format_predicate_usage(
@@ -806,8 +699,6 @@ class PartitionEditor(GroupingEditor[Partition]):
     """
     unit = "partition"
     non_competing_pairs: list[WithinKgNonCompetingPartitionPair]
-    # the subjects outside all partitions as a member of their own (small KG only: a large one is not scanned)
-    mark_uncategorized: bool
 
     def __post_init__(self) -> None:
         self.non_competing_pairs = list(self.non_competing_pairs)
@@ -834,15 +725,15 @@ class PartitionEditor(GroupingEditor[Partition]):
             entity_space=entity_space,
             definitions=definitions,
             non_competing_pairs=non_competing_pairs,
-            mark_uncategorized=not kg_profile.large,
         )
 
     def grouping(self) -> Grouping:
-        return partitions_to_grouping(list(self.definitions.values()), mark_uncategorized_as_rest=self.mark_uncategorized)
+        # the subjects outside all partitions as a member of their own (UNCATEGORIZED)
+        return partitions_to_grouping(list(self.definitions.values()), mark_uncategorized_as_rest=True)
 
     def outside(self, kind: Literal["predicates", "types"], name: str) -> tuple[dict[str, int], int]:
         counts = self.predicates if kind == "predicates" else self.types
-        return complement(counts, self.sizes, name)
+        return complement(counts, self.group_sizes, name)
 
     def input_for_llm(self) -> list[Section]:
         return [
@@ -856,8 +747,8 @@ class PartitionEditor(GroupingEditor[Partition]):
                  [Item(f"membership: {{ {partition.membership_sparql} }}")])
             for name, partition in self.definitions.items()
             ]
-        if self.sizes.get(UNCATEGORIZED):
-            items.append(Item(f"{UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} subjects match no partition"))
+        if self.group_sizes.get(UNCATEGORIZED):
+            items.append(Item(f"{UNCATEGORIZED}: {self.group_sizes[UNCATEGORIZED]} subjects match no partition"))
         return items
 
     def format_non_competing_pairs(self) -> list[SectionContent]:
@@ -964,19 +855,19 @@ class PartitionEditor(GroupingEditor[Partition]):
 
     def with_partitions(self, profile: KgProfile) -> KgProfile:
         """The profile with the entity space, the partitions that have entities and their non-competing pairs."""
-        kept = [partition for name, partition in self.definitions.items() if self.sizes.get(name)]
+        kept = [partition for name, partition in self.definitions.items() if self.group_sizes.get(name)]
         kept_names = {partition.name for partition in kept}
         non_competing_pairs = [pair for pair in self.non_competing_pairs if pair.partitions() <= kept_names]
         return profile.model_copy(update={
             "entity_space": self.entity_space, "partitions": kept, "non_competing_pairs": non_competing_pairs}, deep=True)
 
     def check_partitions(self) -> None:
-        if not any(self.sizes.get(name) for name in self.definitions):
+        if not any(self.group_sizes.get(name) for name in self.definitions):
             raise FunctionCallException("No partition has entities")
 
     def empty_partition_names(self) -> list[str]:
         """Partitions without entities: with_partitions drops them."""
-        return [name for name in self.definitions if not self.sizes.get(name)]
+        return [name for name in self.definitions if not self.group_sizes.get(name)]
 
 
 @dataclass(eq=False)
@@ -1002,8 +893,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
     def from_kg_profile(cls, kg_manager: KgManager, kg_profile: KgProfile, *, create_missing: bool) -> Self:
         """
         The groups of the profile with their exclusions. create_missing:
-        without groups, one per partition (and in a large KG one per large
-        class); otherwise a ValueError.
+        without groups, one per partition; otherwise a ValueError.
         """
         if not kg_profile.groups and not create_missing:
             raise ValueError("The profile has no groups")
@@ -1031,8 +921,8 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
 
     def outside(self, kind: Literal["predicates", "types"], name: str) -> tuple[dict[str, int], int]:
         if kind == "predicates":
-            return rest(self.all_predicates, self.all_size, self.predicates.get(name, {}), self.sizes.get(name, 0))
-        return rest(self.all_types, self.all_size, self.types.get(name, {}), self.sizes.get(name, 0))
+            return rest(self.all_predicates, self.all_size, self.predicates.get(name, {}), self.group_sizes.get(name, 0))
+        return rest(self.all_types, self.all_size, self.types.get(name, {}), self.group_sizes.get(name, 0))
 
     def input_for_llm(self) -> list[Section]:
         return [Section("Groups", [
@@ -1189,7 +1079,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         old = {group.name: group for group in profile.groups}
         groups = []
         for name, definition in self.definitions.items():
-            if not self.sizes.get(name):
+            if not self.group_sizes.get(name):
                 continue
             update: dict[str, Any] = {"definition": definition, "excluded": name in self.exclusions,
                                       "exclusion_reason": self.exclusions.get(name, "")}
@@ -1199,7 +1089,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         return profile.model_copy(update={"entity_space": self.entity_space, "groups": groups}, deep=True)
 
     def check_groups(self) -> None:
-        kept = [name for name in self.definitions if self.sizes.get(name)]
+        kept = [name for name in self.definitions if self.group_sizes.get(name)]
         if not kept:
             raise FunctionCallException("No group has entities")
         if all(name in self.exclusions for name in kept):
@@ -1207,7 +1097,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
 
     def empty_group_names(self) -> list[str]:
         """Groups without entities: with_groups drops them."""
-        return [name for name in self.definitions if not self.sizes.get(name)]
+        return [name for name in self.definitions if not self.group_sizes.get(name)]
 
 
 @dataclass(eq=False)
@@ -1264,7 +1154,7 @@ class RoleEditor(Editor):
         if not partitions:
             if not create_missing:
                 raise ValueError("The profile has no partitions")
-            partitions = list(get_assigned_default_partitions(kg_manager, kg_profile, entity_space).values())
+            partitions = list(get_assigned_default_partitions(kg_manager, entity_space).values())
         grouping = partitions_to_grouping(partitions, mark_uncategorized_as_rest=False)
         partition_names = [partition.name for partition in partitions]
         group_sizes = retrieve_group_sizes(kg_manager, grouping, entity_space)
@@ -1762,21 +1652,11 @@ class ProfileStageTask(GraspTask):
                 f"Profile of {self.input_profile.kg_name} given for {self.kg_manager.kg}"
                 )
         self.finished, self.rationale, self.stats = False, None, {}
-        # a large KG is profiled on samples of the partitions
-        # and groups (large_kg_sampling); the space stage
-        # decides whether the KG is large
-        large = self.input_profile.large and self.stage != Stage.SPACE
-        use_sample(
-            self.kg_manager,
-            KgSample(
-                self.kg_manager, tuple(self.input_profile.entity_space)
-                ) if large else None
-            )
         stage_section = self.prepare(input)
         self.profile = self.default.model_copy(deep=True)
         knowledge_graph = Section(
             f"Knowledge graph: {self.kg_manager.kg}",
-            [self.kg_manager.description or "", LARGE_KG_NOTE if large else ""],
+            [self.kg_manager.description or ""],
             )
         sections = [knowledge_graph, *self.format_earlier_results(), stage_section]
         return "\n\n".join(format_display_content(section) for section in sections)

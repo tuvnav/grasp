@@ -23,10 +23,7 @@ whole other side (draw_trial_sample). The sample is consistent across runs
 below the sampling share, so an entity in the populations of two runs is in
 both samples if it is in the one with the smaller share, and the trial runs of
 an ensemble can be merged on the same entities. Only one side is sampled: sampling both
-would lose the true counterparts and distort every signal. A large KG is always
-the sampled side, drawn per group at spread offsets (large_kg_sampling) in
-proportion to the estimated group sizes, and queried for the sampled entities
-only; two large KGs are not supported yet.
+would lose the true counterparts and distort every signal.
 """
 from collections import Counter
 import dataclasses
@@ -103,13 +100,11 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, retrieve_counts_by_group, retrieve_group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
+    Grouping, retrieve_counts_by_group, retrieve_group_sizes, profile_groups_to_grouping,
 )
-from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.candidate_generation import (
     NeighbourIndex,
     ValueIndex,
-    ExistingEquivalences,
     build_side_indices,
     build_side_witness_index,
     compare_value_indices_by_vectors,
@@ -177,9 +172,6 @@ def generate_group_grouping(kg_profile: KgProfile, population: Population, side:
     the profile and the inline groups (all are needed to count rivals outside the
     population by group), without the entities of excluded groups.
     """
-    if kg_profile.large:
-        # large KG: only the groups of the population (not built yet)
-        raise NotImplementedError("key candidates for large KGs: retrieve only the population's groups")
     return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
 
 
@@ -191,7 +183,7 @@ def generate_population_groups_grouping(kg_profile: KgProfile, population: Popul
     """
     The groups of one side's population only 
     (no rivals), without the entities
-    of excluded groups; also for a large KG.
+    of excluded groups.
     """
     all_groups = profile_groups_to_grouping(kg_profile, inline_groups(population, side))
     group_names = population_group_names(kg_profile, population, side)
@@ -234,49 +226,27 @@ TRIAL_ENTITY_LIMITS: dict[str, int] = {
     "char_3grams": 5000,
     "embedding": 5_000,
 }
-# a large KG is always sampled in a trial run; the key and neighbour strategies
-# (without a limit in a small KG) with this limit
-LARGE_KG_TRIAL_ENTITY_LIMIT = 20_000
 
 
 @dataclass(frozen=True)
 class EntitySample:
     """
     The entities of one side's population that a trial run compares; the
-    other side is compared whole. kg_sample: in a large KG, the sample of the
-    membership patterns the entities come from; while it is in use
-    (large_kg_sampling.use_sample) the queries over the groups of that KG see
-    only these entities.
+    other side is compared whole.
     """
     side: Side
     entities: frozenset[IRI]
-    kg_sample: KgSample | None = field(default=None, compare=False)
 
 
-def trial_entity_limit(strategy: CandidateStrategy, large: bool = False) -> int | None:
-    """The trial limit of a strategy; None: no sampling. large: of a large KG,
-    which is always sampled."""
+def trial_entity_limit(strategy: CandidateStrategy) -> int | None:
+    """The trial limit of a strategy; None: no sampling."""
     if isinstance(strategy, VectorStrategy):
         return TRIAL_ENTITY_LIMITS.get(strategy.vectorizer)
-    return LARGE_KG_TRIAL_ENTITY_LIMIT if large else None
-
-
-def check_large_kgs(large_sides: set[Side], trial: bool) -> None:
-    """A run with a large KG is only possible as a trial run, and only if the
-    other KG is not large too (then the large side is sampled and the other one
-    compared whole)."""
-    if len(large_sides) == 2:
-        raise FunctionCallException(
-            "Both KGs are large: trial runs of candidate strategies are not supported yet "
-            "(neither side can be compared whole)")
-    if large_sides and not trial:
-        raise FunctionCallException(
-            "A large KG can only be compared in a trial run (on a sample) for now")
+    return None
 
 
 def choose_sampled_side(population_sizes: dict[Side, int], limit: int | None) -> Side | None:
-    """The side to sample in a trial run of two KGs that are not large: the one
-    with the larger population, if it is above the limit (the source on equal
+    """The side to sample in a trial run: the one with the larger population, if it is above the limit (the source on equal
     sizes); None: compare both whole."""
     larger_side = max(SIDES, key=lambda side: population_sizes[side])  # first maximum: the source
     if limit is None or population_sizes[larger_side] <= limit:
@@ -307,80 +277,16 @@ def draw_entity_sample(entities: Iterable[IRI], size: int, seed: int) -> frozens
     return frozenset(entity for entity in distinct_entities if sample_position(entity, seed) < sampling_share)
 
 
-def allocate_sample_sizes(estimated_sizes: dict[str, int | None], limit: int) -> dict[str, int]:
-    """The members to draw per group, `limit` in all, in proportion to the
-    estimated sizes of the groups (so that the shares over the population are not
-    skewed towards small groups); at least one per group with members, at most
-    its size. A group without an estimate (None) gets an equal share."""
-    group_count = len(estimated_sizes)
-    if group_count == 0:
-        return {}
-    known_total = sum(size for size in estimated_sizes.values() if size)
-    sizes: dict[str, int] = {}
-    for name, size in estimated_sizes.items():
-        if size is None:
-            sizes[name] = max(1, limit // group_count)
-        elif size == 0 or known_total == 0:
-            sizes[name] = 0
-        else:
-            sizes[name] = min(size, max(1, round(limit * size / known_total)))
-    return sizes
-
-
-def draw_large_kg_sample(manager: KgManager, kg_profile: KgProfile, generator: Generator, side: Side,
-                         limit: int) -> EntitySample:
-    """The sample of the population of a large KG: per group, members drawn at
-    spread offsets (large_kg_sampling; not random, but cheap), as many as its
-    share of the estimated population size; assigned to their groups in Python."""
-    grouping = generate_population_groups_grouping(kg_profile, generator.population, side)
-    space = tuple(kg_profile.entity_space)
-    estimated_sizes = KgSample(manager, space).estimated_sizes(grouping)
-    sample_sizes = allocate_sample_sizes({name: estimated_sizes.get(name) for name in grouping.names}, limit)
-    # a name with several patterns: each pattern draws the size of the name
-    kg_sample = KgSample(manager, space, size_by_membership={
-        membership.strip(): sample_sizes[name] for name, membership in grouping.members})
-    entities = frozenset(entity for entity, _ in kg_sample.assignments(grouping))
-    return EntitySample(side=side, entities=entities, kg_sample=kg_sample)
-
-
 def draw_trial_sample(
-        managers: dict[Side, KgManager],
-        alignment_state: AlignmentState,
         generator: Generator,
         populations_by_side: dict[Side, frozenset[IRI]],
         seed: int,
-        existing_equivalences: ExistingEquivalences | None = None,
         ) -> EntitySample | None:
     """
     The sample of a trial run (see the module docstring); None: no sampling
-    needed. populations_by_side: the populations of the sides that are not
-    large, already without the entities that have an equivalence. A large KG
-    is always the sampled side (its population is not retrieved); its entities
-    with an equivalence (existing_equivalences) are taken out of its sample.
-    seed: only for KGs that are not large.
+    needed. populations_by_side: the populations, already without the
+    entities that have an equivalence.
     """
-    matched_entities = {
-        side: set(existing_equivalences[side])
-        if existing_equivalences else set() for side in SIDES
-        }
-    large_side = next(
-        (side for side in SIDES if alignment_state.get_kg_profile(side).large),
-        None
-        )
-    if large_side is not None:
-        limit = trial_entity_limit(generator.strategy, large=True)
-        assert limit is not None
-        large_kg_sample = draw_large_kg_sample(
-            managers[large_side],
-            alignment_state.get_kg_profile(large_side),
-            generator,
-            large_side,
-            limit
-            )
-        return dataclasses.replace(
-            large_kg_sample,
-            entities=large_kg_sample.entities - matched_entities[large_side]
-            )
     limit = trial_entity_limit(generator.strategy)
     side = choose_sampled_side(
         {side: len(population) for side, population in populations_by_side.items()},
@@ -420,28 +326,12 @@ def retrieve_strategy_value_rows(
     The values a strategy compares on one side (its value_pattern_source: roles,
     or the structure relations of a neighbour strategy): of the entities of all
     groups (rivals outside the population included); on a sampled side only
-    those of the sampled entities (in a large KG: of the groups of the
-    population, queried for the sampled entities only). object_iris: only values
-    among these (a neighbour strategy: the entities of the witnesses).
+    those of the sampled entities. object_iris: only values among these (a
+    neighbour strategy: the entities of the witnesses).
     """
     value_pattern_source = generator.strategy.value_pattern_source(side, kg_profile.roles)
     check_value_pattern_source(value_pattern_source, kg_profile)
     side_sample = entity_sample if entity_sample is not None and entity_sample.side == side else None
-    if side_sample is not None and side_sample.kg_sample is not None:
-        use_sample(manager, side_sample.kg_sample)
-        try:
-            value_rows = list(retrieve_value_rows(
-                manager,
-                generate_population_groups_grouping(kg_profile, generator.population, side),
-                kg_profile.entity_space,
-                value_pattern_source,
-                kg_profile.roles,
-                object_iris,
-            ))
-        finally:
-            use_sample(manager, None)
-        return iter(value_rows)
-
     value_rows = retrieve_value_rows(
         manager,
         generate_group_grouping(kg_profile, generator.population, side),
@@ -455,30 +345,15 @@ def retrieve_strategy_value_rows(
     return (row for row in value_rows if row.entity in side_sample.entities)
 
 
-def sampled_partition_names(kg_profile: KgProfile, entity_sample: EntitySample) -> dict[IRI, str]:
-    """
-    The partition of every sampled entity of a large KG, asked for these
-    entities only (the first matching partition, as in a small KG).
-    """
-    assert entity_sample.kg_sample is not None
-    assignments = entity_sample.kg_sample.assignments(
-        profile_partitions_to_grouping(kg_profile), sorted(entity_sample.entities))
-    return {entity: partition for entity, partition in assignments}
-
-
 def retrieve_partition_names(
         managers: dict[Side, KgManager],
         alignment_state: AlignmentState,
         ) -> dict[Side, dict[IRI, str]]:
     """The partition of every entity, per side. Depends only on the profiles, so it
-    is retrieved once per run and reused by every strategy. A large KG is left
-    empty here: a trial run asks for the partitions of its sampled entities only."""
+    is retrieved once per run and reused by every strategy."""
     partition_names_by_entity = {}
     for side in SIDES:
         kg_profile = alignment_state.get_kg_profile(side)
-        if kg_profile.large:
-            partition_names_by_entity[side] = {}
-            continue
         partition_names_by_entity[side] = retrieve_partitions_by_entity(
             managers[side], kg_profile, kg_profile.entity_space)
     return partition_names_by_entity
@@ -683,21 +558,19 @@ def get_neighbour_candidates(
 
 
 def compared_entities_by_side(
-        population_by_side: dict[Side, frozenset[IRI] | None],
+        population_by_side: dict[Side, frozenset[IRI]],
         entity_sample: EntitySample | None,
         ) -> dict[Side, frozenset[IRI]]:
     """
     The entities a run compares per side: on the sampled side the sample,
-    otherwise the population (a large KG is always the sampled side).
+    otherwise the population.
     """
     compared_entities: dict[Side, frozenset[IRI]] = {}
     for side in SIDES:
         if entity_sample is not None and entity_sample.side == side:
             compared_entities[side] = entity_sample.entities
         else:
-            population = population_by_side[side]
-            assert population is not None, "a large KG is always the sampled side"
-            compared_entities[side] = population
+            compared_entities[side] = population_by_side[side]
     return compared_entities
 
 
@@ -716,16 +589,12 @@ def run_strategy(
     candidates, but stay candidates of the others (marked candidate_already_matched). trial: a trial run, which may compare only a sample of the larger
     population (see the module docstring); sample_seed: the seed of the sample,
     consistent across runs (draw_entity_sample), so that trials of different
-    strategies see the same entities as far as their populations and shares allow. A large KG
-    only in a trial run, and only against a KG that is not large.
+    strategies see the same entities as far as their populations and shares allow.
     """
     # 0. the populations without the entities that already have an equivalence,
-    # and in a trial run the sample of the larger one. A large KG is not counted
-    # and it is always the sampled side
-    large_sides = {side for side in SIDES if alignment_state.get_kg_profile(side).large}
-    check_large_kgs(large_sides, trial)
+    # and in a trial run the sample of the larger one
     existing_equivalences_by_entity = alignment_state.existing_equivalences()
-    population_by_side: dict[Side, frozenset[IRI] | None] = {
+    population_by_side: dict[Side, frozenset[IRI]] = {
         side: retrieve_population(
             managers[side],
             alignment_state.get_kg_profile(side),
@@ -733,28 +602,11 @@ def run_strategy(
             side,
             existing_equivalences_by_entity[side].keys()
             )
-        if side not in large_sides else None
         for side in SIDES
         }
-    retrieved_populations = {
-        side: entities for side, entities in population_by_side.items() if entities is not None
-        }
-    population_sizes = {side: len(entities) for side, entities in retrieved_populations.items()}
-    entity_sample = (
-        draw_trial_sample(
-            managers, alignment_state, generator,
-            retrieved_populations, sample_seed,
-            existing_equivalences_by_entity
-            )
-        if trial else None
-        )
+    population_sizes = {side: len(entities) for side, entities in population_by_side.items()}
+    entity_sample = draw_trial_sample(generator, population_by_side, sample_seed) if trial else None
     compared_entities = compared_entities_by_side(population_by_side, entity_sample)
-    if entity_sample is not None and entity_sample.kg_sample is not None:
-        partition_names_by_entity = {
-            **partition_names_by_entity,
-            entity_sample.side: sampled_partition_names(
-                alignment_state.get_kg_profile(entity_sample.side), entity_sample),
-        }
 
     # 1. collect
     value_wordsets = None
@@ -1524,7 +1376,7 @@ def format_ensemble_evaluation_of_side(
     if evaluation is None:
         return Section(title, [
             f"Not measurable: a run compared only a sample of the other side, so the lists "
-            f"of the {side} side lack candidates; or the {side} side is a large KG."
+            f"of the {side} side lack candidates."
             ])
     if evaluation.num_evaluated == 0:
         return Section(title, [
@@ -1598,7 +1450,7 @@ def count_group_entities(
         ) -> dict[str, tuple[int, int]]:
     """
     Per group of the profile: its entities and those already matched (an
-    entity in several groups counts in each). Not for a large KG.
+    entity in several groups counts in each).
     """
     grouping = profile_groups_to_grouping(kg_profile)
     sizes = retrieve_group_sizes(manager, grouping, kg_profile.entity_space)
@@ -1619,8 +1471,6 @@ def count_group_entities(
 
 def format_group_counts(state: CandidateTaskState, side: Side) -> list[SectionContent]:
     kg_profile = state.alignment_state.get_kg_profile(side)
-    if kg_profile.large:
-        return ["Groups are not counted (large KG)."]
     matched_entities = state.alignment_state.aligned_entities[side]
     counts = count_group_entities(
         state.kg_managers[side], kg_profile, matched_entities

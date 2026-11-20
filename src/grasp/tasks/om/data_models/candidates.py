@@ -759,9 +759,8 @@ class StrategyResult[H: Hub]:
     strategy (KeyHub, VectorHub).
     """
     # per side the entities of the run's population (generator.population),
-    # without those that already have an equivalence; None: a large KG, whose
-    # population is not retrieved
-    population: dict[Side, frozenset[IRI] | None]
+    # without those that already have an equivalence
+    population: dict[Side, frozenset[IRI]]
     # per side the entities the run compared: the population, or on the side
     # sampled in a trial run the sample
     compared_entities: dict[Side, frozenset[IRI]]

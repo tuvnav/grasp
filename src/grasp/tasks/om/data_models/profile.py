@@ -554,7 +554,6 @@ class WithinKgNonCompetingPartitionPair(BaseModel):
 
 class GroupOrigin(StrEnum):
     PARTITION = "partition"  # copy of a partition (the start of stage d)
-    CLASS = "class"          # a large class (rdf:type) of a large KG
     FORMED = "formed"        # formed in stage d
 
 
@@ -624,9 +623,7 @@ def unknown_name_message(kind: str, name: str, existing_names: list[str]) -> str
 class KgProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kg_name: str
-    # triples of the KG (None: not countable); a large KG is profiled on samples (large_kg_sampling)
     triples: int | None = None
-    large: bool = False
     entity_space: list[str] = []
     partitions: list[Partition] = []  # in order: the first match wins
     non_competing_pairs: list[WithinKgNonCompetingPartitionPair] = []

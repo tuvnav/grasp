@@ -516,10 +516,7 @@ def retrieve_recall_strata(
     The unmatched entities of the KG (all partitions, excluded groups
     included) in the recall strata, disjoint, in the order of RECALL_STRATA:
     neighbours of matched entities, members of excluded groups, the rest.
-    Not for a large KG (its entities cannot be listed).
     """
-    if kg_profile.large:
-        raise ValueError(f"{kg_profile.kg_name} is large: its unmatched entities cannot be listed")
     all_partitions = profile_partitions_to_grouping(kg_profile)
     unmatched = set(retrieve_entities(manager, all_partitions, kg_profile.entity_space)) - matched_entities
     neighbours = retrieve_linked_entities(
