@@ -11,7 +11,7 @@ from grasp.tasks.om.foundation.types import IRI
 RDF_TYPE = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 
 
-LABEL_PREDICATES = [
+DEFAULT_LABEL_PREDICATES = [
     IRI("http://www.w3.org/2000/01/rdf-schema#label"),
     IRI("http://www.w3.org/2004/02/skos/core#prefLabel"),
 ]

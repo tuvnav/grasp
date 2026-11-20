@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from grasp.manager import KgManager
+from grasp.sparql.types import Binding
 from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
     GroupOrigin,
@@ -314,7 +315,7 @@ def default_non_competing_pairs(
 
 
 def count_rows(
-        rows: list[dict], *keys: str
+        rows: list[dict[str, Binding]], *keys: str
         ) -> dict[tuple[str, ...], int]:
     return {
         tuple(row[k].value for k in keys): int(row["n"].value)
@@ -327,7 +328,7 @@ def retrieve_counts_by_group(
         grouping: Grouping | None,
         space: Iterable[str],
         where: str,
-        parts: list[str] | None = None
+        branches: list[str] | None = None
         ) -> dict[str, int]:
     sparql = grouping_to_sparql_query(
         manager,
@@ -336,7 +337,7 @@ def retrieve_counts_by_group(
         "?group (COUNT(DISTINCT ?s) AS ?n)",
         where,
         "GROUP BY ?group",
-        parts
+        branches
         )
     return {
         group: n for (group,), n in
@@ -344,7 +345,7 @@ def retrieve_counts_by_group(
         }
 
 
-def group_sizes(
+def retrieve_group_sizes(
         manager: KgManager, grouping: Grouping | None, space: Iterable[str]
         ) -> dict[str, int]:
     return retrieve_counts_by_group(manager, grouping, space, "")
@@ -359,7 +360,7 @@ def estimated_group_sizes(
     """
     sample = current_sample(manager)
     if sample is None:
-        return group_sizes(manager, grouping, space)
+        return retrieve_group_sizes(manager, grouping, space)
     return sample.estimated_sizes(grouping)
 
 

@@ -11,7 +11,7 @@ for the role stages).
 """
 import re
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Callable, ClassVar, Literal, Self
@@ -22,14 +22,17 @@ from grasp.configs import GraspConfig
 from grasp.functions import find_manager
 from grasp.manager import KgManager
 from grasp.model import Message
+from grasp.sparql.types import Binding
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.profile import (
     PredicatePattern,
+    RoleElement,
+    RoleElementKind,
+    RoleElementUsage,
     StructureRelation,
     ROLE_DESCRIPTIONS,
     ROLE_FIELDS,
     STAGES,
-    ElementKey,
     Finding,
     Flag,
     GroupDefinition,
@@ -38,27 +41,29 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     Partition,
     ProfileStageOutput,
-    Roles,
+    PredicateRoles,
     Stage,
-    Usage,
     WithinKgNonCompetingPartitionPair,
     check_structure,
-    derived_roles,
+    derived_group_roles,
     describe_predicate_pattern,
     describe_profile,
-    describe_structure_relation,
+    describe_structure_relation_heading,
     diff_roles,
     effective_roles,
-    role_elements,
+    role_elements_of,
+    role_element_order,
+    role_elements_with_added,
     roles_from_elements,
     short_iri,
 )
 from grasp.tasks.om.foundation.configuration import (
     load_task_instructions,
 )
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
 from grasp.tasks.om.foundation.types import IRI, LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
-    LABEL_PREDICATES,
+    DEFAULT_LABEL_PREDICATES,
     RDF_TYPE,
     UNCATEGORIZED,
     VOCABULARY,
@@ -71,7 +76,7 @@ from grasp.tasks.om.kg_operations.grouping import (
     ensure_groups,
     ensure_partitions,
     estimated_group_sizes,
-    group_sizes,
+    retrieve_group_sizes,
     grouping_to_sparql_query,
     groups_to_grouping,
     get_default_partitions,
@@ -86,12 +91,12 @@ from grasp.tasks.om.kg_operations.large_kg_sampling import (
 )
 from grasp.tasks.om.kg_operations.profile_statistics import (
     PredicateCoverage,
-    Sides,
+    DirectionalUsage,
     canon_roles,
     complement,
     default_roles,
-    distinguishing_features,
-    element_usage,
+    get_predicate_usage,
+    element_usage_in_roles,
     ensure_space,
     member_coverage,
     members_query,
@@ -102,11 +107,12 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     unassigned_predicates,
 )
 from grasp.tasks.om.sparql_access import (
+    down_pushed_union,
     select_rows,
     union_of,
 )
 from grasp.tasks.om.tasks.prompting import load_prompt
-from grasp.utils import FunctionCallException, format_enumerate, format_section
+from grasp.utils import FunctionCallException, format_section
 
 FINISH = "finish"
 LARGE_KG_NOTE = (
@@ -155,7 +161,7 @@ def format_share(n: int, size: int) -> str:
     return f"{n}/{size} ({n / size:.0%})" if size else str(n)
 
 
-def run_retrieve_rows(manager: KgManager, sparql: str) -> list[dict]:
+def run_retrieve_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
     try:
         return select_rows(manager, sparql)
     except Exception as e:
@@ -168,7 +174,7 @@ def run_retrieve_rows(manager: KgManager, sparql: str) -> list[dict]:
 NUM_NAMESPACES = 15
 # kinds or classes listed per prefix
 NUM_KINDS = 8
-NUM_FEATURES = 10
+NUM_SHOWN_PREDICATES_PER_PARTITION = 10
 NUM_PREDICATES = 25
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # stage a) counts entities per prefix by kind,
@@ -186,11 +192,12 @@ def entity_examples(
         space: list[str],
         where: str,
         k: int
-        ) -> list[str]:
+        ) -> list[Item]:
     """
     Up to k entities with a name and their partition or group.
+    Run before profile stage set name predicates, so it uses
+    the defaults.
     """
-    names_sparql = union_of(LABEL_PREDICATES)
     rows = run_retrieve_rows(
         manager,
         grouping_to_sparql_query(
@@ -198,35 +205,45 @@ def entity_examples(
             grouping,
             space,
             "?s ?group ?name",
-            f"{where}\nOPTIONAL {{ ?s {names_sparql} ?name }}", f"LIMIT {k * 4}",
+            f"""{where}\nOPTIONAL {{ {
+                union_of([f'?s <{predicate}> ?name' for predicate in DEFAULT_LABEL_PREDICATES])
+                } }}""",
+            f"LIMIT {k * 4}"
             )
         )
-    seen, lines = set(), []
+    seen: set[str] = set()
+    items: list[Item] = []
     for row in rows:
         entity = row["s"].value
         if entity in seen:
             continue
         seen.add(entity)
         name = f' "{clip(row["name"].value, 50)}"' if "name" in row else ""
-        lines.append(f"  {entity}{name} ({row['group'].value})")
-        if len(lines) == k:
+        items.append(Item(f"{entity}{name} ({row['group'].value})"))
+        if len(items) == k:
             break
-    return lines
+    return items
 
 
 # sizes, features and definitions of partitions and groups
 
-
 def size_text(
-        manager: KgManager, sizes: dict[str, int], estimates: dict[str, int], name: str
+        manager: KgManager,
+        sizes: dict[str, int],
+        estimates: dict[str, int],
+        name: str
         ) -> str:
     """
-    Size of a partition or group: counted, or in a large KG estimated with the size of its sample.
+    Size of a partition or group: counted, or in a
+    large KG estimated with the size of its sample.
     """
     if current_sample(manager) is None:
         return f"{sizes.get(name, 0)} entities"
     estimate = estimates.get(name)
-    return f"{'~' + str(estimate) if estimate is not None else 'unknown number of'} entities, sample {sizes.get(name, 0)}"
+    return f"""{
+        '~' + str(estimate) if estimate is not None
+        else 'unknown number of'
+        } entities, sample {sizes.get(name, 0)}"""
 
 
 def size_stats(
@@ -240,60 +257,93 @@ def size_stats(
     return {"sizes": estimates, "sample_sizes": sizes}
 
 
-def run_sizes(manager: KgManager, grouping: Grouping, space: list[str]) -> dict[str, int]:
+def run_sizes(
+        manager: KgManager, grouping: Grouping, space: list[str]
+        ) -> dict[str, int]:
     try:
-        return group_sizes(manager, grouping, space)
+        return retrieve_group_sizes(manager, grouping, space)
     except Exception as e:
         raise FunctionCallException(f"The SPARQL query failed: {e}") from e
 
 
-def format_features(
-        inside: dict[str, int],
+def format_predicate_usage(
+        usage_inside: dict[str, int],
         size_inside: int,
-        outside: dict[str, int],
+        usage_outside: dict[str, int],
         size_outside: int,
         other: str
-        ) -> list[str]:
-    return [f"  {short_iri(f.key)}: {f.inside:.0%} inside, {f.outside:.0%} in {other}"
-            for f in distinguishing_features(inside, size_inside, outside, size_outside, NUM_FEATURES)]
+        ) -> list[Item]:
+    used_often, used_seldom = get_predicate_usage(
+        usage_inside,
+        size_inside,
+        usage_outside,
+        size_outside,
+        NUM_SHOWN_PREDICATES_PER_PARTITION
+        )
+    return [
+        Item(
+            "Common predicates:",
+            [
+                Item(f"{short_iri(pu.key)}: {pu.share_inside:.0%} used inside, {pu.share_outside:.0%} in {other}")
+                for pu in used_often
+                ]
+        ),
+        Item("Seldom predicates:",
+             [
+                 Item(f"{short_iri(pu.key)}: {pu.share_inside:.0%} used inside, {pu.share_outside:.0%} in {other}")
+                 for pu in used_seldom
+                 ]
+             )
+        ]
 
 
-def membership_argument(fn_args: dict) -> str:
+def check_membership_argument(fn_args: dict) -> str:
     membership = (fn_args.get("membership") or "").strip()
     if not re.search(r"\?s\b", membership):
         raise FunctionCallException("The membership pattern must use ?s")
     return membership
 
 
-def valid_name(name: str, unit: str) -> str:
+def check_valid_name(name: str, unit: str) -> str:
     if not NAME_RE.match(name or "") or name in (UNCATEGORIZED, ALL):
-        raise FunctionCallException(f"Invalid {unit} name {name!r}: lower case letters, digits and _")
+        raise FunctionCallException(
+            f"Invalid {unit} name {name!r}: lower case letters, digits and _"
+            )
     return name
 
 
-def test_function(unit: str, description: str) -> dict:
+MEMBERSHIP_ARG_DESCRIPTION = {
+    "type": "string",
+    "description": (
+        "SPARQL group pattern over ?s, e.g. ?s <http://example.org/p> ?o"
+        )
+    }
+
+
+def test_grouping_function(unit: str, description: str) -> dict:
     return {
         "name": f"test_{unit}",
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": {"membership": MEMBERSHIP,
-                           "compare_with": {"type": "string", "description": f"The {unit} to compare with."}},
+            "properties": {
+                "membership": MEMBERSHIP_ARG_DESCRIPTION,
+                "compare_with": {
+                    "type": "string", "description": f"The {unit} to compare with."
+                    }
+                },
             "required": ["membership"],
             "additionalProperties": False,
         },
     }
 
 
-MEMBERSHIP = {"type": "string", "description": (
-    "SPARQL group pattern over ?s, e.g. ?s <http://example.org/p> ?o")}
+# role overviews and the groups of stage e)
 
-
-# role overviews and the groups of stage e
-
-
-def format_values(values: int, literals: int, blanks: int) -> str:
-    """Kinds of the values (objects) of a predicate."""
+def format_value_type_shares(values: int, literals: int, blanks: int) -> str:
+    """
+    Kinds of the values (objects) of a predicate.
+    """
     if not values:
         return ""
     iris = values - literals - blanks
@@ -304,30 +354,55 @@ def format_values(values: int, literals: int, blanks: int) -> str:
     return ", ".join(parts)
 
 
-def format_predicate_overview(coverage: dict[str, dict[str, PredicateCoverage]], sizes: dict[str, int],
-                              members: list[str], roles: Roles, k: int) -> str:
-    """The predicates with the highest coverage in some partition: the share of
+def format_predicate_overview(
+        predicate_coverage: dict[str, dict[str, PredicateCoverage]],
+        partition_sizes: dict[str, int],
+        partition_names: list[str],
+        roles: PredicateRoles,
+        k: int
+        ) -> Table:
+    """
+    The predicates with the highest coverage in some partition: the share of
     each partition's entities that are its subject (as ?s), the kinds of its
-    values (?o) over these partitions, and the role it has."""
-    in_role = {key[2]: key[0] for key in role_elements(roles) if key[1] == "predicate"}
-    best: dict[str, float] = {}
-    for p in members:
-        for predicate, c in coverage.get(p, {}).items():
-            if sizes.get(p):
-                best[predicate] = max(best.get(predicate, 0.0), c.entities / sizes[p])
-    lines = []
-    for predicate in sorted(best, key=lambda x: -best[x])[:k]:
-        per_member = []
+    values (?o) over these partitions, and the role it has. One column per
+    partition; '-' where no entity of the partition has the predicate.
+    """
+    # a predicate may be in several roles or relations
+    role_names_by_predicate: dict[str, list[str]] = defaultdict(list)
+    for element in sorted(role_elements_of(roles), key=role_element_order):
+        if element.kind == RoleElementKind.PREDICATE:
+            role_names_by_predicate[str(element.definition)].append(element.role_name)
+    most_used_in_partition: dict[str, float] = {}
+    for p in partition_names:
+        for predicate, c in predicate_coverage.get(p, {}).items():
+            if partition_sizes.get(p):
+                most_used_in_partition[predicate] = max(
+                    most_used_in_partition.get(predicate, 0.0),
+                    c.entities / partition_sizes[p]
+                    )
+    rows: list[tuple[str, ...]] = []
+    for predicate in sorted(
+            most_used_in_partition, key=lambda x: -most_used_in_partition[x]
+            )[:k]:
+        per_partition: list[str] = []
         values = literals = blanks = 0
-        for p in members:
-            c = coverage.get(p, {}).get(predicate)
-            if c is not None:
-                per_member.append(f"{p} {c.entities / sizes[p]:.0%}")
-                values, literals, blanks = values + c.values, literals + c.literals, blanks + c.blanks
-        role = f" [{in_role[predicate]}]" if predicate in in_role else ""
-        lines.append(f"  {short_iri(predicate)}{role}  as ?s: {', '.join(per_member)}"
-                     f"  |  values: {format_values(values, literals, blanks)}")
-    return "\n".join(lines)
+        for p in partition_names:
+            c = predicate_coverage.get(p, {}).get(predicate)
+            if c is None or not partition_sizes.get(p):
+                per_partition.append("-")
+                continue
+            per_partition.append(f"{c.entities / partition_sizes[p]:.0%}")
+            values, literals, blanks = values + c.values, literals + c.literals, blanks + c.blanks
+        rows.append((
+            short_iri(predicate),
+            ", ".join(role_names_by_predicate.get(predicate, [])),
+            *per_partition,
+            format_value_type_shares(values, literals, blanks),
+            ))
+    return Table(
+        ("predicate", "role", *(f"{p} as ?s" for p in partition_names), "values (?o)"),
+        rows,
+        )
 
 
 # exclude_group warns if the excluded groups cover more of the entity space
@@ -358,14 +433,14 @@ def group_mode(
         manager: KgManager, profile: KgProfile, group: str
         ) -> tuple[GroupEditMode, list[str]]:
     """
-    (mode of stage e for a group, the unassigned predicates that count).
+    (mode of stage e) for a group, the unassigned predicates that count).
     """
     grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)
-    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
+    usage = element_usage_in_roles(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
     coverage = predicate_coverage(manager, grouping, profile.entity_space).get(group, {})
-    size = group_sizes(manager, grouping, profile.entity_space).get(group, 0)
+    size = retrieve_group_sizes(manager, grouping, profile.entity_space).get(group, 0)
     counted = [p for p, c in unassigned_predicates(effective, coverage)
                if not p.startswith(VOCABULARY) and size and c.entities / size >= MIN_UNASSIGNED_SHARE]
     formed = current.definition.origin == GroupOrigin.FORMED
@@ -389,7 +464,7 @@ class Editor(ABC):
         """The functions for the LLM: (definition, handler) pairs."""
 
     @abstractmethod
-    def input_for_llm(self) -> str:
+    def input_for_llm(self) -> list[Section]:
         """The overview of the current state, for the input of the task."""
 
 
@@ -438,8 +513,8 @@ class EntitySpaceEditor(Editor):
             class_prefix_counts=class_prefix_counts or {},
         )
 
-    def input_for_llm(self) -> str:
-        return "Entity space: " + (", ".join(self.entity_space) or "none")
+    def input_for_llm(self) -> list[Section]:
+        return [Section("Entity space", [", ".join(self.entity_space) or "none"])]
 
     def functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [
@@ -474,21 +549,31 @@ class EntitySpaceEditor(Editor):
             return self.inspect_sampled(prefix)
         sizes = run_sizes(self.kg_manager, SPACE_GROUPING, [prefix])
         if not sizes:
-            return f"No entities with IRIs starting with {prefix}."
-        named = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
-            self.kg_manager, SPACE_GROUPING, [prefix], "(COUNT(DISTINCT ?s) AS ?n)",
-            f"FILTER EXISTS {{ ?s {union_of(LABEL_PREDICATES)} ?name }}",
-        ))
+            return format_display_content(Section(f"Namespace {prefix}", ["No entities with IRIs starting with it."]))
+        named = run_retrieve_rows(
+            self.kg_manager,
+            grouping_to_sparql_query(
+                self.kg_manager,
+                SPACE_GROUPING,
+                [prefix],
+                "(COUNT(DISTINCT ?s) AS ?n)",
+                "FILTER EXISTS {" + union_of(
+                    [f"?s <{p}> ?name" for p in DEFAULT_LABEL_PREDICATES]
+                    ) + "}"
+                )
+        )
         named_count = int(named[0]["n"].value) if named and "n" in named[0] else 0
         types = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
             self.kg_manager, SPACE_GROUPING, [prefix], "?t (COUNT(DISTINCT ?s) AS ?n)",
             f"?s <{RDF_TYPE}> ?t", "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
         ))
-        return "\n".join([
-            f"{prefix}: " + ", ".join(f"{p} {n}" for p, n in sizes.items()) + f"; {named_count} with a canon name",
-            "Most frequent types: " + (", ".join(f"{short_iri(r['t'].value)} {r['n'].value}" for r in types if "t" in r) or "none"),
-            "Examples:", *entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 8),
-        ])
+        return format_display_content(Section(f"Namespace {prefix}", [
+            Item("entities by kind: " + ", ".join(f"{p} {n}" for p, n in sizes.items())
+                 + f"; {named_count} with a canon name"),
+            Item("most frequent types: "
+                 + (", ".join(f"{short_iri(r['t'].value)} {r['n'].value}" for r in types if "t" in r) or "none")),
+            Item("examples:", entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 8)),
+        ]))
 
     def inspect_sampled(self, prefix: str) -> str:
         """inspect_namespace of a large KG, from the class samples."""
@@ -498,27 +583,44 @@ class EntitySpaceEditor(Editor):
                 classes[class_iri] += count
         examples = self.sampled_examples(prefix, 8)
         if not examples:
-            return (f"No sampled entity has an IRI starting with {prefix}. (In this large knowledge graph, "
-                    "entities are only sampled per class; untyped entities are not seen.)")
-        return "\n".join([
-            f"{prefix}: classes of the sampled entities under this prefix or its namespace (estimated members): "
-            + ", ".join(f"{c} ~{n}" for c, n in classes.most_common(NUM_NAMESPACES)),
-            "Examples:", *examples,
-        ])
+            return format_display_content(Section(f"Namespace {prefix}", [
+                "No sampled entity has an IRI starting with it. (In this large knowledge graph, "
+                "entities are only sampled per class; untyped entities are not seen.)"]))
+        return format_display_content(Section(f"Namespace {prefix}", [
+            Item("classes of the sampled entities under this prefix or its namespace (estimated members): "
+                 + ", ".join(f"{c} ~{n}" for c, n in classes.most_common(NUM_NAMESPACES))),
+            Item("examples:", examples),
+        ]))
 
-    def sampled_examples(self, prefix: str, k: int) -> list[str]:
-        """Sampled entities under a prefix (large KG) with a name and their class."""
-        pairs = [(entity, class_iri) for other, sampled in self.prefix_examples.items()
-                 if other.startswith(prefix) or prefix.startswith(other)
-                 for entity, class_iri in sampled if entity.startswith(prefix)][:k]
+    def sampled_examples(self, prefix: str, k: int) -> list[Item]:
+        """
+        Sampled entities under a prefix (large KG) with a name and their class.
+        """
+        pairs = [
+            (entity, class_iri) for other, sampled in self.prefix_examples.items()
+            if other.startswith(prefix) or prefix.startswith(other)
+            for entity, class_iri in sampled if entity.startswith(prefix)
+            ][:k]
         if not pairs:
             return []
         names: dict[str, str] = {}
-        rows = run_retrieve_rows(self.kg_manager, f"SELECT ?s ?name WHERE {{ {values_block([e for e, _ in pairs])} "
-                                 f"?s {union_of(LABEL_PREDICATES)} ?name }}")
+        rows = run_retrieve_rows(
+            self.kg_manager,
+            "SELECT ?s ?name WHERE {" + down_pushed_union(
+                values_block([e for e, _ in pairs]),
+                [f"?s <{p}> ?name" for p in DEFAULT_LABEL_PREDICATES]
+                ) + "}"
+            )
         for row in rows:
             names.setdefault(row["s"].value, row["name"].value)
-        return [f"  {e}" + (f' "{clip(names[e], 50)}"' if e in names else "") + f" ({c})" for e, c in pairs]
+        return [
+            Item(
+                f"{e}"
+                + (f' "{clip(names[e], 50)}"' if e in names else "")
+                + f" ({c})"
+                )
+            for e, c in pairs
+            ]
 
     def has_entities(self, prefix: str) -> bool:
         if not self.large_kg:
@@ -539,7 +641,7 @@ class EntitySpaceEditor(Editor):
         if empty:
             raise FunctionCallException(f"No entities under {empty}")
         self.entity_space = prefixes
-        return self.input_for_llm()
+        return format_display_content(Section("Entity space set", ["Entity space: " + ", ".join(prefixes)]))
 
     def checked_entity_space(self) -> list[str]:
         """The result: the entity space, if it names a prefix."""
@@ -589,7 +691,7 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
     def update_statistics(self) -> None:
         grouping = self.grouping()
         try:
-            self.sizes = group_sizes(self.kg_manager, grouping, self.entity_space)
+            self.sizes = retrieve_group_sizes(self.kg_manager, grouping, self.entity_space)
             self.estimates = estimated_group_sizes(self.kg_manager, grouping, self.entity_space)
             self.predicates = {member: {predicate: c.entities for predicate, c in counts.items()}
                                for member, counts in predicate_coverage(self.kg_manager, grouping, self.entity_space).items()}
@@ -597,19 +699,28 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
 
-    def describe_member(self, name: str, title: str) -> str:
+    def describe_member(self, name: str, title: str) -> Section:
         """A member with examples and the predicates and types that distinguish it."""
         size = self.sizes.get(name, 0)
-        lines = [f"{title} ({self.size_text(name)}). Examples:",
-                 *entity_examples(self.kg_manager, self.grouping(), self.entity_space, f'FILTER(?group = "{name}")', 3)]
         outside, size_outside = self.outside("predicates", name)
-        lines.append("Predicates (share of entities with the predicate):")
-        lines += format_features(self.predicates.get(name, {}), size, outside, size_outside, f"other {self.unit}s")
+        content: list[SectionContent] = [
+            f"{self.size_text(name)}.",
+            Item("examples:", entity_examples(
+                self.kg_manager, self.grouping(), self.entity_space, f'FILTER(?group = "{name}")', 3)),
+            Item("predicates (share of entities with the predicate):", [
+                item for item in format_predicate_usage(
+                    self.predicates.get(name, {}), size, outside, size_outside, f"other {self.unit}s")
+                if item.children
+                ]),
+            ]
         if self.types.get(name):
             outside, size_outside = self.outside("types", name)
-            lines.append("Types:")
-            lines += format_features(self.types[name], size, outside, size_outside, f"other {self.unit}s")[:5]
-        return "\n".join(lines)
+            content.append(Item("types (share of entities with the type):", [
+                item for item in format_predicate_usage(
+                    self.types[name], size, outside, size_outside, f"other {self.unit}s")
+                if item.children
+                ]))
+        return Section(title, content)
 
     def update_definitions(self, definitions: dict[str, T]) -> None:
         """Sets the definitions and their statistics; on a failed query, nothing changes."""
@@ -627,15 +738,16 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
         return name
 
     def test_definition(self, fn_args: dict) -> str:
-        membership = membership_argument(fn_args)
+        membership = check_membership_argument(fn_args)
         try:
             size, overlap = membership_overlap(self.kg_manager, self.grouping(), self.entity_space, membership)
             inside, inside_types = member_coverage(self.kg_manager, self.entity_space, membership)
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
         self.tested.add(membership)
+        title = f"Test of the membership pattern {{ {membership} }}"
         if not size:
-            return "No entity of the entity space matches."
+            return format_display_content(Section(title, ["No entity of the entity space matches."]))
         sample = current_sample(self.kg_manager)
         if sample is not None:
             matches = sample.sample(membership)
@@ -651,26 +763,36 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
             compare = max((member for member in overlap if member in self.sizes),
                           key=lambda member: overlap[member], default=None)
         where = f"by current {self.unit} (share of the {self.unit} that matches)"
-        lines = [size_line + where + ": "
-                 + ", ".join(f"{p} {format_share(n, self.sizes.get(p, 0))}" for p, n in sorted(overlap.items(), key=lambda x: -x[1]))]
+        content: list[SectionContent] = [
+            size_line + where + ": "
+            + ", ".join(f"{p} {format_share(n, self.sizes.get(p, 0))}"
+                        for p, n in sorted(overlap.items(), key=lambda x: -x[1]))
+            ]
         if compare is not None:
             rest_size = self.sizes.get(compare, 0) - overlap.get(compare, 0)
-            for title, counts, ins in (("Predicates", self.predicates, inside), ("Types", self.types, inside_types)):
+            for kind, counts, ins in (("predicates", self.predicates, inside), ("types", self.types, inside_types)):
                 outside = {k: max(0, n - ins.get(k, 0)) for k, n in counts.get(compare, {}).items()}
-                lines.append(f"{title} (share of the matches vs. the rest of {compare}):")
-                lines += format_features(ins, size, outside, rest_size, f"rest of {compare}")[:NUM_FEATURES if title == "Predicates" else 5]
-        lines.append("Examples:")
-        names = union_of(LABEL_PREDICATES)
-        rows = run_retrieve_rows(self.kg_manager, (
-            f"SELECT DISTINCT ?s ?name WHERE {{ {members_query(membership, self.entity_space, self.kg_manager)} "
-            f"OPTIONAL {{ ?s {names} ?name }} }} LIMIT 6"
-        ))
-        lines += [f"  {r['s'].value}" + (f' "{clip(r["name"].value, 50)}"' if "name" in r else "")
-                  for r in rows if "s" in r]
-        return "\n".join(lines)
+                usage_items = [item for item in format_predicate_usage(
+                    ins, size, outside, rest_size, f"rest of {compare}") if item.children]
+                if usage_items:
+                    content.append(Item(f"{kind} (share of the matches vs. the rest of {compare}):", usage_items))
+        rows = run_retrieve_rows(
+            self.kg_manager,
+            "SELECT DISTINCT ?s ?name WHERE {" + members_query(
+                membership, self.entity_space, self.kg_manager
+                ) + f"\nOPTIONAL {{ {union_of([
+                    f'?s <{p}> ?name' for p in DEFAULT_LABEL_PREDICATES
+                ])} }} "
+            + "} LIMIT 6"
+        )
+        content.append(Item("examples:", [
+            Item(r["s"].value + (f' "{clip(r["name"].value, 50)}"' if "name" in r else ""))
+            for r in rows if "s" in r
+            ]))
+        return format_display_content(Section(title, content))
 
     def checked_membership(self, fn_args: dict) -> str:
-        membership = membership_argument(fn_args)
+        membership = check_membership_argument(fn_args)
         if membership not in self.tested:
             raise FunctionCallException(f"Test the membership pattern with test_{self.unit} first (exactly this pattern)")
         return membership
@@ -722,27 +844,33 @@ class PartitionEditor(GroupingEditor[Partition]):
         counts = self.predicates if kind == "predicates" else self.types
         return complement(counts, self.sizes, name)
 
-    def input_for_llm(self) -> str:
-        return self.format_sizes() + "\n\n" + self.format_non_competing_pairs()
+    def input_for_llm(self) -> list[Section]:
+        return [
+            Section("Partitions in order (an entity belongs to the first that matches)", self.format_sizes()),
+            Section("Partitions that do not compete with each other", self.format_non_competing_pairs()),
+            ]
 
-    def format_sizes(self) -> str:
-        lines = [f"  {name}: {self.size_text(name)}: {{ {partition.membership_sparql} }}"
-                 + (f"; {partition.features}" if partition.features else "")
-                 for name, partition in self.definitions.items()]
+    def format_sizes(self) -> list[SectionContent]:
+        items: list[SectionContent] = [
+            Item(f"{name}: {self.size_text(name)}" + (f"; {partition.features}" if partition.features else ""),
+                 [Item(f"membership: {{ {partition.membership_sparql} }}")])
+            for name, partition in self.definitions.items()
+            ]
         if self.sizes.get(UNCATEGORIZED):
-            lines.append(f"  {UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} subjects match no partition")
-        return "Partitions in order (an entity belongs to the first that matches):\n" + "\n".join(lines)
+            items.append(Item(f"{UNCATEGORIZED}: {self.sizes[UNCATEGORIZED]} subjects match no partition"))
+        return items
 
-    def format_non_competing_pairs(self) -> str:
+    def format_non_competing_pairs(self) -> list[SectionContent]:
         if not self.non_competing_pairs:
-            return "Partitions that do not compete with each other: none (all compete)."
-        return "Partitions that do not compete with each other:\n" + "\n".join(
-            f"  {pair.partition_a} - {pair.partition_b}" + (f": {pair.reason}" if pair.reason else "")
-            for pair in self.non_competing_pairs)
+            return ["None: all partitions compete."]
+        return [
+            Item(f"{pair.partition_a} - {pair.partition_b}" + (f": {pair.reason}" if pair.reason else ""))
+            for pair in self.non_competing_pairs
+            ]
 
     def functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [
-            (test_function("partition", (
+            (test_grouping_function("partition", (
                 "Tests a membership pattern: how many entities of the entity space match, in which "
                 "current partitions they are, which predicates and types distinguish them from the "
                 "rest of the partition they overlap most (or compare_with), and examples. A pattern "
@@ -758,7 +886,7 @@ class PartitionEditor(GroupingEditor[Partition]):
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "A short lower case noun for the kind."},
-                        "membership": MEMBERSHIP,
+                        "membership": MEMBERSHIP_ARG_DESCRIPTION,
                         "features": {"type": "string", "description": "What distinguishes its entities."},
                         "before": {"type": "string"},
                     },
@@ -796,7 +924,7 @@ class PartitionEditor(GroupingEditor[Partition]):
         ]
 
     def set_partition(self, fn_args: dict) -> str:
-        name = valid_name(fn_args.get("name") or "", self.unit)
+        name = check_valid_name(fn_args.get("name") or "", self.unit)
         membership = self.checked_membership(fn_args)
         before = fn_args.get("before")
         if before is not None and self.known_name(before) == name:
@@ -811,7 +939,7 @@ class PartitionEditor(GroupingEditor[Partition]):
             index = 0
         items.insert(index, (name, definition))
         self.update_definitions(dict(items))
-        return f"Partition {name} set.\n{self.format_sizes()}"
+        return format_display_content(Section(f"Partition {name} set", subsections=self.input_for_llm()))
 
     def remove_partition(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
@@ -819,7 +947,7 @@ class PartitionEditor(GroupingEditor[Partition]):
             raise FunctionCallException("The last partition cannot be removed")
         self.update_definitions({other: partition for other, partition in self.definitions.items() if other != name})
         self.non_competing_pairs = [pair for pair in self.non_competing_pairs if name not in pair.partitions()]
-        return f"Partition {name} removed.\n{self.format_sizes()}"
+        return format_display_content(Section(f"Partition {name} removed", subsections=self.input_for_llm()))
 
     def set_competition(self, fn_args: dict) -> str:
         partition_a = self.known_name(fn_args.get("partition_a"))
@@ -831,7 +959,8 @@ class PartitionEditor(GroupingEditor[Partition]):
         if not fn_args.get("compete"):
             self.non_competing_pairs.append(WithinKgNonCompetingPartitionPair(
                 partition_a=partition_a, partition_b=partition_b, reason=fn_args.get("reason") or ""))
-        return self.format_non_competing_pairs()
+        return format_display_content(
+            Section("Partitions that do not compete with each other", self.format_non_competing_pairs()))
 
     def with_partitions(self, profile: KgProfile) -> KgProfile:
         """The profile with the entity space, the partitions that have entities and their non-competing pairs."""
@@ -893,7 +1022,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         super().update_statistics()
         merged = self.grouping().merged(ALL)
         try:
-            self.all_size = group_sizes(self.kg_manager, merged, self.entity_space).get(ALL, 0)
+            self.all_size = retrieve_group_sizes(self.kg_manager, merged, self.entity_space).get(ALL, 0)
             self.all_predicates = {predicate: c.entities for predicate, c in
                                    predicate_coverage(self.kg_manager, merged, self.entity_space).get(ALL, {}).items()}
             self.all_types = type_coverage(self.kg_manager, merged, self.entity_space).get(ALL, {})
@@ -905,21 +1034,24 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
             return rest(self.all_predicates, self.all_size, self.predicates.get(name, {}), self.sizes.get(name, 0))
         return rest(self.all_types, self.all_size, self.types.get(name, {}), self.sizes.get(name, 0))
 
-    def input_for_llm(self) -> str:
-        return self.format_sizes()
+    def input_for_llm(self) -> list[Section]:
+        return [Section("Groups", [
+            f"{self.all_size} entities in any group; groups may overlap.", *self.format_sizes()])]
 
-    def format_sizes(self) -> str:
-        lines = []
+    def format_sizes(self) -> list[SectionContent]:
+        items: list[SectionContent] = []
         for name, definition in self.definitions.items():
             notes = [definition.origin.value] + ([f"part of {definition.parent}"] if definition.parent else [])
             excluded = f" [excluded: {self.exclusions[name]}]" if name in self.exclusions else ""
-            lines.append(f"  {name}: {self.size_text(name)} ({', '.join(notes)}): {{ {definition.membership_sparql} }}"
-                         + (f"; {definition.features}" if definition.features else "") + excluded)
-        return f"Groups ({self.all_size} entities in any group; groups may overlap):\n" + "\n".join(lines)
+            items.append(Item(
+                f"{name}: {self.size_text(name)} ({', '.join(notes)})"
+                + (f"; {definition.features}" if definition.features else "") + excluded,
+                [Item(f"membership: {{ {definition.membership_sparql} }}")]))
+        return items
 
     def functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [
-            (test_function("group", (
+            (test_grouping_function("group", (
                 "Tests a membership pattern: how many entities of the entity space match, how much of "
                 "each current group they cover, which predicates and types distinguish them from the "
                 "rest of the group they overlap most (or compare_with), and examples. A pattern must "
@@ -934,7 +1066,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "A short lower case noun for the group."},
-                        "membership": MEMBERSHIP,
+                        "membership": MEMBERSHIP_ARG_DESCRIPTION,
                         "features": {"type": "string",
                                      "description": "What distinguishes its entities, so that they can be recognized."},
                         "parent": {"type": "string", "description": "A group it is part of, if one."},
@@ -984,7 +1116,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         }, self.set_local_name_type)]
 
     def set_group(self, fn_args: dict) -> str:
-        name = valid_name(fn_args.get("name") or "", self.unit)
+        name = check_valid_name(fn_args.get("name") or "", self.unit)
         membership = self.checked_membership(fn_args)
         parent = fn_args.get("parent")
         if parent is not None and self.known_name(parent) == name:
@@ -992,7 +1124,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         definition = GroupDefinition(name=name, membership_sparql=membership, parent=parent,
                                      features=fn_args.get("features") or "")
         self.update_definitions({**self.definitions, name: definition})
-        return f"Group {name} set.\n{self.format_sizes()}"
+        return format_display_content(Section(f"Group {name} set", subsections=self.input_for_llm()))
 
     def excluded_share(self, exclusions: dict[str, str]) -> float:
         """Share of the entities in any group that are in an excluded group."""
@@ -1000,7 +1132,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
             return 0.0
         grouping = Grouping(tuple(("excluded", self.definitions[name].membership_sparql) for name in exclusions),
                             exclusive=True)
-        return group_sizes(self.kg_manager, grouping, self.entity_space).get("excluded", 0) / self.all_size
+        return retrieve_group_sizes(self.kg_manager, grouping, self.entity_space).get("excluded", 0) / self.all_size
 
     def exclude_group(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
@@ -1020,7 +1152,8 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         if excluded and excluded_share > LARGE_EXCLUSION_SHARE:
             result += (" This is a large part. Exclude only entities that would not be matched for this task; "
                        "to exclude part of a group, define that part as a group of its own and exclude it.")
-        return f"{result}\n{self.format_sizes()}"
+        return format_display_content(Section(
+            f"Group {name} {'excluded' if excluded else 'included'}", [result], self.input_for_llm()))
 
     def remove_group(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
@@ -1037,8 +1170,9 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         self.exclusions.pop(name, None)
         self.local_name_types.pop(name, None)
         alone = overlap.get(UNCATEGORIZED, 0)
-        return (f"Group {name} removed; {format_share(alone, size)} of its entities are in no other group and are no "
-                f"longer aligned.\n{self.format_sizes()}")
+        return format_display_content(Section(f"Group {name} removed", [
+            f"{format_share(alone, size)} of its entities are in no other group and are no longer aligned."
+            ], self.input_for_llm()))
 
     def set_local_name_type(self, fn_args: dict) -> str:
         name = self.known_name(fn_args.get("name"))
@@ -1082,30 +1216,41 @@ class RoleEditor(Editor):
     Editing of roles (KG-wide in stage c, of one group in stage e), with the
     coverage of each element over the partitions or groups in scope. The
     coverage is counted once per element and cached; the task may hand in
-    counts it has already made (usage, sides, counted), the rest is counted
+    counts it has already made (usage, usage_by_direction, counted), the rest is counted
     on creation. Created by from_kg_profile (KG-wide) or from_group_profile
     (one group: its effective roles, and its deviation as the result).
     """
     unit: Literal["partition", "group"]  # in texts for the model
-    roles: Roles                         # the working roles, changed by the functions
+    roles: PredicateRoles  # the working roles, changed by the functions
     grouping: Grouping
-    sizes: dict[str, int]
-    scope: list[str]                     # partitions or groups whose coverage is shown
+    unit_sizes: dict[str, int]
+    scope: list[str]  # partitions or groups whose coverage is shown
     # where an element comes from, shown as a mark (stage e: [kg] or [group])
-    origin: Callable[[ElementKey], str] | None = None
-    usage: dict[str, Usage] = field(default_factory=dict)  # partition or group -> element -> entities
-    sides: dict[str, Sides] = field(default_factory=dict)  # partition or group -> relation -> (as ?s, as ?o)
-    counted: set[ElementKey] = field(default_factory=set)  # elements counted, also those used nowhere
-    # one group: its roles derived from the KG-wide ones (the base of its deviation); KG-wide: None
-    derived_roles: Roles | None = None
+    origin: Callable[[RoleElement], str] | None = None
+    # partition or group -> element -> num entities
+    role_element_usage: dict[str, RoleElementUsage] = field(default_factory=dict)
+    # partition or group -> relation -> (as ?s, as ?o)
+    usage_by_direction: dict[str, DirectionalUsage] = field(default_factory=dict)
+    # elements counted, also those used nowhere
+    counted_role_elements: set[RoleElement] = field(default_factory=set)
+    # one group: its roles derived from the KG-wide
+    # ones (the base of its deviation); KG-wide: None
+    derived_roles: PredicateRoles | None = None
 
     def __post_init__(self) -> None:
-        # own copies: the editor changes them, the caller's objects (e.g. the default) stay as they are
+        # own copies: the editor changes them,
+        # the caller's objects (e.g. the default) stay as they are
         self.roles = self.roles.model_copy(deep=True)
-        self.usage = {member: dict(counts) for member, counts in self.usage.items()}
-        self.sides = {member: dict(counts) for member, counts in self.sides.items()}
-        self.counted = set(self.counted)
-        self.update_usage(self.roles)
+        self.role_element_usage = {
+            member: dict(counts) for member, counts
+            in self.role_element_usage.items()
+            }
+        self.usage_by_direction = {
+            member: dict(counts) for member, counts
+            in self.usage_by_direction.items()
+            }
+        self.counted_role_elements = set(self.counted_role_elements)
+        self.update_role_element_usage(self.roles)
 
     @classmethod
     def from_kg_profile(cls, kg_manager: KgManager, kg_profile: KgProfile, *, create_missing: bool) -> Self:
@@ -1122,34 +1267,40 @@ class RoleEditor(Editor):
             partitions = list(get_assigned_default_partitions(kg_manager, kg_profile, entity_space).values())
         grouping = partitions_to_grouping(partitions, mark_uncategorized_as_rest=False)
         partition_names = [partition.name for partition in partitions]
-        sizes = group_sizes(kg_manager, grouping, entity_space)
+        group_sizes = retrieve_group_sizes(kg_manager, grouping, entity_space)
 
         roles = kg_profile.roles
-        usage: dict[str, Usage] = {}
-        sides: dict[str, Sides] = {}
-        counted: set[ElementKey] = set()
-        if not role_elements(roles):
+        role_element_usage: dict[str, RoleElementUsage] = {}
+        role_element_usage_by_direction: dict[str, DirectionalUsage] = {}
+        counted_role_elements: set[RoleElement] = set()
+        if not role_elements_of(roles):
             if not create_missing:
                 raise ValueError("The profile has no roles")
-            # the canon is counted for the default: the editor counts only what is added later
-            usage = element_usage(kg_manager, grouping, entity_space, canon_roles(), sides)
-            roles = default_roles(usage, sizes, partition_names)
-            counted = set(role_elements(canon_roles()))
+            # the canon is counted for the default: the
+            # editor counts only what is added later
+            role_element_usage = element_usage_in_roles(
+                kg_manager, grouping, entity_space,
+                canon_roles(), role_element_usage_by_direction
+                )
+            roles = default_roles(role_element_usage, group_sizes, partition_names)
+            counted_role_elements = set(role_elements_of(canon_roles()))
         return cls(
             kg_manager=kg_manager,
             entity_space=entity_space,
             unit="partition",
             roles=roles,
             grouping=grouping,
-            sizes=sizes,
+            unit_sizes=group_sizes,
             scope=partition_names,
-            usage=usage,
-            sides=sides,
-            counted=counted,
+            role_element_usage=role_element_usage,
+            usage_by_direction=role_element_usage_by_direction,
+            counted_role_elements=counted_role_elements,
         )
 
     @classmethod
-    def from_group_profile(cls, kg_manager: KgManager, kg_profile: KgProfile, group_name: str) -> Self:
+    def from_group_profile(
+            cls, kg_manager: KgManager, kg_profile: KgProfile, group_name: str
+            ) -> Self:
         """
         The effective roles of one group (the KG-wide roles used in it, minus
         its removed, plus its added), with the coverage in the group only
@@ -1157,38 +1308,43 @@ class RoleEditor(Editor):
         element is the group's own or KG-wide.
         """
         if group_name not in kg_profile.group_names():
-            raise ValueError(f"Unknown group {group_name}; groups: {', '.join(kg_profile.group_names())}")
+            raise ValueError(
+                f"Unknown group {group_name}; groups: {', '.join(kg_profile.group_names())}"
+                )
         entity_space = ensure_space(kg_manager, kg_profile)
-        grouping = single_grouping(kg_profile, group_name)
+        grouping = single_group_grouping(kg_profile, group_name)
         group_profile = kg_profile.get_group(group_name)
-        sides: dict[str, Sides] = {}
-        usage = element_usage(
+        usage_by_direction: dict[str, DirectionalUsage] = {}
+        usage = element_usage_in_roles(
             kg_manager, grouping, entity_space,
-            roles_from_elements(role_elements(kg_profile.roles) | role_elements(group_profile.added)), sides,
+            roles_from_elements(
+                role_elements_with_added(role_elements_of(kg_profile.roles), group_profile.added)
+                ),
+            usage_by_direction,
             )
-        group_usage = usage.get(group_name, {})
-        effective = effective_roles(kg_profile.roles, group_profile, group_usage)
-        added_keys = set(role_elements(group_profile.added))
+        group_role_element_usage = usage.get(group_name, {})
+        effective_predicate_roles = effective_roles(kg_profile.roles, group_profile, group_role_element_usage)
+        added_role_elements = set(group_profile.added)
 
-        def origin(key: ElementKey) -> str:
-            return "group" if key in added_keys else "kg"
+        def origin(element: RoleElement) -> str:
+            return "group" if element in added_role_elements else "kg"
 
         return cls(
             kg_manager=kg_manager,
             entity_space=entity_space,
             unit="group",
-            roles=effective,
+            roles=effective_predicate_roles,
             grouping=grouping,
-            sizes=group_sizes(kg_manager, grouping, entity_space),
+            unit_sizes=retrieve_group_sizes(kg_manager, grouping, entity_space),
             scope=[group_name],
             origin=origin,
-            usage=usage,
-            sides=sides,
-            counted=set(role_elements(effective)),
-            derived_roles=derived_roles(kg_profile.roles, group_usage),
+            role_element_usage=usage,
+            usage_by_direction=usage_by_direction,
+            counted_role_elements=set(role_elements_of(effective_predicate_roles)),
+            derived_roles=derived_group_roles(kg_profile.roles, group_role_element_usage),
         )
 
-    def input_for_llm(self) -> str:
+    def input_for_llm(self) -> list[Section]:
         return self.format_roles(self.roles, self.origin)
 
     def functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
@@ -1255,50 +1411,104 @@ class RoleEditor(Editor):
         ]
 
     # --- coverage ---
-    def update_usage(self, roles: Roles) -> None:
-        """Usage of the elements of roles not counted yet."""
-        known = {key for counts in self.usage.values() for key in counts} | self.counted
-        new = {k: v for k, v in role_elements(roles).items() if k not in known}
-        if not new:
+    def update_role_element_usage(self, roles: PredicateRoles) -> None:
+        """
+        Usage of the elements of roles not counted yet.
+        """
+        known_role_elements = {
+            key for counts in self.role_element_usage.values() for key in counts
+            } | self.counted_role_elements
+        new_elements = {
+            e for e in role_elements_of(roles) if e not in known_role_elements
+            }
+        if not new_elements:
             return
-        sides: dict[str, Sides] = {}
+        # roles_from_elements drops a relation part without its relation's properties
+        relation_names = {e.role_name for e in new_elements if e.is_structure_relation}
+        new_elements |= {
+            e for e in role_elements_of(roles)
+            if e.kind == RoleElementKind.RELATION_PROPERTIES and e.role_name in relation_names
+            }
+        usage_by_direction: dict[str, DirectionalUsage] = {}
         try:
-            usage = element_usage(self.kg_manager, self.grouping, self.entity_space, roles_from_elements(new), sides)
+            usage = element_usage_in_roles(
+                self.kg_manager, self.grouping,
+                self.entity_space,
+                roles_from_elements(new_elements),
+                usage_by_direction
+                )
         except Exception as e:
             raise FunctionCallException(f"The SPARQL query failed: {e}") from e
         for member, counts in usage.items():
-            self.usage.setdefault(member, {}).update(counts)
-        for member, counts in sides.items():
-            self.sides.setdefault(member, {}).update(counts)
-        self.counted |= set(new)
+            self.role_element_usage.setdefault(member, {}).update(counts)
+        for member, counts in usage_by_direction.items():
+            self.usage_by_direction.setdefault(member, {}).update(counts)
+        self.counted_role_elements |= set(new_elements)
 
-    def format_coverage(self, key: ElementKey) -> str:
-        counts = [f"{p} {format_share(self.usage.get(p, {}).get(key, 0), self.sizes.get(p, 0))}"
-                  for p in self.scope]
+    def format_coverage(self, element: RoleElement) -> str:
+        counts = [
+            f"""{p}: {format_share(
+                self.role_element_usage.get(p, {}).get(element, 0),
+                self.unit_sizes.get(p, 0)
+                )}"""
+            for p in self.scope
+            ]
         return "; ".join(counts)
 
-    def format_field(self, field: str, pattern: PredicatePattern | None,
-                     origin: Callable[[ElementKey], str] | None = None) -> list[str]:
+    def format_non_structure_role(
+            self,
+            field: str,
+            pattern: PredicatePattern | None,
+            origin: Callable[[RoleElement], str] | None = None
+            ) -> Item:
         if pattern is None:
-            return [f"{field}: none"]
-        mark = lambda key: f" [{origin(key)}]" if origin else ""
-        return [f"{field}:"] + [f"  {key[1]} {key[2]}{mark(key)}: {self.format_coverage(key)}"
-                                for key in role_elements(Roles(**{field: pattern}))]
+            return Item(f"{field}: none")
+        mark = lambda element: f" [{origin(element)}]" if origin else ""
+        return Item(f"{field}:", [
+            Item(f"{element.kind.value} {element.definition}{mark(element)}: {self.format_coverage(element)}")
+            for element in sorted(role_elements_of(PredicateRoles(**{field: pattern})), key=role_element_order)
+            ])
 
-    def format_relation(self, relation: StructureRelation, origin: Callable[[ElementKey], str] | None = None) -> str:
-        key = ("structure", "relation", relation.name)
-        mark = f" [{origin(key)}]" if origin else ""
-        side = lambda i: "; ".join(f"{p} {format_share(self.sides.get(p, {}).get(key, (0, 0))[i], self.sizes.get(p, 0))}"
-                                   for p in self.scope)
-        return f"  {describe_structure_relation(relation)}{mark}\n    as ?s: {side(0)}\n    as ?o: {side(1)}"
+    def format_structure_relation(
+            self,
+            relation: StructureRelation,
+            origin: Callable[[RoleElement], str] | None = None
+            ) -> Item:
+        """
+        The relation (its properties, with their origin), then each of its
+        predicates and patterns with its coverage as ?s and as ?o.
+        """
+        mark = lambda element: f" [{origin(element)}]" if origin else ""
+        elements = sorted(role_elements_of(PredicateRoles(structure=[relation])), key=role_element_order)
+        properties = next(e for e in elements if e.kind == RoleElementKind.RELATION_PROPERTIES)
+        children = []
+        for element in elements:
+            if element.kind == RoleElementKind.RELATION_PROPERTIES:
+                continue
+            direction = lambda i: "; ".join(
+                f"{p} {format_share(self.usage_by_direction.get(p, {}).get(element, (0, 0))[i], self.unit_sizes.get(p, 0))}"
+                for p in self.scope
+                )
+            children.append(Item(f"{element.kind.value} {element.definition}{mark(element)}: "
+                                 f"as ?s: {direction(0)}; as ?o: {direction(1)}"))
+        return Item(f"{describe_structure_relation_heading(relation)}{mark(properties)}", children)
 
-    def format_roles(self, roles: Roles, origin: Callable[[ElementKey], str] | None = None) -> str:
+    def format_roles(
+            self, roles: PredicateRoles, origin: Callable[[RoleElement], str] | None = None
+            ) -> list[Section]:
         """Each element with its coverage per partition or group in scope."""
-        self.update_usage(roles)
-        lines = [line for field in ROLE_FIELDS for line in self.format_field(field, getattr(roles, field), origin)]
-        lines.append("structure relations:" if roles.structure else "structure relations: none")
-        lines += [self.format_relation(relation, origin) for relation in roles.structure]
-        return "\n".join(lines)
+        self.update_role_element_usage(roles)
+        marks = (" [kg]: a KG-wide element used here, [group]: the group's own." if origin else "")
+        return [
+            Section("Roles", [
+                f"Coverage as ?s per {self.unit}.{marks}",
+                *(self.format_non_structure_role(field, getattr(roles, field), origin) for field in ROLE_FIELDS),
+                ]),
+            Section("Structure relations", [
+                f"Coverage of each predicate or pattern as ?s and as ?o per {self.unit}.",
+                *([self.format_structure_relation(relation, origin) for relation in roles.structure] or ["none"]),
+                ]),
+            ]
 
     # --- functions ---
     def try_pattern(self, fn_args: dict) -> str:
@@ -1308,49 +1518,74 @@ class RoleEditor(Editor):
             raise FunctionCallException(f"Invalid predicate_pattern: {e}") from e
         member = fn_args.get("show_examples_from")
         if member is not None and member not in self.scope:
-            raise FunctionCallException(f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}")
-        rows = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
-            self.kg_manager, self.grouping, self.entity_space,
-            "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
-            "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
-            "", "GROUP BY ?group", pattern.branches_for_union(),
-        ))
+            raise FunctionCallException(
+                f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}"
+                )
+        rows = run_retrieve_rows(
+            self.kg_manager,
+            grouping_to_sparql_query(
+                self.kg_manager,
+                self.grouping,
+                self.entity_space,
+                "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
+                "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
+                "",
+                "GROUP BY ?group",
+                pattern.branches_for_union(),
+                ))
         counts = {row["group"].value: row for row in rows if "group" in row}
         value = lambda row, key: int(row[key].value) if key in row else 0
-        lines = [f"Pattern: {describe_predicate_pattern(pattern)}"]
+        content: list[SectionContent] = []
         for p in self.scope:
             row = counts.get(p, {})
-            lines.append(f"{self.unit.capitalize()} {p}: {format_share(value(row, 'subjects'), self.sizes.get(p, 0))} entities are ?s; "
-                         f"{value(row, 'n')} matches, {value(row, 'objects')} distinct ?o, "
-                         f"{value(row, 'literals')} literal matches.")
+            content.append(
+                Item(f"{self.unit} {p}: {format_share(value(row, 'subjects'),
+                self.unit_sizes.get(p, 0))} entities are ?s; "
+                f"{value(row, 'n')} matches, {value(row, 'objects')} distinct ?o, "
+                f"{value(row, 'literals')} literal matches"))
         if member is None:
             in_scope = [p for p in self.scope if value(counts.get(p, {}), "subjects")]
             member = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
         if member is not None and value(counts.get(member, {}), "subjects"):
-            lines.append(f"Examples in {member} (?s -> ?o, with names in quotes):")
-            lines += self.format_examples(member, pattern.branches_for_union())
-        return "\n".join(lines)
+            content.append(Item(f"examples in {member} (?s -> ?o, with names in quotes):",
+                                self.format_examples(member, pattern.branches_for_union())))
+        return format_display_content(
+            Section(f"Test of the pattern: {describe_predicate_pattern(pattern)}", content))
 
-    def format_examples(self, member: str, parts: list[str]) -> list[str]:
-        """Example matches with a name of ?s and of ?o (codes alone say little)."""
+    def format_examples(self, member: str, parts: list[str]) -> list[Item]:
+        """
+        Example matches with a name of ?s and of ?o
+        (local names alone might say little).
+        """
         names = self.roles.names.predicates if self.roles.names else []
-        names_path = union_of(list(dict.fromkeys(names + LABEL_PREDICATES)))
-        rows = run_retrieve_rows(self.kg_manager, grouping_to_sparql_query(
-            self.kg_manager, self.grouping, self.entity_space, "?s ?o ?s_name ?o_name",
-            f'FILTER(?group = "{member}")\n'
-            f"OPTIONAL {{ ?s {names_path} ?s_name }}\nOPTIONAL {{ ?o {names_path} ?o_name }}",
-            f"LIMIT {NUM_EXAMPLES * 4}", parts,
-        ))
-        seen, lines = set(), []
+        name_predicates = list(dict.fromkeys(names + DEFAULT_LABEL_PREDICATES))
+        rows = run_retrieve_rows(
+            self.kg_manager,
+            grouping_to_sparql_query(
+                self.kg_manager,
+                self.grouping,
+                self.entity_space,
+                "?s ?o ?s_name ?o_name",
+                f'FILTER(?group = "{member}")\n'
+                f"OPTIONAL {{ {union_of([f'?s <{p}> ?s_name' for p in name_predicates])} }}\n"
+                f"OPTIONAL {{ {union_of([f'?o <{p}> ?o_name' for p in name_predicates])} }}",
+                f"LIMIT {NUM_EXAMPLES * 4}", parts,
+                ))
+        seen: set[tuple[str, str]] = set()
+        items: list[Item] = []
         for row in rows:
-            if "s" not in row or "o" not in row or (row["s"].value, row["o"].value) in seen:
+            if "s" not in row or "o" not in row or (
+                    row["s"].value, row["o"].value
+                    ) in seen:
                 continue
             seen.add((row["s"].value, row["o"].value))
-            named = lambda var: row[var].value + (f' "{clip(row[var + "_name"].value, 40)}"' if var + "_name" in row else "")
-            lines.append(f"  {named('s')} -> {clip(named('o'), MAX_VALUE_CHARS)}")
-            if len(lines) == NUM_EXAMPLES:
+            named = lambda var: row[var].value + (
+                f' "{clip(row[var + "_name"].value, 40)}"' if var + "_name" in row else ""
+                )
+            items.append(Item(f"{named('s')} -> {clip(named('o'), MAX_VALUE_CHARS)}"))
+            if len(items) == NUM_EXAMPLES:
                 break
-        return lines
+        return items
 
     def edit_role(self, fn_args: dict) -> str:
         role = fn_args.get("role")
@@ -1374,9 +1609,10 @@ class RoleEditor(Editor):
             predicates += [p for p in add.predicates if p not in predicates]
             patterns += [p for p in add.patterns if p not in patterns]
         new = PredicatePattern(predicates=predicates, patterns=patterns) if predicates or patterns else None
-        self.update_usage(Roles(**{role: new}))  # may raise on SPARQL errors; then nothing changes
+        self.update_role_element_usage(PredicateRoles(**{role: new}))  # may raise on SPARQL errors; then nothing changes
         self.roles = self.roles.model_copy(update={role: new})
-        return f"Role now (coverage as ?s per {self.unit}):\n" + "\n".join(self.format_field(role, new))
+        return format_display_content(Section(
+            f"Role {role} changed", [f"Coverage as ?s per {self.unit}.", self.format_non_structure_role(role, new)]))
 
     def set_structure_relation(self, fn_args: dict) -> str:
         try:
@@ -1384,21 +1620,18 @@ class RoleEditor(Editor):
         except ValidationError as e:
             raise FunctionCallException(f"Invalid relation: {e}") from e
         relation.source = "llm"
-        key = ("structure", "relation", relation.name)
-        # a changed pattern must be counted again
-        for counts in self.usage.values():
-            counts.pop(key, None)
-        self.counted.discard(key)
-        self.update_usage(Roles(structure=[relation]))
-        text = self.format_relation(relation)
+        self.update_role_element_usage(PredicateRoles(structure=[relation]))
+        relation_item = self.format_structure_relation(relation)
         structure = [r for r in self.roles.structure if r.name != relation.name]
         replaced = len(structure) < len(self.roles.structure)
         self.roles = self.roles.model_copy(update={"structure": structure + [relation]})
         problems = check_structure(self.roles.structure)
-        result = f"Structure relation {relation.name} {'replaced' if replaced else 'added'}:\n{text}"
+        content: list[SectionContent] = [
+            f"Coverage of each predicate or pattern as ?s and as ?o per {self.unit}.", relation_item]
         if problems:
-            result += "\nTo resolve before finish: " + "; ".join(problems)
-        return result
+            content.append("To resolve before finish: " + "; ".join(problems))
+        return format_display_content(
+            Section(f"Structure relation {relation.name} {'replaced' if replaced else 'added'}", content))
 
     def remove_structure_relation(self, fn_args: dict) -> str:
         name = fn_args.get("name")
@@ -1406,7 +1639,8 @@ class RoleEditor(Editor):
         if name not in names:
             raise FunctionCallException(f"No structure relation {name}; relations: {', '.join(names) or 'none'}")
         self.roles = self.roles.model_copy(update={"structure": [r for r in self.roles.structure if r.name != name]})
-        return f"Structure relation {name} removed; relations: {', '.join(r.name for r in self.roles.structure) or 'none'}"
+        return format_display_content(Section(f"Structure relation {name} removed", [
+            "Structure relations: " + (", ".join(r.name for r in self.roles.structure) or "none")]))
 
     def check_roles(self) -> None:
         """Raises if the structure relations of the working roles are inconsistent."""
@@ -1414,12 +1648,12 @@ class RoleEditor(Editor):
         if problems:
             raise FunctionCallException("Structure relations: " + "; ".join(problems))
 
-    def checked_roles(self) -> Roles:
+    def checked_roles(self) -> PredicateRoles:
         """The result: the working roles, if their structure relations are consistent."""
         self.check_roles()
         return self.roles.model_copy(deep=True)
 
-    def group_deviation(self) -> tuple[Roles, Roles]:
+    def group_deviation(self) -> tuple[list[RoleElement], list[RoleElement]]:
         """
         One group: (added, removed) of the working roles against the roles
         derived from the KG-wide ones. Unchecked (also for the working state):
@@ -1482,10 +1716,10 @@ class ProfileStageTask(GraspTask):
     # --- stage interface ---
 
     @abstractmethod
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         """
-        Computes default and statistics, sets self.default, 
-        returns the stage's input text.
+        Computes default and statistics, sets self.default,
+        returns the stage's part of the input.
         """
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
@@ -1538,40 +1772,34 @@ class ProfileStageTask(GraspTask):
                 self.kg_manager, tuple(self.input_profile.entity_space)
                 ) if large else None
             )
-        body = self.prepare(input)
+        stage_section = self.prepare(input)
         self.profile = self.default.model_copy(deep=True)
-        head = f"Knowledge graph: {self.kg_manager.kg}" + (
-            f" ({self.kg_manager.description})" if self.kg_manager.description else "")
-        if large:
-            head += "\n\n" + LARGE_KG_NOTE
-        return "\n\n".join(
-            part for part in (
-                head, self.format_earlier_results(), body
-                ) if part
+        knowledge_graph = Section(
+            f"Knowledge graph: {self.kg_manager.kg}",
+            [self.kg_manager.description or "", LARGE_KG_NOTE if large else ""],
             )
+        sections = [knowledge_graph, *self.format_earlier_results(), stage_section]
+        return "\n\n".join(format_display_content(section) for section in sections)
 
-    def format_earlier_results(self) -> str:
+    def format_earlier_results(self) -> list[Section]:
+        """
+        The profile so far (not in the revision: it shows the whole profile
+        itself), the findings and the flags of earlier stages.
+        """
         profile = self.input_profile
-        parts = []
+        sections = []
         notes = describe_profile(profile, findings=False)
-        if notes:
-            parts.append(
-                format_section("Results of earlier stages",
-                               format_enumerate(notes))
-                )
+        if (notes.content or notes.subsections) and self.stage != Stage.REVISION:
+            sections.append(Section("Results of earlier stages", notes.content, notes.subsections))
         if profile.findings:
-            findings = [f"[{f.stage.value}{', ' + f.group if f.group else ''}] {f.text}"
-                        for f in profile.findings]
-            parts.append(format_section(
-                "Observations of earlier stages",
+            sections.append(Section("Observations of earlier stages", [
                 "Unverified notes of earlier stages. Rely on them only as far as you can confirm "
-                "them; if one contradicts what you see, report it with a flag in finish.\n"
-                + format_enumerate(findings),
-            ))
+                "them; if one contradicts what you see, report it with a flag in finish.",
+                *(Item(f"[{f.stage.value}{', ' + f.group if f.group else ''}] {f.text}") for f in profile.findings),
+                ]))
         if profile.flags:
-            parts.append(format_section("Flags raised so far", format_enumerate(
-                [format_flag(flag) for flag in profile.flags])))
-        return "\n\n".join(parts)
+            sections.append(Section("Flags raised so far", [Item(format_flag(flag)) for flag in profile.flags]))
+        return sections
 
     def system_information(self) -> str:
         info = load_prompt("profile_common.txt") + "\n\n" + load_prompt(self.prompt_file)

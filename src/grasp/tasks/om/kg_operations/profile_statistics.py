@@ -24,11 +24,12 @@ from grasp.tasks.om.data_models.profile import (
     GroupProfile,
     KgProfile,
     PredicatePattern,
-    ElementKey,
-    Roles,
-    Usage,
+    RoleElement,
+    PredicateRoles,
+    RoleElementKind,
+    RoleElementUsage,
     effective_roles,
-    role_elements,
+    role_elements_of,
     roles_from_elements,
     swap,
 )
@@ -38,7 +39,7 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     CODE_PREDICATES,
     CROSS_REFERENCE_PREDICATES,
     DEFINITION_PREDICATES,
-    LABEL_PREDICATES,
+    DEFAULT_LABEL_PREDICATES,
     RDF_TYPE,
     SYNONYM_PREDICATES,
     UNCATEGORIZED,
@@ -65,7 +66,7 @@ from grasp.tasks.om.sparql_access import (
 
 # canon predicates per role field of Roles
 CANON = {
-    "names": LABEL_PREDICATES,
+    "names": DEFAULT_LABEL_PREDICATES,
     "synonyms": SYNONYM_PREDICATES,
     "definitions": DEFINITION_PREDICATES,
     "codes": CODE_PREDICATES,
@@ -116,7 +117,11 @@ def prefix_counts(
     canon name or synonym (keeps out e.g. image files of wiki KGs).
     """
     named = (
-        f"FILTER EXISTS {{ ?s {union_of(LABEL_PREDICATES + SYNONYM_PREDICATES)} ?name }}"
+        f"""FILTER EXISTS {{ {union_of([
+            f'?s <{p}> ?name'
+            for p in DEFAULT_LABEL_PREDICATES + SYNONYM_PREDICATES]
+            )}  }}"""
+
         if named_only else ""
         )
     sparql = grouping_to_sparql_query(
@@ -214,40 +219,50 @@ def type_coverage(
 
 
 @dataclass
-class Feature:
+class PredicateUsage:
     """A predicate or type and its share inside a group and outside of it."""
     key: str
-    inside: float
-    outside: float
+    share_inside: float
+    share_outside: float
 
     @property
     def contrast(self) -> float:
-        return self.inside - self.outside
+        return self.share_inside - self.share_outside
 
 
-def distinguishing_features(
-    inside: dict[str, int],
+def get_predicate_usage(
+    usage_inside: dict[str, int],
     size_inside: int,
-        outside: dict[str, int],
-        size_outside: int,
-        k: int
-        ) -> list[Feature]:
+    usage_outside: dict[str, int],
+    size_outside: int,
+    k: int
+        ) -> tuple[list[PredicateUsage], list[PredicateUsage]]:
     """
-    The k features with the largest difference of shares, in either direction
+    The k predicates with the largest difference of shares, in either direction
     (common inside and rare outside, or the reverse), at least MIN_CONTRAST.
     """
     if not size_inside:
-        return []
-    features = [
-        Feature(
+        return ([], [])
+    relevant_predicates = [
+        PredicateUsage(
             key,
-            inside.get(key, 0) / size_inside,
-            outside.get(key, 0) / size_outside if size_outside else 0.0
+            usage_inside.get(key, 0) / size_inside,
+            usage_outside.get(key, 0) / size_outside if size_outside else 0.0
             )
-        for key in set(inside) | set(outside)
+        for key in set(usage_inside) | set(usage_outside)
     ]
-    features = [f for f in features if abs(f.contrast) >= MIN_CONTRAST]
-    return sorted(features, key=lambda f: (-abs(f.contrast), f.key))[:k]
+    relevant_predicates = [
+        f for f in relevant_predicates if abs(f.contrast) >= MIN_CONTRAST
+        ]
+    used_often = sorted(
+        (p for p in relevant_predicates if p.contrast > 0),
+        key=lambda f: (-abs(f.contrast), f.key)
+        )
+    used_seldom = sorted(
+        (p for p in relevant_predicates if p.contrast < 0),
+        key=lambda f: (-abs(f.contrast), f.key)
+    )
+    return (used_often[:k], used_seldom[:k])
 
 
 def complement(
@@ -330,85 +345,161 @@ def member_coverage(
             {t: n for (t,), n in count_rows(types, "t").items()})
 
 
-def canon_roles() -> Roles:
+def canon_roles() -> PredicateRoles:
     """
     All canon predicates and structure relations, used or not.
     """
-    return Roles(
+    return PredicateRoles(
         structure=list(DEFAULT_STRUCTURE_RELATIONS),
         **{field: PredicatePattern(predicates=list(predicates)) for field, predicates in CANON.items()},
     )
 
 
-def element_parts(key: ElementKey, value) -> list[str]:
-    """Alternatives of the pattern over ?s and ?o of one element of a Roles."""
-    _, kind, item = key
-    if kind == "relation":
-        return value.predicate_pattern.branches_for_union()
-    if kind == "predicate":
-        return [f"?s <{item}> ?o"]
-    return [item]
+# element of a structure relation -> (entities as ?s, entities as ?o)
+type DirectionalUsage = dict[RoleElement, tuple[int, int]]
 
 
-def element_sparql(key: ElementKey, value) -> str:
-    """Pattern over ?s and ?o of one element of a Roles."""
-    parts = element_parts(key, value)
-    return parts[0] if len(parts) == 1 else " UNION ".join(f"{{ {p} }}" for p in parts)
-
-
-# relation key -> (entities as ?s, entities as ?o)
-type Sides = dict[ElementKey, tuple[int, int]]
-
-
-def element_usage(manager: KgManager, grouping: Grouping | None, space: Iterable[str], roles: Roles,
-                  sides: dict[str, Sides] | None = None) -> dict[str, Usage]:
+def count_entities_by_predicate(
+        manager: KgManager,
+        grouping: Grouping | None,
+        space: Iterable[str],
+        predicates: Iterable[str],
+        triple: str
+        ) -> dict[str, dict[str, int]]:
     """
-    group -> element of the roles -> entities using it: as ?s for
-    predicates and patterns; as ?s or ?o for structure relations, whichever
-    side has more (e.g. classes are only ?o of instance_of), with both sides
-    in sides if given. Predicates in one query, every pattern in its own,
-    every relation in two.
+    predicate -> group name -> num entities of the group in the triple pattern
+    (?s the entity, ?p the predicate), for all predicates in one query.
     """
-    usage: dict[str, Usage] = defaultdict(dict)
-    elements = role_elements(roles)
-    predicates = sorted({key[2] for key in elements if key[1] == "predicate"})
-    if predicates:
-        values = " ".join(f"<{p}>" for p in predicates)
-        sparql = grouping_to_sparql_query(manager, grouping, space, "?group ?p (COUNT(DISTINCT ?s) AS ?n)",
-                                          f"VALUES ?p {{ {values} }}\n?s ?p ?o .", "GROUP BY ?group ?p")
-        by_predicate = count_rows(select_rows(manager, sparql), "group", "p")
-        for key in elements:
-            if key[1] == "predicate":
-                for (group, p), n in by_predicate.items():
-                    if p == key[2]:
-                        usage[group][key] = n
-    for key, value in elements.items():
-        if key[1] == "pattern":
-            for group, n in retrieve_counts_by_group(manager, grouping, space, "", element_parts(key, value)).items():
-                usage[group][key] = n
-        elif key[1] == "relation":
-            parts = element_parts(key, value)
-            as_s = retrieve_counts_by_group(manager, grouping, space, "", parts)
+    predicates = sorted(set(predicates))
+    counts: dict[str, dict[str, int]] = defaultdict(dict)
+    if not predicates:
+        return counts
+    values = " ".join(f"<{p}>" for p in predicates)
+    sparql = grouping_to_sparql_query(
+        manager,
+        grouping,
+        space,
+        "?group ?p (COUNT(DISTINCT ?s) AS ?n)",
+        f"VALUES ?p {{ {values} }}\n{triple} .",
+        "GROUP BY ?group ?p"
+        )
+    for (group, predicate), n in count_rows(
+            select_rows(manager, sparql), "group", "p"
+            ).items():
+        counts[predicate][group] = n
+    return counts
+
+
+def element_usage_in_roles(
+        manager: KgManager,
+        grouping: Grouping | None,
+        space: Iterable[str],
+        roles: PredicateRoles,
+        usage_by_direction: dict[str, DirectionalUsage] | None = None
+        ) -> dict[str, RoleElementUsage]:
+    """
+    group name -> element of the roles -> number of entities using it.
+    Elements of role fields count their entities as ?s; parts of structure
+    relations as ?s or as ?o, whichever is more (e.g. classes are only ?o of
+    instance_of), with both numbers in usage_by_direction if given. Relation
+    properties are not counted. The predicates in one query per direction,
+    every pattern in its own (an invalid pattern fails alone).
+    """
+    usage: dict[str, RoleElementUsage] = defaultdict(dict)
+    elements = role_elements_of(roles)
+    non_structure_predicates = [
+        e for e in elements if e.kind == RoleElementKind.PREDICATE
+        and not e.is_structure_relation
+        ]
+    structure_predicates = [
+        e for e in elements if e.kind == RoleElementKind.PREDICATE
+        and e.is_structure_relation
+        ]
+    non_structure_patterns = [
+        e for e in elements if e.kind == RoleElementKind.PATTERN
+        and not e.is_structure_relation
+        ]
+    structure_patterns = [
+        e for e in elements if e.kind == RoleElementKind.PATTERN
+        and e.is_structure_relation
+        ]
+
+    # non structure fields: count entities as ?s
+    non_structure_counts = count_entities_by_predicate(
+        manager,
+        grouping,
+        space,
+        (str(e.definition) for e in non_structure_predicates),
+        "?s ?p ?o"
+        )
+    for element in non_structure_predicates:
+        for group, n in non_structure_counts.get(str(element.definition), {}).items():
+            usage[group][element] = n
+    for element in non_structure_patterns:
+        for group, n in retrieve_counts_by_group(
+                manager, grouping, space, str(element.sparql())
+                ).items():
+            usage[group][element] = n
+
+    # structure relations: entities as ?s and as ?o
+    relation_iris = [str(e.definition) for e in structure_predicates]
+    as_subject = count_entities_by_predicate(
+        manager, grouping, space, relation_iris, "?s ?p ?o"
+        )
+    as_object = count_entities_by_predicate(
+        manager, grouping, space, relation_iris, "?o ?p ?s"
+        )
+    counts_by_direction: dict[RoleElement, tuple[dict[str, int], dict[str, int]]] = {
+        element: (
+            as_subject.get(str(element.definition), {}),
+            as_object.get(str(element.definition), {})
+            )
+        for element in structure_predicates
+        }
+    for element in structure_patterns:
+        pattern = str(element.sparql())
+        counts_by_direction[element] = (
+            retrieve_counts_by_group(manager, grouping, space, pattern),
             # the entities as ?o: the pattern with ?s and ?o swapped
-            as_o = retrieve_counts_by_group(manager, grouping, space, "", [swap(part) for part in parts])
-            for group in set(as_s) | set(as_o):
-                n_s, n_o = as_s.get(group, 0), as_o.get(group, 0)
-                usage[group][key] = max(n_s, n_o)
-                if sides is not None:
-                    sides.setdefault(group, {})[key] = (n_s, n_o)
+            retrieve_counts_by_group(manager, grouping, space, swap(pattern)),
+            )
+    for element, (subject_counts, object_counts) in counts_by_direction.items():
+        for group in set(subject_counts) | set(object_counts):
+            n_s, n_o = subject_counts.get(group, 0), object_counts.get(group, 0)
+            usage[group][element] = max(n_s, n_o)
+            if usage_by_direction is not None:
+                usage_by_direction.setdefault(group, {})[element] = (n_s, n_o)
     return dict(usage)
 
 
-def default_roles(usage: dict[str, Usage], sizes: dict[str, int], active: Iterable[str]) -> Roles:
+def default_roles(
+        role_element_usage: dict[str, RoleElementUsage],
+        group_sizes: dict[str, int],
+        active_groups: Iterable[str]
+        ) -> PredicateRoles:
     """
-    Canon elements covering at least MIN_DEFAULT_COVERAGE of 
+    Canon elements covering at least MIN_DEFAULT_COVERAGE of
     an active group or partition.
     """
-    keep = {
-        key for group in active if sizes.get(group)
-        for key, n in usage.get(group, {}).items() if n / sizes[group] >= MIN_DEFAULT_COVERAGE
+    kept_role_elements_without_structure_properties = {
+        role_element for group in active_groups if group_sizes.get(group)
+        for role_element, n in role_element_usage.get(group, {}).items()
+        if n / group_sizes[group] >= MIN_DEFAULT_COVERAGE
     }
-    return roles_from_elements({k: v for k, v in role_elements(canon_roles()).items() if k in keep})
+    kept_structure_relation_names = {
+        element.role_name for element in kept_role_elements_without_structure_properties
+        if element.is_structure_relation
+    }
+    return roles_from_elements(
+        frozenset(
+            element for element in role_elements_of(canon_roles())
+            if element in kept_role_elements_without_structure_properties
+            or (
+                element.kind == RoleElementKind.RELATION_PROPERTIES
+                and element.role_name in kept_structure_relation_names
+                )
+            )
+        )
 
 
 class LocalNameStats(BaseModel):
@@ -532,7 +623,7 @@ def group_name_stats(
     grouping: Grouping,
     space: list[str],
     group: str,
-        roles: Roles
+        roles: PredicateRoles
         ) -> LocalNameStats:
     sample = sample_entities(manager, grouping, space, where=f'FILTER(?group = "{group}")')
     return local_name_stats(manager, sample.get(group, []), roles.names)
@@ -546,23 +637,31 @@ def group_defaults(
     """
     grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)
-    usage = element_usage(manager, grouping, profile.entity_space, profile.roles).get(group, {})
+    usage = element_usage_in_roles(manager, grouping, profile.entity_space, profile.roles).get(group, {})
     effective = effective_roles(profile.roles, current, usage)
     stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
     return current.model_copy(update={"local_name_type": local_name_type(stats)}, deep=True), stats
 
 
-
 def unassigned_predicates(
-        roles: Roles, coverage: dict[str, PredicateCoverage]
+        roles: PredicateRoles, coverage: dict[str, PredicateCoverage]
         ) -> list[tuple[str, PredicateCoverage]]:
     """
     Predicates of a group in no element of its roles (as predicate or
     inside a pattern), most frequent first.
     """
-    elements = role_elements(roles)
-    predicates = {key[2] for key in elements if key[1] == "predicate"}
-    patterns = [element_sparql(key, value) for key, value in elements.items() if key[1] != "predicate"]
-    covered = lambda p: p in predicates or any(f"<{p}>" in pattern for pattern in patterns)
-    return [(p, c) for p, c in sorted(coverage.items(), key=lambda x: -x[1].entities) if not covered(p)]
-
+    elements = role_elements_of(roles)
+    predicates = {
+        str(e.definition) for e in elements if e.kind == RoleElementKind.PREDICATE
+        }
+    patterns = [
+        str(e.definition) for e in elements if e.kind == RoleElementKind.PATTERN
+    ]
+    covered = lambda p: p in predicates or any(
+        f"<{p}>" in pattern for pattern in patterns
+        )
+    return [
+        (p, c) for p, c in sorted(
+            coverage.items(), key=lambda x: -x[1].entities
+            ) if not covered(p)
+        ]

@@ -27,7 +27,7 @@ from grasp.tasks.om.data_models.profile import (
     StructureRelation,
     StructureRelationKind,
     INVERSE_PREFIX,
-    Roles,
+    PredicateRoles,
 )
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.text_vectors import (
@@ -52,7 +52,7 @@ def retrieve_value_rows(
         grouping: Grouping,
         entity_space: Iterable[str],
         value_source: ValuePatternSource,
-        roles: Roles,
+        roles: PredicateRoles,
         object_iris: Collection[IRI] | None = None
         ) -> Iterator[ValueRow]:
 
@@ -90,7 +90,7 @@ def retrieve_value_rows(
 
 def prepare_value_branches_for_sparql(
         value_source: ValuePatternSource,
-        roles: Roles,
+        roles: PredicateRoles,
         restrict_to_object_iris: Collection[IRI] | None = None,
         new_role_name: str = "own"
         ) -> list[str]:
@@ -112,7 +112,7 @@ def prepare_value_branches_for_sparql(
 
 def named_value_patterns(
         value_source: ValuePatternSource,
-        roles: Roles,
+        roles: PredicateRoles,
         new_role_name: str = "own"
         ) -> list[tuple[str, PredicatePattern]]:
     """
@@ -277,7 +277,7 @@ def relation_key(relation: StructureRelation, inverse: bool) -> str:
 
 
 def relation_keys_by_role_name(
-        value_pattern_source: ValuePatternSource, roles: Roles
+        value_pattern_source: ValuePatternSource, roles: PredicateRoles
         ) -> dict[str, str]:
     """
     For each relation of a value source, by the role name of its rows

@@ -26,9 +26,9 @@ from grasp.tasks.om.data_models.profile import (
     ROLE_FIELDS,
     KgProfile,
     RoleName,
-    Roles,
+    PredicateRoles,
     StructureRelationKind,
-    entity_roles,
+    roles_of_entity,
 )
 from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
 from grasp.tasks.om.foundation.rdf_vocabulary import (
@@ -218,7 +218,7 @@ def shown_values(
 # ---------------------------------------------------------------- what the profile says
 
 def plain_predicates(
-        roles: Roles, role_names: Iterable[RoleName]
+        roles: PredicateRoles, role_names: Iterable[RoleName]
         ) -> set[IRI]:
     """
     The plain predicates of the roles (not their SPARQL patterns).
@@ -232,7 +232,7 @@ def plain_predicates(
         }
 
 
-def membership_predicates(roles: Roles) -> list[IRI]:
+def membership_predicates(roles: PredicateRoles) -> list[IRI]:
     """
     The plain predicates of the membership relations: the types of an entity.
     """
@@ -243,7 +243,7 @@ def membership_predicates(roles: Roles) -> list[IRI]:
     })
 
 
-def context_role_names(roles: Roles) -> list[str]:
+def context_role_names(roles: PredicateRoles) -> list[str]:
     """
     The roles shown in a context: all but noise, the structure relations in
     both directions.
@@ -256,7 +256,7 @@ def context_role_names(roles: Roles) -> list[str]:
     ]
 
 
-def role_branches(roles: Roles, role_names: Iterable[str]) -> list[str]:
+def role_branches(roles: PredicateRoles, role_names: Iterable[str]) -> list[str]:
     """
     SPARQL alternatives over ?s (entity), ?predicate_ref (role name) and ?o (value),
     for retrieve_value_groups; roles that are not set are left out.
@@ -300,7 +300,7 @@ class EntityContext:
 # ---------------------------------------------------------------- context: gathering
 
 def find_helper_nodes(
-        manager: KgManager, iris: Iterable[IRI], roles: Roles
+        manager: KgManager, iris: Iterable[IRI], roles: PredicateRoles
         ) -> set[IRI]:
     """
     The IRIs that only carry a value: at least one name, and otherwise only
@@ -440,7 +440,7 @@ class EntityDisplay:
         for roles, members in self.roles_by_group_names(neighbours - self.values_by_entity_role.keys()).values():
             self.prefetch_role_values(members, STANDARD_VIEW_ROLES, roles)
 
-    def roles_by_group_names(self, entities: set[IRI]) -> dict[frozenset[str], tuple[Roles, set[IRI]]]:
+    def roles_by_group_names(self, entities: set[IRI]) -> dict[frozenset[str], tuple[PredicateRoles, set[IRI]]]:
         """
         The entities divided by their combination of groups, each part with
         its roles: entities in the same groups have the same roles, so each
@@ -453,14 +453,14 @@ class EntityDisplay:
             divided.setdefault(group_names, set()).add(entity)
         return {
             group_names: (
-                entity_roles(self.kg_profile.roles,
+                roles_of_entity(self.kg_profile.roles,
                              map(self.kg_profile.get_group, group_names)),
                 members,
             )
             for group_names, members in divided.items()
         }
 
-    def prefetch_role_values(self, entities: set[IRI], role_names: Iterable[str], roles: Roles) -> None:
+    def prefetch_role_values(self, entities: set[IRI], role_names: Iterable[str], roles: PredicateRoles) -> None:
         """
         The values of the specified roles. Vocabulary IRIs are skipped.
         """
@@ -478,7 +478,7 @@ class EntityDisplay:
             entity: IRI,
             outgoing: dict[str, ValueGroup],
             incoming: dict[str, ValueGroup],
-            roles: Roles,
+            roles: PredicateRoles,
             ) -> EntityContext:
         """
         The context of a main entity from its retrieved edges: blank nodes

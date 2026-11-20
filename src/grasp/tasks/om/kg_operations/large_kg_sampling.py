@@ -29,13 +29,14 @@ from typing import TYPE_CHECKING, Iterable
 from grasp.manager import KgManager
 from grasp.tasks.om.foundation.types import IRI
 from grasp.tasks.om.foundation.rdf_vocabulary import (
-    LABEL_PREDICATES,
+    DEFAULT_LABEL_PREDICATES,
     RDF_TYPE,
     SYNONYM_PREDICATES,
     UNIVERSE,
     local_name,
 )
 from grasp.tasks.om.sparql_access import (
+    down_pushed_union,
     select_rows,
     union_of,
     extract_union_alternatives,
@@ -98,7 +99,7 @@ def draw_members(manager: KgManager, membership: str, count: int, k: int, chunks
     members: dict[IRI, None] = {}
     for offset, limit in spread_offsets(count, k, chunks):
         rows = select_rows(manager, f"SELECT DISTINCT ?s WHERE {{ {membership} FILTER(isIRI(?s)) }} "
-                                    f"OFFSET {offset} LIMIT {limit}")
+                           f"OFFSET {offset} LIMIT {limit}")
         for row in rows:
             if "s" in row:
                 members[IRI(row["s"].value)] = None
@@ -282,15 +283,26 @@ def large_prefix_counts(manager: KgManager, classes: dict[IRI, int]) -> PrefixCo
     totals: Counter[str] = Counter()
     named_totals: Counter[str] = Counter()
     examples: dict[str, list[tuple[IRI, str]]] = {}
-    names = union_of(LABEL_PREDICATES + SYNONYM_PREDICATES)
     sampled = dict(sorted(classes.items(), key=lambda x: -x[1])[:MAX_SAMPLED_CLASSES])
     class_values = "VALUES ?t { " + " ".join(f"<{t}>" for t in sampled) + " }"
     for type_iri, n in sampled.items():
         sample = draw_members(manager, type_membership(type_iri), n, CLASS_SAMPLE, 3)
         if not sample:
             continue
-        with_name = {IRI(r["s"].value) for r in select_rows(
-            manager, f"SELECT DISTINCT ?s WHERE {{ {values_block(sample)} ?s {names} ?name }}") if "s" in r}
+        with_name = {
+            IRI(r["s"].value) for r in select_rows(
+                manager,
+                (
+                    "SELECT DISTINCT ?s WHERE {"
+                    + down_pushed_union(
+                        values_block(sample),
+                        [f"?s <{p}> ?name" for p in DEFAULT_LABEL_PREDICATES + SYNONYM_PREDICATES]
+                        )
+                    + "}"
+                )
+                )
+            if "s" in r
+            }
         # number of sampled classes of each entity, so that it counts once in the totals
         n_classes = {IRI(r["s"].value): int(r["k"].value) for r in select_rows(
             manager, f"SELECT ?s (COUNT(DISTINCT ?t) AS ?k) WHERE {{ {values_block(sample)} {class_values} "

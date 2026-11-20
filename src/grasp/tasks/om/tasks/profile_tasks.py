@@ -19,14 +19,17 @@ from grasp.tasks.om.data_models.profile import (
     Flag,
     FlagStatus,
     KgProfile,
-    Roles,
+    PredicateRoles,
     Stage,
     describe_profile,
-    role_elements,
+    RoleElementKind,
+    role_element_order,
+    role_elements_of,
     short_iri,
     unknown_name_message,
 )
 from grasp.tasks.om.foundation.configuration import configured_namespaces
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
 from grasp.tasks.om.foundation.types import IRI, LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNCATEGORIZED,
@@ -45,6 +48,7 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     canon_roles,
     local_name_type,
     predicate_coverage,
+    group_name_stats,
     prefix_counts,
     prefix_totals,
 )
@@ -62,14 +66,13 @@ from grasp.tasks.om.tasks.profile_stage import (
     entity_examples,
     format_flag,
     format_predicate_overview,
-    format_values,
-    group_name_stats,
+    format_value_type_shares,
     format_share,
     size_stats,
     size_text,
     unassigned_predicates,
 )
-from grasp.utils import FunctionCallException, format_section
+from grasp.utils import FunctionCallException
 
 
 # --- a. entity space ----------------------------------------------------------------
@@ -86,7 +89,7 @@ class SpaceTask(ProfileStageTask):
     triples: int | None
     large: bool
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         self.triples = count_triples(self.kg_manager)
         self.large = is_large(self.triples)
         prefix_examples: dict[str, list[tuple[IRI, str]]] = {}
@@ -123,32 +126,37 @@ class SpaceTask(ProfileStageTask):
             prefix_examples=prefix_examples, class_prefix_counts=class_prefix_counts,
         )
 
-        # the input text: entities per host and prefix, examples
+        # the input: entities per host and prefix, examples
         hosts: dict[str, list[str]] = {}
         for prefix, _ in totals.most_common():
             hosts.setdefault(namespace_of(prefix), []).append(prefix)
         approx = "~" if self.large else ""
-        lines = []
+
+        def prefix_item(prefix: str) -> Item:
+            kinds = sorted(((k, n) for (other, k), n in all_counts.items() if other == prefix), key=lambda x: -x[1])
+            more = f", ... {len(kinds) - NUM_KINDS} more" if len(kinds) > NUM_KINDS else ""
+            kinds_text = ", ".join(f"{k} {approx}{n}" for k, n in kinds[:NUM_KINDS]) + more
+            return Item(f"{prefix}: {approx}{totals[prefix]} entities ({kinds_text}), "
+                        f"{approx}{named_totals.get(prefix, 0)} with a canon name")
+
+        prefix_items: list[SectionContent] = []
         for host, prefixes in sorted(hosts.items(), key=lambda x: -sum(totals[p] for p in x[1]))[:NUM_NAMESPACES]:
-            if prefixes != [host]:
-                lines.append(f"  {host}: {approx}{sum(totals[p] for p in prefixes)} entities, "
-                             f"{approx}{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name")
-            for prefix in prefixes[:NUM_NAMESPACES]:
-                kinds = sorted(((k, n) for (other, k), n in all_counts.items() if other == prefix), key=lambda x: -x[1])
-                more = f", ... {len(kinds) - NUM_KINDS} more" if len(kinds) > NUM_KINDS else ""
-                kinds_text = ", ".join(f"{k} {approx}{n}" for k, n in kinds[:NUM_KINDS]) + more
-                indent = "    " if prefixes != [host] else "  "
-                lines.append(f"{indent}{prefix}: {approx}{totals[prefix]} entities ({kinds_text}), "
-                             f"{approx}{named_totals.get(prefix, 0)} with a canon name")
+            if prefixes == [host]:
+                prefix_items.append(prefix_item(host))
+                continue
+            children = [prefix_item(prefix) for prefix in prefixes[:NUM_NAMESPACES]]
             if len(prefixes) > NUM_NAMESPACES:
-                lines.append(f"    ... {len(prefixes) - NUM_NAMESPACES} more prefixes")
+                children.append(Item(f"... {len(prefixes) - NUM_NAMESPACES} more prefixes"))
+            prefix_items.append(Item(
+                f"{host}: {approx}{sum(totals[p] for p in prefixes)} entities, "
+                f"{approx}{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name", children))
         if len(hosts) > NUM_NAMESPACES:
-            lines.append(f"  ... {len(hosts) - NUM_NAMESPACES} more hosts")
-        examples = []
-        for prefix, _ in totals.most_common(3):
-            examples.append(f"{prefix}:")
-            examples += (self.space_editor.sampled_examples(prefix, 4) if self.large
-                         else entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 4))
+            prefix_items.append(Item(f"... {len(hosts) - NUM_NAMESPACES} more hosts"))
+        example_items: list[SectionContent] = [
+            Item(f"{prefix}:", self.space_editor.sampled_examples(prefix, 4) if self.large
+                 else entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 4))
+            for prefix, _ in totals.most_common(3)
+            ]
         size = (f"Size: {self.triples} triples." if self.triples is not None
                 else "Size: the triples cannot be counted (the query times out).")
         if self.large:
@@ -157,12 +165,14 @@ class SpaceTask(ProfileStageTask):
             group = "class (rdf:type)"
         else:
             group = "kind"
-        return "\n\n".join([
+        return Section("Current stage: entity space", [
             size,
             f"Default entity space ({source}): " + (", ".join(space) or "none"),
-            f"Entities per IRI prefix (host, and below it the first path segment) and {group}:\n" + "\n".join(lines),
-            "Examples:\n" + "\n".join(examples),
-        ])
+            ], [
+            Section(f"Entities per IRI prefix (host, and below it the first path segment) and {group}",
+                    prefix_items),
+            Section("Examples", example_items),
+            ])
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.space_editor.functions()
@@ -186,20 +196,20 @@ class PartitionsTask(ProfileStageTask):
     prompt_file = "profile_partitions.txt"
     partition_editor: PartitionEditor
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         self.partition_editor = PartitionEditor.from_kg_profile(
             self.kg_manager, self.input_profile, create_missing=True
             )
         self.stats = self.partition_editor.size_stats()
         self.default = self.partition_editor.with_partitions(self.input_profile)
 
-        sections = [self.partition_editor.input_for_llm()]
+        subsections = list(self.partition_editor.input_for_llm())
         for name in self.partition_editor.names() + [UNCATEGORIZED]:
             if self.partition_editor.sizes.get(name):
                 title = (f"Partition {name}" if name != UNCATEGORIZED
                          else f"Subjects that match no partition, {UNCATEGORIZED}, not aligned")
-                sections.append(self.partition_editor.describe_member(name, title))
-        return "\n\n".join(sections)
+                subsections.append(self.partition_editor.describe_member(name, title))
+        return Section("Current stage: partitions", subsections=subsections)
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.partition_editor.functions()
@@ -229,30 +239,39 @@ class RolesTask(ProfileStageTask):
     prompt_file = "profile_roles.txt"
     role_editor: RoleEditor
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         self.role_editor = RoleEditor.from_kg_profile(self.kg_manager, self.input_profile, create_missing=True)
         default = self.role_editor.roles
         entity_space, grouping = self.role_editor.entity_space, self.role_editor.grouping
-        partition_names, sizes = self.role_editor.scope, self.role_editor.sizes
+        partition_names, sizes = self.role_editor.scope, self.role_editor.unit_sizes
         estimates = estimated_group_sizes(self.kg_manager, grouping, entity_space)
         self.default = self.input_profile.model_copy(update={"entity_space": entity_space, "roles": default}, deep=True)
         self.stats = size_stats(self.kg_manager, sizes, estimates)
 
         coverage = predicate_coverage(self.kg_manager, grouping, entity_space)
-        canon = ", ".join(short_iri(key[2]) if key[1] == "predicate" else key[2]
-                          for key in role_elements(canon_roles()))
+        canon = ", ".join(
+            short_iri(element.definition) if element.kind == RoleElementKind.PREDICATE
+            else str(element.definition) if element.kind == RoleElementKind.PATTERN
+            else f"relation {element.role_name}"
+            for element in sorted(role_elements_of(canon_roles()), key=role_element_order)
+            if not (element.is_structure_relation and element.kind != RoleElementKind.RELATION_PROPERTIES)
+            )
         partition_sizes = ", ".join(
             f"{name} ({size_text(self.kg_manager, sizes, estimates, name)})" for name in partition_names
             )
-        return "\n\n".join([
+        return Section("Current stage: KG-wide roles", [
             "Partitions: " + partition_sizes,
             f"Default canon checked: {canon}. Canon elements below "
-            "1% coverage in every partition are left out of the default.",
-            "Default roles (coverage as ?s per partition):\n" + self.role_editor.input_for_llm(),
-            "Most frequent predicates: share of each partition's entities that are their subject "
-            "(as ?s), kinds of their values (?o), [role] if in the default:\n"
-            + format_predicate_overview(coverage, sizes, partition_names, default, NUM_PREDICATES),
-        ])
+            "1% coverage in every partition are left out of the default. "
+            "The default roles are below.",
+            ], [
+            *self.role_editor.input_for_llm(),
+            Section("Most frequent predicates", [
+                "Share of each partition's entities that are their subject (as ?s), kinds of their "
+                "values (?o), and the role or structure relation they are in:",
+                format_predicate_overview(coverage, sizes, partition_names, default, NUM_PREDICATES),
+                ]),
+            ])
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.role_editor.functions()
@@ -278,22 +297,22 @@ class GroupsTask(ProfileStageTask):
     prompt_file = "profile_groups.txt"
     group_editor: GroupEditor
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         self.group_editor = GroupEditor.from_kg_profile(self.kg_manager, self.input_profile, create_missing=True)
         self.stats = self.group_editor.size_stats()
         self.default = self.group_editor.with_groups(self.input_profile)
 
-        sections = []
+        subsections = []
         partner = input.get("partner_profile")
         if partner:
             notes = describe_profile(KgProfile.model_validate(partner))
-            sections.append(format_section("Profile of the other knowledge graph of the task",
-                                           "\n".join(f"- {note}" for note in notes)))
-        sections.append(self.group_editor.input_for_llm())
+            subsections.append(
+                Section("Profile of the other knowledge graph of the task", notes.content, notes.subsections))
+        subsections += self.group_editor.input_for_llm()
         for name in self.group_editor.names():
             if self.group_editor.sizes.get(name):
-                sections.append(self.group_editor.describe_member(name, f"Group {name}"))
-        return "\n\n".join(sections)
+                subsections.append(self.group_editor.describe_member(name, f"Group {name}"))
+        return Section("Current stage: groups", subsections=subsections)
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.group_editor.functions()
@@ -329,7 +348,7 @@ class GroupTask(ProfileStageTask):
     role_editor: RoleEditor
     name_type: LocalNameType  # the default local name type
 
-    def prepare(self, input: dict) -> str:
+    def prepare(self, input: dict) -> Section:
         profile = self.input_profile
         group_name = input.get("group")
         if group_name is None or group_name not in profile.group_names():
@@ -340,7 +359,7 @@ class GroupTask(ProfileStageTask):
 
         self.role_editor = RoleEditor.from_group_profile(self.kg_manager, profile, group_name)
         effective = self.role_editor.roles
-        entity_space, grouping, sizes = self.role_editor.entity_space, self.role_editor.grouping, self.role_editor.sizes
+        entity_space, grouping, sizes = self.role_editor.entity_space, self.role_editor.grouping, self.role_editor.unit_sizes
         estimates = estimated_group_sizes(self.kg_manager, grouping, entity_space)
         group_profile = profile.get_group(group_name)
 
@@ -350,29 +369,41 @@ class GroupTask(ProfileStageTask):
                       "mode": self.edit_mode.value, "local_names": stats.model_dump()}
         self.default = profile.with_replaced_group(group_profile.model_copy(update={"local_name_type": self.name_type}))
 
-        derived = self.role_editor.derived_roles or Roles()
-        unused = [key for key in role_elements(profile.roles) if key not in role_elements(derived)
-                  and key not in role_elements(group_profile.added)]
+        derived = self.role_editor.derived_roles or PredicateRoles()
+        derived_elements, added = role_elements_of(derived), set(group_profile.added)
+        unused = sorted(
+            (element for element in role_elements_of(profile.roles)
+             if element not in derived_elements and element not in added
+             and element.kind != RoleElementKind.RELATION_PROPERTIES),
+            key=role_element_order,
+            )
         coverage = predicate_coverage(self.kg_manager, grouping, entity_space).get(group_name, {})
         size = sizes.get(group_name, 0)
-        others = [f"  {short_iri(p)}  as ?s: {format_share(c.entities, size)}  |  values: {format_values(c.values, c.literals, c.blanks)}"
-                  for p, c in unassigned_predicates(effective, coverage)][:NUM_PREDICATES]
+        unassigned = unassigned_predicates(effective, coverage)[:NUM_PREDICATES]
         definition = group_profile.definition
         agreement = "–" if stats.agreement is None else f"{stats.agreement:.0%}"
         speaking = "–" if stats.speaking is None else f"{stats.speaking:.0%}"
-        return "\n\n".join([
+        return Section(f"Current stage: group {group_name}", [
             f"Group {group_name}: {size_text(self.kg_manager, sizes, estimates, group_name)}"
-            + (f"; {definition.features}" if definition.features else "")
-            + f"; membership {{ {definition.membership_sparql} }}",
-            f"Local names (sample of {stats.sample_size}, {stats.labelled} with a name): {agreement} agree with "
-            f"a name, {speaking} look like words -> default local_name_type: {self.name_type.value}",
-            "Roles of this group: the KG-wide roles used here [kg], and its own additions [group] "
-            "(coverage as ?s):\n" + self.role_editor.input_for_llm(),
-            "KG-wide elements not used in this group (dropped): "
-            + (", ".join(short_iri(k[2]) for k in unused) or "none"),
-            "Predicates of this group's entities that have no role yet: share of its entities that "
-            "are their subject (as ?s), kinds of their values (?o):\n" + ("\n".join(others) or "  none"),
-        ])
+            + (f"; {definition.features}" if definition.features else ""),
+            Item(f"membership: {{ {definition.membership_sparql} }}"),
+            f"Local names (sample of {stats.sample_size}, {stats.labelled} with a name predicate): {agreement} agree with "
+            f"a name predicate, {speaking} look like words -> default local_name_type: {self.name_type.value}",
+            ], [
+            *self.role_editor.input_for_llm(),
+            Section("KG-wide elements not used in this group (dropped)", [
+                Item(f"{element.role_name}: {element.kind.value} {short_iri(str(element.definition))}")
+                for element in unused
+                ] or ["none"]),
+            Section("Predicates of this group's entities that have no role yet", [
+                "Share of its entities that are their subject (as ?s), kinds of their values (?o):",
+                Table(("predicate", "as ?s", "values (?o)"), [
+                    (short_iri(p), format_share(c.entities, size),
+                     format_value_type_shares(c.values, c.literals, c.blanks))
+                    for p, c in unassigned
+                    ]) if unassigned else "none",
+                ]),
+            ])
 
     def stage_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return self.role_editor.functions()
@@ -390,9 +421,8 @@ class GroupTask(ProfileStageTask):
         current = self.default.get_group(self.group_name)
         updated = current.model_copy(update={"local_name_type": name_type, "added": added, "removed": removed})
         profile = self.default.with_replaced_group(updated)
-        count = lambda r: len(role_elements(r))
         return profile, (f"Group {self.group_name}: local names {name_type.value}, "
-                         f"{count(added)} elements added or overridden, {count(removed)} removed")
+                         f"{len(added)} elements added or overridden, {len(removed)} removed")
 
 
 # --- f. revision: resolve the flags, condense the findings ------------------------------
@@ -456,17 +486,21 @@ class ProfileRevisionTask(ProfileStageTask):
         self.default = profile.model_copy(deep=True)
         self.stats = {"open_flags": len(self.open_flag_ids()), "findings": len(self.findings)}
 
-        sections = [
-            self.entity_space_editor.input_for_llm()
-            + (" (a large knowledge graph: the entity space cannot be changed here)" if profile.large else ""),
-            self.partition_editor.input_for_llm(),
-            self.group_editor.input_for_llm(),
-            "KG-wide roles (coverage as ?s per partition):\n" + self.partition_role_editor.input_for_llm(),
-            "The roles of a group: show_roles with the group.",
-        ]
-        open_flags = [format_flag(flag) for flag in self.flags if flag.status == FlagStatus.OPEN]
-        sections.append(format_section("Open flags", "\n".join(open_flags) or "none"))
-        return "\n\n".join(sections)
+        entity_space_sections = self.entity_space_editor.input_for_llm()
+        if profile.large:
+            entity_space_sections[0].content = [
+                *entity_space_sections[0].content,
+                "A large knowledge graph: the entity space cannot be changed here."]
+        open_flags = [Item(format_flag(flag)) for flag in self.flags if flag.status == FlagStatus.OPEN]
+        return Section("Current stage: revision", [
+            "The whole profile with its statistics. The roles of a group: show_roles with the group.",
+            ], [
+            *entity_space_sections,
+            *self.partition_editor.input_for_llm(),
+            *self.group_editor.input_for_llm(),
+            *self.partition_role_editor.input_for_llm(),
+            Section("Open flags", open_flags or ["none"]),
+            ])
 
     # --- the current profile and the rebuild of dependent editors ---
 
@@ -583,9 +617,10 @@ class ProfileRevisionTask(ProfileStageTask):
     def show_roles(self, fn_args: dict) -> str:
         group_name = fn_args.get("group")
         if group_name is None:
-            return "KG-wide roles (coverage as ?s per partition):\n" + self.partition_role_editor.input_for_llm()
-        return (f"Roles of group {group_name} (coverage as ?s):\n"
-                + self.group_role_editor(group_name).input_for_llm())
+            return format_display_content(
+                Section("KG-wide roles", subsections=self.partition_role_editor.input_for_llm()))
+        return format_display_content(Section(
+            f"Roles of group {group_name}", subsections=self.group_role_editor(group_name).input_for_llm()))
 
     # --- flags and findings ---
 

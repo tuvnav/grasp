@@ -18,7 +18,7 @@ from grasp.tasks.om.data_models.profile import (
     StructureRelation,
     StructureRelationKind,
     INVERSE_PREFIX,
-    Roles,
+    PredicateRoles,
 )
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 
@@ -87,7 +87,6 @@ class ValuePatterns(BaseModel):
         return self.source if side == Side.SOURCE or self.target is None else self.target
 
 
-
 class StringTransform(BaseModel):
     """A string transform applied to every value before the normalization
     ladder. Only what the ladder cannot do (case, word splitting, word sets,
@@ -154,7 +153,7 @@ class KeyStrategy(BaseModel):
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
 
-    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
         """The values compared on one side (roles: unused, all strategies take it)."""
         return self.values.by_side(side)
 
@@ -176,7 +175,7 @@ class VectorStrategy(BaseModel):
             raise ValueError("model is only used with the embedding vectorizer")
         return self
 
-    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
         """The values compared on one side (roles: unused, all strategies take it)."""
         return self.values.by_side(side)
 
@@ -209,7 +208,7 @@ class NeighbourStrategy(BaseModel):
     # only count witnesses for the candidates of other generators
     mode: Literal["generate", "corroborate"] = "generate"
 
-    def value_pattern_source(self, side: Side, roles: Roles) -> ValuePatternSource:
+    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
         """The structure relations whose neighbours are compared on one side: the
         named relations as written, else those of relation_kinds in the profile
         (roles), in both directions."""
@@ -301,7 +300,7 @@ class VectorMatch(Match):
 @dataclass(frozen=True)
 class NeighbourMatch(Match):
     """
-    One witness pair shared by one source 
+    One witness pair shared by one source
     and one target entity over corresponding relations,
     with the rows of just these two entities.
     """

@@ -34,11 +34,14 @@ prompts (they replace the structural notes when these are missing). Later
 stages read them as unverified observations and report a contradiction as a
 flag instead of changing an earlier stage's result.
 """
+from __future__ import annotations
+
+from collections import defaultdict
 from enum import StrEnum, auto
 import re
 from typing import Any, Iterable, Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent
 from grasp.tasks.om.foundation.types import IRI, LocalNameType
@@ -85,10 +88,10 @@ class PredicatePattern(BaseModel):
         """
         return list(self.patterns) + [f"?s <{p}> ?o" for p in self.predicates]
 
-    def inverted(self) -> "PredicatePattern":
+    def inverted(self) -> PredicatePattern:
         """
-        The pattern in the other direction: ?s and ?o 
-        swapped in every alternative (e.g. "the parts 
+        The pattern in the other direction: ?s and ?o
+        swapped in every alternative (e.g. "the parts
         of ?s" from "?s is part of ?o").
         """
         return PredicatePattern(
@@ -145,17 +148,9 @@ def _structure(name: str, kind: StructureRelationKind, predicates: list[str] = [
 
 
 _RDFS = "http://www.w3.org/2000/01/rdf-schema#"
-
-
 _OWL = "http://www.w3.org/2002/07/owl#"
-
-
 _SKOS = "http://www.w3.org/2004/02/skos/core#"
-
-
 _PART_OF = "http://purl.obolibrary.org/obo/BFO_0000050"
-
-
 _NOT_VOCABULARY = " && ".join(f'!STRSTARTS(STR(?o), "{ns}")' for ns in VOCABULARY)
 
 
@@ -182,7 +177,7 @@ DEFAULT_STRUCTURE_RELATIONS = [
 ]
 
 
-class Roles(BaseModel):
+class PredicateRoles(BaseModel):
     """
     Roles of predicates and patterns, KG-wide or as a group's delta.
     Patterns read from ?s, the entity, to ?o, the value; a pattern may compute
@@ -250,7 +245,288 @@ class Roles(BaseModel):
 # the role fields of Roles; also used to refer to a role elsewhere (scope.ValuePatterns)
 type RoleName = Literal["names", "synonyms", "definitions", "codes", "cross_references", "noise"]
 ROLE_FIELDS: tuple[RoleName, ...] = get_args(RoleName.__value__)  # a type alias keeps its Literal in __value__
-assert set(Roles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the fields of Roles differ"
+assert set(PredicateRoles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the fields of Roles differ"
+
+
+class RoleElementKind(StrEnum):
+    PREDICATE = auto()            # one predicate of a role or relation
+    PATTERN = auto()               # one SPARQL pattern of a role or relation
+    RELATION_PROPERTIES = auto()  # transitive, symmetric etc.
+
+
+class RelationProperties(BaseModel):
+    """
+    A structure relation without its predicate pattern.
+    """
+    model_config = ConfigDict(frozen=True)
+    kind: StructureRelationKind
+    symmetric: bool = False
+    transitive: bool = False
+    inverse_of: str | None = None
+    corresponds_to: str | None = None
+    # provenance, not part of the definition: equal
+    # properties set by different stages are one element
+    source: Literal["default", "declared", "llm"] = Field(
+        default="default", exclude=False, repr=False
+        )
+
+
+class RoleElement(BaseModel):
+    """
+    The smallest unit of Roles: one predicate or pattern of a role field or a
+    structure relation, or the properties of a structure relation.
+    """
+    model_config = ConfigDict(frozen=True)
+    role_name: str  # a role field ("names") or a relation name ("subclass_of")
+    is_structure_relation: bool
+    kind: RoleElementKind
+    definition: IRI | str | RelationProperties  # predicate, SPARQL pattern or properties
+
+    def __hash__(self) -> int:
+        return hash(
+            (self.role_name,
+             self.is_structure_relation,
+             self.kind,
+             # source of the properties does not count (see eq)
+             hashable_definition(self.definition))
+            )
+
+    def __eq__(self, other: "RoleElement") -> bool:
+        return (
+            isinstance(other, RoleElement) and hash(self) == hash(other)
+            and hashable_definition(self.definition) == hashable_definition(other.definition)
+            )
+
+    def sparql(self) -> str | None:
+        """
+        The pattern over ?s and ?o of this element.
+        None for relation properties.
+        """
+        match self.kind:
+            case RoleElementKind.PREDICATE:
+                return f"?s <{self.definition}> ?o"
+            case RoleElementKind.PATTERN:
+                if isinstance(self.definition, RelationProperties):
+                    raise ValueError(
+                        "RoleElement has kind 'RELATION_PROPERTIES' "
+                        "but it's definition is a RelationProperties."
+                        )
+                return self.definition
+            case _:
+                return None
+
+
+def hashable_definition(definition: IRI | str | RelationProperties) -> str | tuple:
+    """
+    The definition as a hashable value for equality: relation properties
+    without their source (who set them does not change what they mean).
+    """
+    if isinstance(definition, RelationProperties):
+        return tuple(sorted(definition.model_dump(exclude={"source"}).items()))
+    return definition
+
+
+type RoleElements = frozenset[RoleElement]
+# number of entities of a group (or partition) that an element covers (as ?s)
+type RoleElementUsage = dict[RoleElement, int]
+
+
+def role_elements_of(roles: PredicateRoles) -> RoleElements:
+    role_elements: set[RoleElement] = set()
+    for field in ROLE_FIELDS:
+        if (pattern := getattr(roles, field)) is not None:
+            add_predicate_pattern(role_elements, field, False, pattern)
+        for structure_relation in roles.structure:
+            add_predicate_pattern(
+                role_elements,
+                structure_relation.name,
+                True,
+                structure_relation.predicate_pattern
+                )
+            role_elements.add(
+                RoleElement(
+                    role_name=structure_relation.name,
+                    is_structure_relation=True,
+                    kind=RoleElementKind.RELATION_PROPERTIES,
+                    definition=RelationProperties(
+                        **structure_relation.model_dump(
+                            exclude={"name", "predicate_pattern"}
+                            )
+                        )
+                    )
+                )
+    return frozenset(role_elements)
+
+
+def add_predicate_pattern(
+        role_elements: set[RoleElement],
+        role_name: str,
+        is_structure_relation: bool,
+        pattern: PredicatePattern
+        ):
+    role_elements.update(
+        RoleElement(
+            role_name=role_name,
+            is_structure_relation=is_structure_relation,
+            kind=RoleElementKind.PREDICATE,
+            definition=p
+            )
+        for p in pattern.predicates
+        )
+    role_elements.update(
+        RoleElement(
+            role_name=role_name,
+            is_structure_relation=is_structure_relation,
+            kind=RoleElementKind.PATTERN,
+            definition=p
+            )
+        for p in pattern.patterns
+        )
+
+
+def roles_from_elements(elements: RoleElements) -> PredicateRoles:
+    """
+    A structure relation needs its properties and at least one
+    predicate or pattern, otherwise it is left out (e.g. not used in a group).
+    """
+    # (is_structure_relation, field_name) -> predicate / pattern
+    predicates: dict[tuple[bool, str], list[IRI]] = defaultdict(list)
+    patterns: dict[tuple[bool, str], list[str]] = defaultdict(list)
+    # sturture field name -> properties
+    properties: dict[str, RelationProperties] = {}
+
+    for element in sorted(elements, key=role_element_order):
+        key = (element.is_structure_relation, element.role_name)
+        match element.kind:
+            case RoleElementKind.PREDICATE:
+                predicates[key].append(element.definition)
+            case RoleElementKind.PATTERN:
+                patterns[key].append(element.definition)
+            case RoleElementKind.RELATION_PROPERTIES:
+                properties[element.role_name] = element.definition
+
+    def predicate_pattern_of(key: tuple[bool, str]) -> PredicatePattern | None:
+        if not predicates[key] and not patterns[key]:
+            return None
+        return PredicatePattern(predicates=predicates[key], patterns=patterns[key])
+
+    non_structure_roles = {
+        field: p for field in ROLE_FIELDS
+        if (p := predicate_pattern_of((False, field))) is not None
+        }
+    structure_roles = [
+        StructureRelation(name=name, predicate_pattern=p, **props.model_dump())
+        for name, props in properties.items()
+        if (p := predicate_pattern_of((True, name))) is not None
+    ]
+
+    return PredicateRoles(structure=structure_roles, **non_structure_roles)
+
+
+def role_element_order(element: RoleElement) -> tuple[bool, int, str, int, str]:
+    """
+    Sort key of role elements, so that sets of them give the same Roles in every
+    run: role fields first (in the order of ROLE_FIELDS), then structure
+    relations by name; within one role, predicates, patterns, properties
+    (the order of RoleElementKind), then by definition.
+    """
+    field_position = 0 if element.is_structure_relation else ROLE_FIELDS.index(element.role_name)
+    return (
+        element.is_structure_relation,
+        field_position,
+        element.role_name,
+        list(RoleElementKind).index(element.kind),
+        str(hashable_definition(element.definition)),
+        )
+
+
+def role_elements_with_added(
+        elements: RoleElements, added: Iterable[RoleElement]
+        ) -> RoleElements:
+    """
+    The elements plus the added ones; added relation
+    properties replace the relation's old ones.
+    """
+    added = set(added)
+    replaced = {
+        element.role_name for element in added
+        if element.kind == RoleElementKind.RELATION_PROPERTIES
+    }
+    kept = {
+        element for element in elements
+        if not (
+            element.kind == RoleElementKind.RELATION_PROPERTIES
+            and element.role_name in replaced
+            )
+    }
+    return frozenset(kept | added)
+
+
+def diff_roles(
+        derived: PredicateRoles, final: PredicateRoles
+        ) -> tuple[list[RoleElement], list[RoleElement]]:
+    before, after = role_elements_of(derived), role_elements_of(final)
+    return (
+        sorted(after - before, key=role_element_order),
+        sorted(before - after, key=role_element_order)
+        )
+
+
+def derived_group_roles(
+    kg_roles: PredicateRoles, element_usage: RoleElementUsage
+        ) -> PredicateRoles:
+    return roles_from_elements(
+        frozenset(
+            element for element in role_elements_of(kg_roles)
+            if element.kind == RoleElementKind.RELATION_PROPERTIES
+            or element_usage.get(element, 0) > 0
+        )
+    )
+
+
+def effective_roles(
+        kg_roles: PredicateRoles, group: GroupProfile, usage: RoleElementUsage
+        ) -> PredicateRoles:
+    elements = role_elements_of(derived_group_roles(kg_roles, usage)) - set(group.removed)
+    return roles_from_elements(role_elements_with_added(elements, group.added))
+
+
+def roles_of_entity(
+        kg_roles: PredicateRoles, groups: Iterable[GroupProfile]
+        ) -> PredicateRoles:
+    """
+    Roles of an entity in these groups: the KG-wide roles minus the removed
+    of all groups, plus their added (an addition wins over a removal by
+    another group. Of two groups that change the same relation's properties,
+    the later defined one wins).
+    """
+    groups = list(groups)
+    elements = role_elements_of(kg_roles)
+    for group in groups:
+        elements -= set(group.removed)
+    for group in groups:
+        elements = role_elements_with_added(elements, group.added)
+    return roles_from_elements(elements)
+
+
+def check_structure(relations: list[StructureRelation]) -> list[str]:
+    """Problems of a list of structure relations: duplicate names, inverse_of
+    naming no relation of the list, or inverses that do not point back."""
+    problems = []
+    by_name: dict[str, StructureRelation] = {}
+    for relation in relations:
+        if relation.name in by_name:
+            problems.append(f"duplicate structure relation name {relation.name}")
+        by_name[relation.name] = relation
+    for relation in relations:
+        if relation.inverse_of is None:
+            continue
+        inverse = by_name.get(relation.inverse_of)
+        if inverse is None:
+            problems.append(f"{relation.name}: inverse_of names no structure relation ({relation.inverse_of})")
+        elif inverse.inverse_of not in (None, relation.name):
+            problems.append(f"{relation.name} is inverse_of {inverse.name}, but {inverse.name} is inverse_of {inverse.inverse_of}")
+    return problems
 
 
 class Partition(BaseModel):
@@ -304,14 +580,12 @@ class GroupProfile(BaseModel):
     excluded: bool = False
     exclusion_reason: str = ""
     local_name_type: LocalNameType | None = None  # set by stage e (or its default)
-    added: Roles = Roles()    # group-specific; a relation overrides the KG-wide one of its name
-    removed: Roles = Roles()  # used in the group, but uninformative there
+    added: list[RoleElement] = []   # group-specific changes on roles
+    removed: list[RoleElement] = []  # roles used in the group, but uninformative there
 
     @property
     def name(self) -> str:
         return self.definition.name
-
-
 
 
 class Finding(BaseModel):
@@ -356,7 +630,7 @@ class KgProfile(BaseModel):
     entity_space: list[str] = []
     partitions: list[Partition] = []  # in order: the first match wins
     non_competing_pairs: list[WithinKgNonCompetingPartitionPair] = []
-    roles: Roles = Roles()
+    roles: PredicateRoles = PredicateRoles()
     groups: list[GroupProfile] = []
     findings: list[Finding] = []
     flags: list[Flag] = []
@@ -449,119 +723,6 @@ class ProfileStageOutput(BaseModel):
     stats: dict[str, Any]
 
 
-# --- elements and deltas ------------------------------------------------------
-
-
-# an element of a Roles: (field, "predicate" | "pattern", IRI or pattern) for the
-# role fields, ("structure", "relation", name) for a structure relation
-type ElementKey = tuple[str, str, str]
-type Elements = dict[ElementKey, str | StructureRelation]
-
-
-def role_elements(roles: Roles) -> Elements:
-    elements: Elements = {}
-    for field in ROLE_FIELDS:
-        pattern: PredicatePattern | None = getattr(roles, field)
-        if pattern is None:
-            continue
-        for predicate in pattern.predicates:
-            elements[(field, "predicate", predicate)] = predicate
-        for sparql in pattern.patterns:
-            elements[(field, "pattern", sparql)] = sparql
-    for relation in roles.structure:
-        elements[("structure", "relation", relation.name)] = relation
-    return elements
-
-
-def roles_from_elements(elements: Elements) -> Roles:
-    predicates: dict[str, list[IRI]] = {field: [] for field in ROLE_FIELDS}
-    patterns: dict[str, list[str]] = {field: [] for field in ROLE_FIELDS}
-    structure = []
-    for (field, kind, _), value in elements.items():
-        if kind == "relation":
-            structure.append(value)
-        elif kind == "predicate":
-            predicates[field].append(IRI(value))
-        else:
-            patterns[field].append(value)
-    fields = {
-        field: PredicatePattern(predicates=predicates[field], patterns=patterns[field])
-        for field in ROLE_FIELDS
-        if predicates[field] or patterns[field]
-    }
-    return Roles(structure=structure, **fields)
-
-
-def same_element(element_a: str | StructureRelation, element_b: str | StructureRelation) -> bool:
-    # a relation edited without change stays the same, whoever set it
-    if isinstance(element_a, StructureRelation) and isinstance(element_b, StructureRelation):
-        return element_a.model_dump(exclude={"source"}) == element_b.model_dump(exclude={"source"})
-    return element_a == element_b
-
-
-# number of entities of a group (or partition) that an element covers (as ?s)
-type Usage = dict[ElementKey, int]
-
-
-def derived_roles(kg_roles: Roles, usage: Usage) -> Roles:
-    """KG-wide roles restricted to the elements used in a group."""
-    return roles_from_elements({
-        key: value for key, value in role_elements(kg_roles).items() if usage.get(key, 0) > 0
-    })
-
-
-def effective_roles(kg_roles: Roles, group: GroupProfile, usage: Usage) -> Roles:
-    """Roles of a group: KG-wide roles used in it, minus removed, plus added."""
-    elements = role_elements(derived_roles(kg_roles, usage))
-    for key in role_elements(group.removed):
-        elements.pop(key, None)
-    elements.update(role_elements(group.added))
-    return roles_from_elements(elements)
-
-
-def entity_roles(kg_roles: Roles, groups: Iterable[GroupProfile]) -> Roles:
-    """Roles of an entity in these groups: the KG-wide roles minus the removed
-    of all groups, plus their added (an addition wins over a removal by
-    another group)."""
-    groups = list(groups)
-    elements = role_elements(kg_roles)
-    for group in groups:
-        for key in role_elements(group.removed):
-            elements.pop(key, None)
-    for group in groups:
-        elements.update(role_elements(group.added))
-    return roles_from_elements(elements)
-
-
-def diff_roles(derived: Roles, final: Roles) -> tuple[Roles, Roles]:
-    """(added, removed) that turn derived into final. A relation changed
-    under its name is added (overriding), not removed and added."""
-    before, after = role_elements(derived), role_elements(final)
-    added = {key: value for key, value in after.items() if key not in before or not same_element(before[key], value)}
-    removed = {key: value for key, value in before.items() if key not in after}
-    return roles_from_elements(added), roles_from_elements(removed)
-
-
-def check_structure(relations: list[StructureRelation]) -> list[str]:
-    """Problems of a list of structure relations: duplicate names, inverse_of
-    naming no relation of the list, or inverses that do not point back."""
-    problems = []
-    by_name: dict[str, StructureRelation] = {}
-    for relation in relations:
-        if relation.name in by_name:
-            problems.append(f"duplicate structure relation name {relation.name}")
-        by_name[relation.name] = relation
-    for relation in relations:
-        if relation.inverse_of is None:
-            continue
-        inverse = by_name.get(relation.inverse_of)
-        if inverse is None:
-            problems.append(f"{relation.name}: inverse_of names no structure relation ({relation.inverse_of})")
-        elif inverse.inverse_of not in (None, relation.name):
-            problems.append(f"{relation.name} is inverse_of {inverse.name}, but {inverse.name} is inverse_of {inverse.inverse_of}")
-    return problems
-
-
 # --- description for prompts -------------------------------------------------------
 
 # TODO: Why not use GRASPs prefixed version?
@@ -638,7 +799,7 @@ def describe_structure_relation(relation: StructureRelation) -> str:
             f"{describe_predicate_pattern(relation.predicate_pattern)}")
 
 
-def describe_roles(roles: Roles) -> list[Item]:
+def describe_roles(roles: PredicateRoles) -> list[Item]:
     """Each role and structure relation with its predicates and patterns below it."""
     items = [
         Item(f"'{field.replace('_', ' ')}' ({ROLE_DESCRIPTIONS[field]}):", describe_predicate_pattern_items(pattern))

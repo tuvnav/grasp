@@ -103,7 +103,7 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, retrieve_counts_by_group, group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
+    Grouping, retrieve_counts_by_group, retrieve_group_sizes, profile_groups_to_grouping, profile_partitions_to_grouping,
 )
 from grasp.tasks.om.kg_operations.large_kg_sampling import KgSample, use_sample
 from grasp.tasks.om.kg_operations.candidate_generation import (
@@ -1601,7 +1601,7 @@ def count_group_entities(
     entity in several groups counts in each). Not for a large KG.
     """
     grouping = profile_groups_to_grouping(kg_profile)
-    sizes = group_sizes(manager, grouping, kg_profile.entity_space)
+    sizes = retrieve_group_sizes(manager, grouping, kg_profile.entity_space)
     matched = (
         retrieve_counts_by_group(
             manager,
