@@ -7,7 +7,7 @@ Your task:
 - Add elements that are specific to this group and useful for matching (e.g. an identifier or name predicate used only by this group).
 - Check the local name type: label if the local names of the IRIs are names (they may then serve as names of entities without one), code if they are identifiers (e.g. ABC_0001234, Q42, a UUID), other if mixed. A local name can look like a name and still only be an identifier.
 
-Your changes apply to this group only. If an element is wrong for the whole knowledge graph, report it with a flag on the roles stage.
+Your changes apply to this group only. If an element is wrong for the whole knowledge graph, report it with raise_flag on the roles stage.
 
 Steps:
 1. Read the roles and the statistics; inspect a few typical entities of the group with all their predicates.

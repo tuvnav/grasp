@@ -10,10 +10,10 @@ from typing import Callable
 
 @dataclass
 class FunctionRegistry:
-    Registry: dict[str, Callable] = field(default_factory=dict)
+    handlers: dict[str, Callable] = field(default_factory=dict)
 
     def register(self, function_name: StrEnum):
         def decorator(func: Callable):
-            self.Registry[function_name] = func
+            self.handlers[function_name] = func
             return func
         return decorator

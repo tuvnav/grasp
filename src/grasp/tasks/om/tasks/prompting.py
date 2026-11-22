@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+from pydantic import BaseModel
 
 from grasp.configs import GraspConfig
 from grasp.tasks.om.foundation.configuration import load_task_instructions
@@ -45,3 +47,32 @@ def add_equivalence_condition(text: str, config: GraspConfig) -> str:
     if EQUIVALENCE_PLACEHOLDER in text:
         return text.replace(EQUIVALENCE_PLACEHOLDER, injection)
     return text + "\n\n" + injection
+
+
+def inline_schema(
+        model: type[BaseModel], drop: frozenset[str] = frozenset()
+        ) -> dict:
+    """
+    JSON schema of a model with its $defs inlined (not every model API
+    resolves $ref), without titles, without the given properties and without
+    discriminator mappings (they point into $defs; the const kind of each
+    alternative of a oneOf is enough).
+    """
+    schema = model.model_json_schema()
+    defs = schema.pop("$defs", {})
+
+    def resolve(node: Any) -> Any:
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
+            node = {k: resolve(v) for k, v in node.items() if k not in ("title", "discriminator")}
+            if "properties" in node:
+                node["properties"] = {k: v for k, v in node["properties"].items() if k not in drop}
+                if "required" in node:
+                    node["required"] = [r for r in node["required"] if r not in drop]
+            return node
+        if isinstance(node, list):
+            return [resolve(v) for v in node]
+        return node
+
+    return resolve(schema)

@@ -458,7 +458,7 @@ class OMVerifyTask(GraspTask):
             fn_args: dict,
             known: set[str],
             example_indices: dict | None) -> str:
-        fn: Optional[Callable] = func_reg.Registry.get(fn_name)
+        fn: Optional[Callable] = func_reg.handlers.get(fn_name)
         if fn is None or fn_name not in self.offered_functions():
             raise FunctionCallException(
                 f"Unknown function {fn_name}, use one of {[f.value for f in self.offered_functions()]}"

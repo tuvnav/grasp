@@ -245,11 +245,16 @@ def ensure_groups(
     profile = kg_profile
     if profile.groups:
         return {g.name: g.definition for g in profile.groups}
-    groups = {name: GroupDefinition(name=p.name, membership_sparql=p.membership_sparql, origin=GroupOrigin.PARTITION,
-                                    features=p.features)
-              for name, p in ensure_partitions(
-                  kg_manager, kg_profile, entity_space
-                  ).items()}
+    groups = {
+        name: GroupDefinition(
+            name=p.name,
+            membership_sparql=p.membership_sparql,
+            origin=GroupOrigin.PARTITION,
+            features=p.features
+            )
+        for name, p in ensure_partitions(
+            kg_manager, kg_profile, entity_space
+            ).items()}
     return groups
 
 

@@ -9,13 +9,11 @@ The six stages of the KG profile (data_models/profile.py), each a GRASP task on 
 """
 import copy
 from functools import partial
-from typing import Callable
+from typing import Callable, Literal
 
-from pydantic import ValidationError
 
 from grasp.tasks.om.data_models.profile import (
     ROLE_FIELDS,
-    Finding,
     Flag,
     FlagStatus,
     KgProfile,
@@ -44,25 +42,26 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     predicate_coverage,
     group_name_stats,
     prefix_per_group_counts,
-    prefix_totals,
+    prefix_total_counts,
 )
 from grasp.tasks.om.tasks.profile_stage import (
-    NUM_KINDS,
+    MAX_FINDINGS_AFTER_REVISION,
+    NUM_MEMBERS_LISTED_PER_PREFIX,
     NUM_NAMESPACES,
     NUM_PREDICATES,
-    SPACE_GROUPING,
+    DEFAULT_SPACE_PARTITION_GROUPING,
     EntitySpaceEditor,
     GroupEditMode,
     GroupEditor,
     PartitionEditor,
+    ProfileFunctionName,
     ProfileStageTask,
     RoleEditor,
-    entity_examples,
-    format_flag,
+    get_entity_examples,
     format_predicate_overview,
     format_value_type_shares,
     format_share,
-    size_stats,
+    get_required_argument,
     size_text,
     unassigned_predicates,
 )
@@ -88,9 +87,10 @@ class SpaceTask(ProfileStageTask):
                 f"Large knowledge graphs (more than {LARGE_TRIPLES:_} triples, or whose triples cannot "
                 "be counted) are not supported yet."
                 )
-        named = prefix_per_group_counts(self.kg_manager, True)
-        all_counts = prefix_per_group_counts(self.kg_manager, False)
-        named_totals, totals = prefix_totals(named), prefix_totals(all_counts)
+        named_entities_counts_per_group = prefix_per_group_counts(self.kg_manager, True)
+        all_entities_counts_per_group = prefix_per_group_counts(self.kg_manager, False)
+        prefix_counts_named_entities = prefix_total_counts(named_entities_counts_per_group)
+        prefix_counts_all_entities = prefix_total_counts(all_entities_counts_per_group)
 
         # the default space
         configured = configured_namespaces(self.config, self.kg_manager.kg)
@@ -98,39 +98,52 @@ class SpaceTask(ProfileStageTask):
             space, source = list(self.input_profile.entity_space), "given in the input profile"
         elif configured:
             space, source = list(configured), "configured"
-        elif named_totals:
-            space, source = [named_totals.most_common(1)[0][0]], "prefix with the most named entities"
-        elif totals:
-            space, source = [totals.most_common(1)[0][0]], "prefix with the most entities"
+        elif prefix_counts_named_entities:
+            space, source = [prefix_counts_named_entities.most_common(1)[0][0]], "prefix with the most named entities"
+        elif prefix_counts_all_entities:
+            space, source = [prefix_counts_all_entities.most_common(1)[0][0]], "prefix with the most entities"
         else:
             space, source = [], "no entities found"
         self.stats = {
             "triples": self.triples,
-            "prefixes": dict(totals.most_common()),
-            "named": dict(named_totals.most_common())
+            "prefixes": dict(prefix_counts_all_entities.most_common()),
+            "named": dict(prefix_counts_named_entities.most_common())
             }
-        self.default = self.input_profile.model_copy(
+        self.default_profile = self.input_profile.model_copy(
             update={"entity_space": space, "triples": self.triples}, deep=True)
 
-        # the default is chosen above from the counts made anyway, not by the editor
+        # the default is chosen above from the counts, not by the editor
         self.space_editor = EntitySpaceEditor.from_kg_profile(
-            self.kg_manager, self.default, create_missing=False,
+            self.kg_manager, self.default_profile, create_missing=False,
         )
 
         # the input: entities per host and prefix, examples
         hosts: dict[str, list[str]] = {}
-        for prefix, _ in totals.most_common():
+        for prefix, _ in prefix_counts_all_entities.most_common():
             hosts.setdefault(namespace_of(prefix), []).append(prefix)
 
         def prefix_item(prefix: str) -> Item:
-            kinds = sorted(((k, n) for (other, k), n in all_counts.items() if other == prefix), key=lambda x: -x[1])
-            more = f", ... {len(kinds) - NUM_KINDS} more" if len(kinds) > NUM_KINDS else ""
-            kinds_text = ", ".join(f"{k} {n}" for k, n in kinds[:NUM_KINDS]) + more
-            return Item(f"{prefix}: {totals[prefix]} entities ({kinds_text}), "
-                        f"{named_totals.get(prefix, 0)} with a canon name")
+            members = sorted(
+                (
+                    (member, n) for (other_prefix, member), n
+                    in all_entities_counts_per_group.items()
+                    if other_prefix == prefix
+                    ),
+                key=lambda x: -x[1])
+            more_text = (
+                f", ... {len(members) - NUM_MEMBERS_LISTED_PER_PREFIX} more"
+                if len(members) > NUM_MEMBERS_LISTED_PER_PREFIX else ""
+            )
+            members_text = ", ".join(
+                f"{member}: {n}" for member, n in members[:NUM_MEMBERS_LISTED_PER_PREFIX]
+                ) + more_text
+            return Item(
+                f"{prefix}: {prefix_counts_all_entities[prefix]} entities ({members_text}), "
+                f"{prefix_counts_named_entities.get(prefix, 0)} with a canon name"
+                )
 
         prefix_items: list[SectionContent] = []
-        for host, prefixes in sorted(hosts.items(), key=lambda x: -sum(totals[p] for p in x[1]))[:NUM_NAMESPACES]:
+        for host, prefixes in sorted(hosts.items(), key=lambda x: -sum(prefix_counts_all_entities[p] for p in x[1]))[:NUM_NAMESPACES]:
             if prefixes == [host]:
                 prefix_items.append(prefix_item(host))
                 continue
@@ -138,16 +151,19 @@ class SpaceTask(ProfileStageTask):
             if len(prefixes) > NUM_NAMESPACES:
                 children.append(Item(f"... {len(prefixes) - NUM_NAMESPACES} more prefixes"))
             prefix_items.append(Item(
-                f"{host}: {sum(totals[p] for p in prefixes)} entities, "
-                f"{sum(named_totals.get(p, 0) for p in prefixes)} with a canon name", children))
+                f"{host}: {sum(prefix_counts_all_entities[p] for p in prefixes)} entities, "
+                f"{sum(prefix_counts_named_entities.get(p, 0) for p in prefixes)} with a canon name", children))
         if len(hosts) > NUM_NAMESPACES:
             prefix_items.append(Item(f"... {len(hosts) - NUM_NAMESPACES} more hosts"))
         example_items: list[SectionContent] = [
             Item(
                 f"{prefix}:",
-                entity_examples(self.kg_manager, SPACE_GROUPING, [prefix], "", 4)
+                get_entity_examples(
+                    self.kg_manager, DEFAULT_SPACE_PARTITION_GROUPING, [prefix],
+                    self.space_editor.name_sparql(), "", 4
+                    )
                 )
-            for prefix, _ in totals.most_common(3)
+            for prefix, _ in prefix_counts_all_entities.most_common(3)
             ]
         size = f"Size: {self.triples} triples."
 
@@ -156,7 +172,7 @@ class SpaceTask(ProfileStageTask):
             f"Default entity space ({source}): " + (", ".join(space) or "none"),
             ], [
             Section(
-                f"Entities per IRI prefix (host, and below it the first path segment) and kind",
+                "Entities per IRI prefix (host, and below it the first path segment) and kind",
                 prefix_items
                 ),
             Section("Examples", example_items),
@@ -189,10 +205,10 @@ class PartitionsTask(ProfileStageTask):
             self.kg_manager, self.input_profile, create_missing=True
             )
         self.stats = self.partition_editor.size_stats()
-        self.default = self.partition_editor.with_partitions(self.input_profile)
+        self.default_profile = self.partition_editor.with_partitions(self.input_profile)
 
         subsections = list(self.partition_editor.input_for_llm())
-        for name in self.partition_editor.names() + [UNCATEGORIZED]:
+        for name in self.partition_editor.member_names() + [UNCATEGORIZED]:
             if self.partition_editor.group_sizes.get(name):
                 title = (f"Partition {name}" if name != UNCATEGORIZED
                          else f"Subjects that match no partition, {UNCATEGORIZED}, not aligned")
@@ -232,8 +248,8 @@ class RolesTask(ProfileStageTask):
         default = self.role_editor.roles
         entity_space, grouping = self.role_editor.entity_space, self.role_editor.grouping
         partition_names, sizes = self.role_editor.scope, self.role_editor.unit_sizes
-        self.default = self.input_profile.model_copy(update={"entity_space": entity_space, "roles": default}, deep=True)
-        self.stats = size_stats(sizes)
+        self.default_profile = self.input_profile.model_copy(update={"entity_space": entity_space, "roles": default}, deep=True)
+        self.stats = {"sizes": sizes}
 
         coverage = predicate_coverage(self.kg_manager, grouping, entity_space)
         canon = ", ".join(
@@ -264,12 +280,12 @@ class RolesTask(ProfileStageTask):
         return self.role_editor.functions()
 
     def stage_rules(self) -> list[str]:
-        return ["Test every predicate or pattern you add with try_pattern first."]
+        return [f"Test every predicate or pattern you add with {ProfileFunctionName.TRY_PATTERN} first."]
 
     def apply_finish(self, fn_args: dict) -> tuple[KgProfile, str]:
         roles = self.role_editor.checked_roles()
-        profile = self.default.model_copy(update={"roles": roles}, deep=True)
-        changed = [f for f in (*ROLE_FIELDS, "structure") if getattr(roles, f) != getattr(self.default.roles, f)]
+        profile = self.default_profile.model_copy(update={"roles": roles}, deep=True)
+        changed = [f for f in (*ROLE_FIELDS, "structure") if getattr(roles, f) != getattr(self.default_profile.roles, f)]
         return profile, "Changed: " + (", ".join(changed) or "nothing (default roles)")
 
 
@@ -287,7 +303,7 @@ class GroupsTask(ProfileStageTask):
     def prepare(self, input: dict) -> Section:
         self.group_editor = GroupEditor.from_kg_profile(self.kg_manager, self.input_profile, create_missing=True)
         self.stats = self.group_editor.size_stats()
-        self.default = self.group_editor.with_groups(self.input_profile)
+        self.default_profile = self.group_editor.with_groups(self.input_profile)
 
         subsections = []
         partner = input.get("partner_profile")
@@ -296,7 +312,7 @@ class GroupsTask(ProfileStageTask):
             subsections.append(
                 Section("Profile of the other knowledge graph of the task", notes.content, notes.subsections))
         subsections += self.group_editor.input_for_llm()
-        for name in self.group_editor.names():
+        for name in self.group_editor.member_names():
             if self.group_editor.group_sizes.get(name):
                 subsections.append(self.group_editor.describe_member(name, f"Group {name}"))
         return Section("Current stage: groups", subsections=subsections)
@@ -335,6 +351,9 @@ class GroupTask(ProfileStageTask):
     role_editor: RoleEditor
     name_type: LocalNameType  # the default local name type
 
+    def id_prefix(self) -> str:
+        return f"{self.stage}-{self.group_name}"
+
     def prepare(self, input: dict) -> Section:
         profile = self.input_profile
         group_name = input.get("group")
@@ -353,7 +372,7 @@ class GroupTask(ProfileStageTask):
         self.name_type = local_name_type(stats)
         self.stats = {"size": sizes.get(group_name, 0),
                       "mode": self.edit_mode.value, "local_names": stats.model_dump()}
-        self.default = profile.with_replaced_group(group_profile.model_copy(update={"local_name_type": self.name_type}))
+        self.default_profile = profile.with_replaced_group(group_profile.model_copy(update={"local_name_type": self.name_type}))
 
         derived = self.role_editor.derived_roles or PredicateRoles()
         derived_elements, added = role_elements_of(derived), set(group_profile.added)
@@ -404,9 +423,9 @@ class GroupTask(ProfileStageTask):
         self.role_editor.check_roles()
         added, removed = self.role_editor.group_deviation()
         name_type = LocalNameType(fn_args.get("local_name_type") or self.name_type)
-        current = self.default.get_group(self.group_name)
+        current = self.default_profile.get_group(self.group_name)
         updated = current.model_copy(update={"local_name_type": name_type, "added": added, "removed": removed})
-        profile = self.default.with_replaced_group(updated)
+        profile = self.default_profile.with_replaced_group(updated)
         return profile, (f"Group {self.group_name}: local names {name_type.value}, "
                          f"{len(added)} elements added or overridden, {len(removed)} removed")
 
@@ -414,10 +433,12 @@ class GroupTask(ProfileStageTask):
 # --- f. revision: resolve the flags, condense the findings ------------------------------
 
 # functions whose successful call makes dependent editors outdated
-SPACE_CHANGES = {"set_entity_space"}
-PARTITION_CHANGES = {"set_partition", "remove_partition"}
-GROUP_CHANGES = {"set_group", "exclude_group", "remove_group"}
-KG_ROLE_CHANGES = {"edit_role", "set_structure_relation", "remove_structure_relation"}
+SPACE_CHANGES = {ProfileFunctionName.SET_ENTITY_SPACE}
+PARTITION_CHANGES = {ProfileFunctionName.SET_PARTITION, ProfileFunctionName.REMOVE_PARTITION}
+GROUP_CHANGES = {ProfileFunctionName.SET_GROUP, ProfileFunctionName.EXCLUDE_GROUP, ProfileFunctionName.REMOVE_GROUP}
+KG_ROLE_CHANGES = {
+    ProfileFunctionName.EDIT_ROLE, ProfileFunctionName.SET_STRUCTURE_RELATION, ProfileFunctionName.REMOVE_STRUCTURE_RELATION
+    }
 FLAG_RESOLUTIONS = (FlagStatus.RESOLVED, FlagStatus.DISMISSED)
 GROUP_PARAMETER = {"type": "string", "description": (
     "The group whose roles to test or change (its own deviation from the KG-wide roles); "
@@ -442,43 +463,76 @@ class ProfileRevisionTask(ProfileStageTask):
     """
     name = "om-profile-revision"
     stage = Stage.REVISION
+    is_revision_task = True
     prompt_file = "profile_revision.txt"
     entity_space_editor: EntitySpaceEditor
     partition_editor: PartitionEditor
     group_editor: GroupEditor
     partition_role_editor: RoleEditor             # the KG-wide roles, coverage per partition
     group_role_editors: dict[str, RoleEditor]     # group name -> its roles; created on first use
-    flags: list[Flag]                             # working copies, with the resolutions
-    findings: list[Finding]                       # working copy, replaced by set_findings
 
     def prepare(self, input: dict) -> Section:
-        profile = self.input_profile
+        input_profile = self.input_profile
         try:
             self.entity_space_editor = EntitySpaceEditor.from_kg_profile(
-                self.kg_manager, profile, create_missing=False
+                self.kg_manager, input_profile, create_missing=False
                 )
-            self.partition_editor = PartitionEditor.from_kg_profile(self.kg_manager, profile, create_missing=False)
-            self.group_editor = GroupEditor.from_kg_profile(self.kg_manager, profile, create_missing=False)
-            self.partition_role_editor = RoleEditor.from_kg_profile(self.kg_manager, profile, create_missing=False)
+            self.partition_editor = PartitionEditor.from_kg_profile(self.kg_manager, input_profile, create_missing=False)
+            self.group_editor = GroupEditor.from_kg_profile(self.kg_manager, input_profile, create_missing=False)
+            self.partition_role_editor = RoleEditor.from_kg_profile(self.kg_manager, input_profile, create_missing=False)
         except ValueError as e:
             raise ValueError(f"The revision needs a complete profile: {e}") from e
         self.group_role_editors = {}
-        self.flags = [flag.model_copy() for flag in profile.flags]
-        self.findings = list(profile.findings)
+        self.new_flags = {
+            id: flag.model_copy() for id, flag in input_profile.flags.items()
+            }
+        self.new_findings = {
+            id: finding.model_copy() for id, finding in input_profile.findings.items()
+            }
         # without finish, the profile stays as it is, the flags stay open
-        self.default = profile.model_copy(deep=True)
-        self.stats = {"open_flags": len(self.open_flag_ids()), "findings": len(self.findings)}
+        self.default_profile = input_profile.model_copy(deep=True)
+        self.stats = {
+            "open_flags": len(self.open_flag_ids()), "findings": len(self.new_findings)
+            }
 
-        open_flags = [Item(format_flag(flag)) for flag in self.flags if flag.status == FlagStatus.OPEN]
         return Section("Current stage: revision", [
-            "The whole profile with its statistics. The roles of a group: show_roles with the group.",
+            "The whole profile with its statistics. The roles of a group: "
+            f"{ProfileFunctionName.SHOW_ROLES} with the group.",
             ], [
             *self.entity_space_editor.input_for_llm(),
             *self.partition_editor.input_for_llm(),
             *self.group_editor.input_for_llm(),
             *self.partition_role_editor.input_for_llm(),
-            Section("Open flags", open_flags or ["none"]),
+            Section(
+                "Open flags with their evidence",
+                self.notes_with_current_evidence("flags")
+                ),
+            Section(
+                "Findings with their evidence",
+                self.notes_with_current_evidence("findings")
+                )
             ])
+
+    def notes_with_current_evidence(self, kind: Literal["flags", "findings"]) -> list[SectionContent]:
+        items = []
+        notes = (
+            self.new_findings if kind == "findings"
+            else {
+                id: flag for id, flag in self.new_flags.items()
+                if flag.status == FlagStatus.OPEN}
+            )
+        for note_id, note in notes.items():
+            try:
+                evidence = self.run_evidence_query(
+                    {"evidence_query": note.evidence_query}
+                ).formatted
+            except FunctionCallException as error:
+                evidence = f"The evidence query fails now: {error}"
+            items.append(Item(
+                f"[{note_id}]{f' on {note.concerns}' if isinstance(note, Flag) else ""} {note.content}",
+                [Item("Evidence from the knowledge graph:\n" + evidence)]
+                ))
+        return items or ["none"]
 
     # --- the current profile and the rebuild of dependent editors ---
 
@@ -498,8 +552,6 @@ class ProfileRevisionTask(ProfileStageTask):
             "entity_space": list(self.entity_space_editor.entity_space),
             "roles": self.partition_role_editor.roles.model_copy(deep=True),
             "groups": groups,
-            "flags": [flag.model_copy() for flag in self.flags],
-            "findings": list(self.findings),
         })
 
     def rebuild_after_space_change(self) -> None:
@@ -567,7 +619,7 @@ class ProfileRevisionTask(ProfileStageTask):
                     "the most entities as ?s. Not used for a group.")}
             functions.append((definition, partial(self.call_role_function, definition["name"])))
         functions.append(({
-            "name": "show_roles",
+            "name": ProfileFunctionName.SHOW_ROLES,
             "description": "Shows the roles with their coverage: KG-wide, or of a group ([kg]: KG-wide, [group]: its own).",
             "parameters": {
                 "type": "object",
@@ -603,12 +655,13 @@ class ProfileRevisionTask(ProfileStageTask):
     # --- flags and findings ---
 
     def open_flag_ids(self) -> list[str]:
-        return [flag.id for flag in self.flags if flag.status == FlagStatus.OPEN]
+        return [flag_id for flag_id, flag in self.new_flags.items()
+                if flag.status == FlagStatus.OPEN]
 
     def flag_and_finding_functions(self) -> list[tuple[dict, Callable[[dict], str]]]:
         return [
             ({
-                "name": "resolve_flag",
+                "name": ProfileFunctionName.RESOLVE_FLAG,
                 "description": (
                     "Closes a flag: resolved if it was right and you changed the profile, dismissed if it was "
                     "wrong. The resolution says what you changed or checked, and why."
@@ -624,37 +677,15 @@ class ProfileRevisionTask(ProfileStageTask):
                     "additionalProperties": False,
                 },
             }, self.resolve_flag),
-            ({
-                "name": "set_findings",
-                "description": (
-                    "Replaces all findings by a condensed list: merge repetitions, drop findings that are "
-                    "wrong or no longer apply, correct the rest, keep what matters for matching."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string"},
-                                "group": {"type": "string", "description": self.about_description()},
-                            },
-                            "required": ["text"],
-                            "additionalProperties": False,
-                        },
-                    }},
-                    "required": ["findings"],
-                    "additionalProperties": False,
-                },
-            }, self.set_findings),
         ]
 
     def resolve_flag(self, fn_args: dict) -> str:
-        flag_id = fn_args.get("id")
-        flag = next((flag for flag in self.flags if flag.id == flag_id), None)
+        flag_id: str = get_required_argument(fn_args, "id")
+        flag = self.new_flags.get(flag_id)
         if flag is None:
-            raise FunctionCallException(f"No flag {flag_id}; flags: {', '.join(f.id for f in self.flags) or 'none'}")
+            raise FunctionCallException(
+                f"No flag {flag_id}; flags: {', '.join(self.new_flags) or 'none'}"
+                )
         try:
             status = FlagStatus(fn_args.get("status"))
         except ValueError as e:
@@ -666,20 +697,6 @@ class ProfileRevisionTask(ProfileStageTask):
             raise FunctionCallException("Give the resolution: what you changed or checked, and why")
         flag.status, flag.resolution_description = status, resolution
         return f"Flag {flag.id} {status.value}. Open flags: {', '.join(self.open_flag_ids()) or 'none'}"
-
-    def set_findings(self, fn_args: dict) -> str:
-        profile = self.current_profile()
-        known = set(profile.partition_names()) | set(profile.group_names())
-        try:
-            findings = [Finding(stage=self.stage, **finding) for finding in fn_args.get("findings") or []]
-        except (ValidationError, TypeError) as e:
-            raise FunctionCallException(f"Invalid findings: {e}") from e
-        unknown = {finding.group for finding in findings if finding.group and finding.group not in known}
-        if unknown:
-            raise FunctionCallException(f"Unknown groups or partitions {sorted(unknown)}; known: {', '.join(sorted(known))}")
-        before = len(self.findings)
-        self.findings = findings
-        return f"Findings replaced: {before} -> {len(findings)}"
 
     # --- stage interface ---
 
@@ -704,11 +721,17 @@ class ProfileRevisionTask(ProfileStageTask):
                 role_editor.check_roles()
             except FunctionCallException as e:
                 raise FunctionCallException(f"Group {group_name}: {e}") from e
+        if len(self.new_findings) > MAX_FINDINGS_AFTER_REVISION:
+            raise FunctionCallException(
+                f"At most {MAX_FINDINGS_AFTER_REVISION} findings after the revision ({len(self.new_findings)} now): "
+                f"merge findings that say the same ({ProfileFunctionName.ADD_FINDING} the merged one, "
+                f"{ProfileFunctionName.REMOVE_FINDING} the others) and remove wrong ones"
+                )
         profile = self.current_profile()
-        counts = {status: sum(flag.status == status for flag in self.flags) for status in FlagStatus}
+        counts = {status: sum(flag.status == status for flag in self.new_flags.values()) for status in FlagStatus}
         summary = (f"Flags: {counts[FlagStatus.RESOLVED]} resolved, {counts[FlagStatus.DISMISSED]} dismissed, "
                    f"{counts[FlagStatus.OPEN]} open ({', '.join(self.open_flag_ids()) or 'none'}); "
-                   f"findings: {self.stats['findings']} -> {len(self.findings)}")
+                   f"findings: {self.stats['findings']} -> {len(self.new_findings)}")
         return profile, summary
 
 

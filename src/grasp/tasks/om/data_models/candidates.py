@@ -15,13 +15,11 @@ from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
     PredicatePattern,
-    StructureRelation,
     StructureRelationKind,
     INVERSE_PREFIX,
     PredicateRoles,
 )
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
-
 
 
 @dataclass(frozen=True)
@@ -75,7 +73,7 @@ class Population(BaseModel):
 
 # values of an entity: one or more roles of its (effective) profile, or an own
 # pattern over ?s (the entity) and ?o (the value); a pattern may compute ?o (BIND)
-type ValuePatternSource = list[str | StructureRelation] | PredicatePattern
+type ValuePatternSource = list[str] | PredicatePattern
 
 
 class ValuePatterns(BaseModel):
@@ -101,6 +99,11 @@ class StringTransform(BaseModel):
         if self.operation == REGEX_REPLACE:
             if not self.pattern:
                 raise ValueError("regex_replace needs a pattern")
+            if re.search(r"\$\d", self.replacement):
+                raise ValueError(
+                    "the replacement uses $1-style groups; Python "
+                    "regex writes them as \\1 (or \\g<1>)"
+                )
             try:
                 re.compile(self.pattern)
             except re.error as e:
@@ -158,6 +161,9 @@ class KeyStrategy(BaseModel):
         return self.values.by_side(side)
 
 
+VECTOR_NORMALIZATION_LEVELS: frozenset[NormalizationLevel] = frozenset({"words", "plural", "inflection"})
+
+
 class VectorStrategy(BaseModel):
     """Candidates are the most similar targets: values are turned into vectors
     (IDF-weighted word tokens, character 3-grams or an embedding model) and
@@ -175,6 +181,16 @@ class VectorStrategy(BaseModel):
             raise ValueError("model is only used with the embedding vectorizer")
         return self
 
+    @model_validator(mode="after")
+    def check_normalization_levels(self) -> Self:
+        levels = self.normalization.levels
+        if len(levels) != 1 or levels[0] not in VECTOR_NORMALIZATION_LEVELS:
+            raise ValueError(
+                "a vector strategy compares on exactly one level: "
+                "words (default), or plural or inflection to let "
+                "inflected forms meet (mainly for idf_tokens)")
+        return self
+
     def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
         """The values compared on one side (roles: unused, all strategies take it)."""
         return self.values.by_side(side)
@@ -187,9 +203,11 @@ type WitnessWeighting = Literal["count", "inverse_degree"]
 
 
 class NeighbourStrategy(BaseModel):
-    """Candidates have witnesses: a pair (x, y) is supported by a matched pair
+    """
+    Candidates have witnesses: a pair (x, y) is supported by a matched pair
     (a, b) with x related to a and y related to b by the same kind of structure
-    relation in the same direction."""
+    relation in the same direction.
+    """
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.NEIGHBOURS] = CandidateStrategyType.NEIGHBOURS
     # the structure relations of these kinds in the profiles, in both directions ...
@@ -198,24 +216,33 @@ class NeighbourStrategy(BaseModel):
         StructureRelationKind.PARTONOMY,
         StructureRelationKind.MEMBERSHIP
         ]
-    # ... unless relations are named here, by name or defined inline, taken as
-    # written ("^part_of": the other direction)
-    relations: list[str | StructureRelation] | None = None
-    depth: int = Field(default=1, ge=1, le=3)
+    # ... unless relations are named here per side, taken as written: names
+    # ("^part_of": the other direction), paths ("part_of/^part_of") or an own
+    # pattern; all relations of a side count as one relation
+    relations: ValuePatterns | None = None
     min_witnesses: int = Field(default=1, ge=1)
     witness_weighting: WitnessWeighting = "count"
     # generate: candidates from the neighbours of matched pairs; corroborate:
     # only count witnesses for the candidates of other generators
     mode: Literal["generate", "corroborate"] = "generate"
 
-    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
-        """The structure relations whose neighbours are compared on one side: the
-        named relations as written, else those of relation_kinds in the profile
-        (roles), in both directions."""
+    def value_pattern_source(
+            self, side: Side, roles: PredicateRoles
+            ) -> ValuePatternSource:
+        """
+        The structure relations whose neighbours are compared
+        on one side: named per side (names, paths or an own pattern);
+        all of a side count as one relation.
+        """
         if self.relations is not None:
-            return self.relations
-        names = [relation.name for relation in roles.structure if relation.kind in self.relation_kinds]
-        both_directions: list[str | StructureRelation] = [*names, *(INVERSE_PREFIX + name for name in names)]
+            return self.relations.by_side(side)
+        names = [
+            relation.name for relation in roles.structure
+            if relation.kind in self.relation_kinds
+            ]
+        both_directions: list[str] = [
+            *names, *(INVERSE_PREFIX + name for name in names)
+            ]
         return both_directions
 
 
@@ -779,6 +806,9 @@ class StrategyResult[H: Hub]:
     # competition set, not only the population), to tell head anchors from
     # specific ones; None: another strategy
     value_wordsets: dict[Side, frozenset[frozenset[str]]] | None = None
+    # key and vector strategies with transforms: per side a few (value, after the
+    # transforms, key on the finest level); None: no transforms or another strategy
+    normalization_examples: dict[Side, list[tuple[str, str, str]]] | None = None
 
 
 class TriedRun(BaseModel):
@@ -887,4 +917,3 @@ class AnchorMerge:
     """
     anchors: list[Anchor]
     conflicts: list[tuple[IRI, IRI, frozenset[str]]]  # (source, target, families)
-

@@ -48,6 +48,7 @@ from grasp.tasks.om.foundation.types import IRI, LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import RDF_TYPE, VOCABULARY, VOCABULARY_PREFIXES
 
 INVERSE_PREFIX = "^"
+PATH_SEPARATOR = "/"
 
 
 class Stage(StrEnum):
@@ -108,6 +109,30 @@ def swap(pattern: str) -> str:
         )
 
 
+def compose(
+        first: PredicatePattern, second: PredicatePattern, step: int
+        ) -> PredicatePattern:
+    """
+    A path of the form 'first/second': ?o of first and ?s
+    of second joined in ?path{step}; the other variables of each
+    get a suffix so that they do not clash.
+    """
+    link = f"?path{step}"
+
+    def rename(branch: str, subject: str, value: str, suffix: str) -> str:
+        return re.sub(
+            r"\?(\w+)\b",
+            lambda match: subject if match.group(1) == "s" else value if match.group(1) == "o"
+            else f"?{match.group(1)}_{suffix}",
+            branch)
+
+    return PredicatePattern(patterns=[
+        f"{rename(first_branch, '?s', link, f'{step}a')} . {rename(second_branch, link, '?o', f'{step}b')}"
+        for first_branch in first.branches_for_union()
+        for second_branch in second.branches_for_union()
+        ])
+
+
 class StructureRelationKind(StrEnum):
     SUBSUMPTION = auto()
     MEMBERSHIP = auto()
@@ -126,7 +151,6 @@ class StructureRelation(RelationAlgebra):
     name: str
     kind: StructureRelationKind
     predicate_pattern: PredicatePattern
-    corresponds_to: str | None = None
     source: Literal["default", "declared", "llm"] = "default"
 
     @model_validator(mode="after")
@@ -138,8 +162,10 @@ class StructureRelation(RelationAlgebra):
         return self
 
 
-def _structure(name: str, kind: StructureRelationKind, predicates: list[str] = [],
-               patterns: list[str] = [], **algebra) -> StructureRelation:
+def _structure(
+    name: str, kind: StructureRelationKind, predicates: list[str] = [],
+        patterns: list[str] = [], **algebra
+        ) -> StructureRelation:
     return StructureRelation(
         name=name, kind=kind,
         predicate_pattern=PredicatePattern(predicates=[IRI(p) for p in predicates], patterns=patterns),
@@ -217,11 +243,24 @@ class PredicateRoles(BaseModel):
 
     def predicate_pattern_by_name(self, name: str) -> PredicatePattern | None:
         """
-        The pattern of a value source by name: a role ("names"), a structure
-        relation ("part_of") or its inverse ("^part_of"). 'None' means
-        a role is not set yet.
+        The pattern of a value source by name: a role ("names"),
+        a structure relation ("part_of") or its inverse ("^part_of")
+        or a path of them joined by '/' ("subclass_of/names": the names of the superclasses).
+        'None' means a role is not set yet.
         Raises ValueError for an unknown name.
         """
+        if PATH_SEPARATOR in name:
+            step_names = name.split(PATH_SEPARATOR)
+            steps = [
+                self.predicate_pattern_by_name(step)
+                for step in step_names
+                ]
+            if any(step is None for step in steps):
+                return None  # a role of the path is not set
+            path = steps[0]
+            for step_number, step in enumerate(steps[1:], start=1):
+                path = compose(path, step, step_number)
+            return path
         if name in ROLE_FIELDS:
             return getattr(self, name)  # may be 'None'
         relation_name = name.removeprefix(INVERSE_PREFIX)
@@ -233,7 +272,7 @@ class PredicateRoles(BaseModel):
             raise ValueError(
                 f"{name!r} is neither a role {ROLE_FIELDS} nor a structure relation "
                 f"{self.structure_relation_names()} (prefix {INVERSE_PREFIX!r}: the "
-                "other direction)"
+                f"other direction; join names with {PATH_SEPARATOR!r} for a path)"
             )
         return (
             relation.predicate_pattern.inverted()
@@ -242,7 +281,7 @@ class PredicateRoles(BaseModel):
             )
 
 
-# the role fields of Roles; also used to refer to a role elsewhere (scope.ValuePatterns)
+# the role fields of Roles
 type RoleName = Literal["names", "synonyms", "definitions", "codes", "cross_references", "noise"]
 ROLE_FIELDS: tuple[RoleName, ...] = get_args(RoleName.__value__)  # a type alias keeps its Literal in __value__
 assert set(PredicateRoles.model_fields) == {*ROLE_FIELDS, "structure"}, "RoleName and the fields of Roles differ"
@@ -263,7 +302,6 @@ class RelationProperties(BaseModel):
     symmetric: bool = False
     transitive: bool = False
     inverse_of: str | None = None
-    corresponds_to: str | None = None
     # provenance, not part of the definition: equal
     # properties set by different stages are one element
     source: Literal["default", "declared", "llm"] = Field(
@@ -560,7 +598,7 @@ class GroupOrigin(StrEnum):
 class GroupDefinition(BaseModel):
     """
     Which entities form a group: its name and membership. Also the form in
-    which a stage defines a group inline (scope.Population).
+    which a strategy defines a group inline (candidates.Population).
     """
     model_config = ConfigDict(extra="forbid")
     name: str
@@ -589,9 +627,10 @@ class GroupProfile(BaseModel):
 
 class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    id: str
     stage: Stage
-    text: str
-    group: str | None = None  # the group (or in stage b the partition) it is about
+    content: str
+    evidence_query: str
 
 
 class FlagStatus(StrEnum):
@@ -604,10 +643,10 @@ class Flag(BaseModel):
     """A later stage's objection to an earlier stage's result."""
     model_config = ConfigDict(extra="forbid")
     id: str
-    raised_by_stage: Stage        # stage that raises the flag
-    concerns_stage: Stage     # stage whose result it questions
+    raised_by_stage: Stage  # stage that raises the flag
+    concerns: str  # finding id, flag id or stage it concerns
     content: str
-    concerns_group: str | None = None
+    evidence_query: str
     status: FlagStatus = FlagStatus.OPEN
     resolution_description: str | None = None
 
@@ -629,8 +668,8 @@ class KgProfile(BaseModel):
     non_competing_pairs: list[WithinKgNonCompetingPartitionPair] = []
     roles: PredicateRoles = PredicateRoles()
     groups: list[GroupProfile] = []
-    findings: list[Finding] = []
-    flags: list[Flag] = []
+    findings: dict[str, Finding] = Field(default_factory=dict)
+    flags: dict[str, Flag] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def non_competing_pairs_name_partitions(self) -> Self:
@@ -811,15 +850,11 @@ def describe_roles(roles: PredicateRoles) -> list[Item]:
     return items
 
 
-def describe_profile(profile: KgProfile,
-                     findings: bool = True,
-                     groups: Iterable[str] | None = None
-                     ) -> Section:
+def describe_profile(profile: KgProfile, findings: bool = True) -> Section:
     """
     The profile as short notes for prompts.
     Patterns read from ?s, the entity, to ?o; structure relations from the
-    specific to the general entity. With groups, only the findings about the
-    whole KG and about these groups (or partitions).
+    specific to the general entity.
     """
     title = "Profile"
     content = []
@@ -896,13 +931,14 @@ def describe_profile(profile: KgProfile,
         subsections.append(roles_subsection)
 
     if findings and profile.findings:
-        shown_findings = [finding for finding in profile.findings
-                          if groups is None or finding.group is None or finding.group in groups]
-        if shown_findings:
-            subsections.append(Section("Findings", [
-                Item(finding.text if finding.group is None else f"{finding.group}: {finding.text}")
-                for finding in shown_findings
-            ]))
+        subsections.append(
+            Section(
+                "Findings", [
+                    Item(finding.content)
+                    for finding in profile.findings.values()
+                    ]
+                )
+            )
 
     return Section(title, content, subsections)
 

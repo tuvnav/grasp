@@ -149,9 +149,11 @@ def prefix_per_group_counts(
     return count_rows(select_rows(manager, sparql), "prefix", "group")
 
 
-def prefix_totals(counts: dict[tuple[str, str], int]) -> Counter[str]:
+def prefix_total_counts(
+        prefix_per_group_counts: dict[tuple[str, str], int]
+        ) -> Counter[str]:
     totals: Counter[str] = Counter()
-    for (prefix, _), n in counts.items():
+    for (prefix, _), n in prefix_per_group_counts.items():
         totals[prefix] += n
     return totals
 
@@ -167,7 +169,7 @@ def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[
         return list(configured), "configured"
     for named_only, source in ((True, "prefix with the most named entities"),
                                (False, "prefix with the most entities")):
-        totals = prefix_totals(prefix_per_group_counts(manager, named_only))
+        totals = prefix_total_counts(prefix_per_group_counts(manager, named_only))
         if totals:
             return [totals.most_common(1)[0][0]], source
     return [], "no entities found"
@@ -222,17 +224,17 @@ def predicate_coverage(
 
 def type_coverage(
     manager: KgManager, grouping: Grouping | None, space: Iterable[str]
-        ) -> dict[str, dict[IRI, int]]:
+        ) -> dict[str, dict[str, int]]:
     """group -> rdf:type value -> entities."""
     sparql = grouping_to_sparql_query(
         manager, grouping, space, "?group ?t (COUNT(DISTINCT ?s) AS ?n)",
         f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?group ?t",
     )
-    coverage: dict[str, dict[IRI, int]] = defaultdict(dict)
+    coverage: dict[str, dict[str, int]] = defaultdict(dict)
     for (group, t), n in count_rows(
             select_rows(manager, sparql), "group", "t"
             ).items():
-        coverage[group][IRI(t)] = n
+        coverage[group][t] = n
     return dict(coverage)
 
 
@@ -308,14 +310,15 @@ def rest(total: dict[str, int], total_size: int, inside: dict[str, int], size: i
 
 
 def members_query(membership: str, space: Iterable[str]) -> str:
-    return f"{{ SELECT DISTINCT ?s WHERE {{ {membership} }} }}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}"
+    return f"""{{ SELECT DISTINCT ?s WHERE {{ {
+        membership} }} }}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}"""
 
 
 def membership_overlap(
     manager: KgManager,
     grouping: Grouping | None,
     space: Iterable[str],
-        membership: str
+    membership: str
         ) -> tuple[int, dict[str, int]]:
     """
     (entities matching a membership pattern, those per current group or
@@ -327,9 +330,15 @@ def membership_overlap(
         f"{members_query(membership, space)}\nOPTIONAL {subquery}\n"
         f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part'
         )
-    overlap = {part: n for (part,), n in count_rows(select_rows(manager, sparql), "part").items()}
-    size = select_rows(manager, f"{make_sparql_prologue(prefixes)}\nSELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-                       f"{members_query(membership, space)}\n}}")
+    overlap = {
+        part: n
+        for (part,), n in count_rows(select_rows(manager, sparql), "part").items()
+        }
+    size = select_rows(
+        manager,
+        f"{make_sparql_prologue(prefixes)}\nSELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
+        f"{members_query(membership, space)}\n}}"
+        )
     return (int(size[0]["n"].value) if size and "n" in size[0] else 0), overlap
 
 
@@ -337,7 +346,7 @@ def member_coverage(
     manager: KgManager, space: Iterable[str], membership: str
         ) -> tuple[dict[str, int], dict[str, int]]:
     """
-    (predicate -> entities, rdf:type value -> entities) among the matches of a membership pattern.
+    (predicate -> num entities, rdf:type value -> num entities) among the matches of a membership pattern.
     """
     members = members_query(membership, space)
     predicates = select_rows(manager, f"SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n?s ?p ?o }} GROUP BY ?p")
@@ -357,7 +366,7 @@ def canon_roles() -> PredicateRoles:
     )
 
 
-# element of a structure relation -> (entities as ?s, entities as ?o)
+# element of a structure relation -> (num entities as ?s, num entities as ?o)
 type DirectionalUsage = dict[RoleElement, tuple[int, int]]
 
 
@@ -514,7 +523,7 @@ class LocalNameStats(BaseModel):
     speaking: float | None = None   # share of local names that look like words
 
 
-def sample_entities(
+def sample_entities_for_local_name_type(
         manager: KgManager,
         grouping: Grouping | None,
         space: Iterable[str],
@@ -560,12 +569,14 @@ def retrieve_values(
     return values
 
 
-NAME_TOKEN = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+NAME_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 
 
 def name_tokens(text: str) -> list[str]:
-    """Lowercased word and number tokens; splits camelCase, _ - ( ) and percent escapes."""
-    return [t.lower() for t in NAME_TOKEN.findall(unquote(text))]
+    """
+    Lowercased word and number tokens; splits camelCase, _ - ( ) and percent escapes.
+    """
+    return [t.lower() for t in NAME_TOKEN_RE.findall(unquote(text))]
 
 
 def is_speaking_name(name: str) -> bool:
@@ -583,17 +594,24 @@ def is_speaking_name(name: str) -> bool:
 
 
 def agrees_with_label(name: str, labels: list[str]) -> bool:
-    """Whether most tokens of the local name occur in one of the labels."""
+    """
+    Whether most tokens of the local name occur in one of the labels.
+    """
     tokens = set(name_tokens(name))
     if not tokens:
         return False
-    return any(len(tokens & set(name_tokens(label))) / len(tokens) >= MIN_TOKEN_AGREEMENT for label in labels)
+    return any(
+        len(tokens & set(name_tokens(label))) / len(tokens)
+        >= MIN_TOKEN_AGREEMENT for label in labels
+        )
 
 
 def local_name_type(stats: LocalNameStats) -> LocalNameType:
-    """Local names agreeing with names, or speaking without names to compare
+    """
+    Local names agreeing with names, or speaking without names to compare
     with, count as names. A speaking local name that differs from the name
-    (e.g. another language) is reported in the statistics."""
+    (e.g. another language) is reported in the statistics.
+    """
     # small groups (e.g. a handful of properties) count if all are labelled
     enough_labelled = stats.labelled >= min(MIN_LABELLED, stats.sample_size)
     if enough_labelled and stats.agreement is not None and stats.agreement >= AGREEMENT_SHARE:
@@ -607,7 +625,9 @@ def local_name_type(stats: LocalNameStats) -> LocalNameType:
     return LocalNameType.OTHER
 
 
-def local_name_stats(manager: KgManager, sample: list[IRI], names: PredicatePattern | None) -> LocalNameStats:
+def local_name_stats(
+        manager: KgManager, sample: list[IRI], names: PredicatePattern | None
+        ) -> LocalNameStats:
     entity_names = retrieve_values(manager, sample, names)
     local_names = {entity: local_name(entity) for entity in sample}
     stats = LocalNameStats(sample_size=len(sample), labelled=sum(entity in entity_names for entity in sample))
@@ -621,13 +641,15 @@ def local_name_stats(manager: KgManager, sample: list[IRI], names: PredicatePatt
 
 
 def group_name_stats(
-    manager: KgManager,
-    grouping: Grouping,
-    space: list[str],
-    group: str,
+        manager: KgManager,
+        grouping: Grouping,
+        space: list[str],
+        group: str,
         roles: PredicateRoles
         ) -> LocalNameStats:
-    sample = sample_entities(manager, grouping, space, where=f'FILTER(?group = "{group}")')
+    sample = sample_entities_for_local_name_type(
+        manager, grouping, space, where=f'FILTER(?group = "{group}")'
+        )
     return local_name_stats(manager, sample.get(group, []), roles.names)
 
 
@@ -635,7 +657,8 @@ def group_defaults(
         manager: KgManager, profile: KgProfile, group: str
         ) -> tuple[GroupProfile, LocalNameStats]:
     """
-    Profile of a group without LLM: the local name type from its sample, its delta unchanged.
+    Profile of a group without LLM: the local name
+    type from its sample, its delta unchanged.
     """
     grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)

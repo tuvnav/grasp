@@ -125,10 +125,8 @@ def named_value_patterns(
         case [*predicate_pattern_refs]:
             named = []
             for pattern_ref in predicate_pattern_refs:
-                if isinstance(pattern_ref, StructureRelation):
-                    named.append((pattern_ref.name, pattern_ref.predicate_pattern))
-                elif (
-                        predicate_pattern := roles.predicate_pattern_by_name(pattern_ref)
+                if (
+                    predicate_pattern := roles.predicate_pattern_by_name(pattern_ref)
                         ) is not None:
                     named.append((pattern_ref, predicate_pattern))
             return named
@@ -164,7 +162,7 @@ def retrieve_linked_entities(
         query = grouping_to_sparql_query(
             manager, grouping, entity_space, "DISTINCT ?s",
             where=f"{values_clause('linked', batch)}\n"
-                  "{ ?s ?p ?linked } UNION { ?linked ?p ?s }"
+            "{ ?s ?p ?linked } UNION { ?linked ?p ?s }"
             )
         linked_entities.update(
             IRI(Binding.from_dict(row["s"]).identifier()) for row in stream_rows(manager, query)
@@ -257,6 +255,28 @@ def build_side_indices(
     return indices_by_level
 
 
+def get_normalization_examples(
+        index: ValueIndex, normalization: Normalization, number: int
+        ) -> list[tuple[str, str, str]]:
+    """
+    (value as retrieved, after the transforms, key on the finest level) of a few
+    values of an index, those the transforms change first: what the transforms
+    and the normalization make of the values.
+    """
+    finest_level = NORMALIZATION_LEVELS[normalization.levels[0]]
+
+    def example(rows: list[ValueRow]) -> tuple[str, str, str]:
+        value = rows[0].raw_projection_value
+        transformed = apply_string_transforms(normalization.transforms, value)
+        return value, transformed, finest_level(transformed)
+
+    examples = [example(rows) for rows in index.values()]
+    changed_by_transform = [entry for entry in examples if entry[0] != entry[1]]
+    unchanged = [entry for entry in examples if entry[0] == entry[1]]
+    # show changed examples first
+    return (changed_by_transform + unchanged)[:number]
+
+
 # structure relations of these kinds correspond across the KGs by their kind and
 # direction (e.g. part_of and UNDEFINED_part_of, subclass_of and skos broader);
 # the others by their name (e.g. two inline relations "domain")
@@ -276,23 +296,33 @@ def relation_key(relation: StructureRelation, inverse: bool) -> str:
     return f"{INVERSE_PREFIX}{base}" if inverse else base
 
 
+NAMED_RELATIONS_KEY = "named"
+
+
 def relation_keys_by_role_name(
-        value_pattern_source: ValuePatternSource, roles: PredicateRoles
+        value_pattern_source: ValuePatternSource,
+        roles: PredicateRoles,
+        named_relations: bool
         ) -> dict[str, str]:
     """
     For each relation of a value source, by the role name of its rows
-    ("part_of", "^part_of", or the name of an inline relation): its relation
-    key. Roles (names, ...) and an own pattern have no relation key.
+    ("part_of", "^part_of"): its relation key. Relations named by the LLM
+    (named_relations: names, paths, an own pattern) all get NAMED_RELATIONS_KEY;
+    otherwise (relation_kinds) roles (names, ...) and an own pattern have none.
     """
+    if named_relations:
+        return {
+            role_name: NAMED_RELATIONS_KEY for role_name, _
+            in named_value_patterns(value_pattern_source, roles)
+            }
     if isinstance(value_pattern_source, PredicatePattern):
         return {}
     keys: dict[str, str] = {}
     for item in value_pattern_source:
-        if isinstance(item, StructureRelation):
-            keys[item.name] = relation_key(item, inverse=False)
-            continue
         relation_name = item.removeprefix(INVERSE_PREFIX)
-        relation = next((relation for relation in roles.structure if relation.name == relation_name), None)
+        relation = next((
+            relation for relation in roles.structure
+            if relation.name == relation_name), None)
         if relation is not None:
             keys[item] = relation_key(relation, inverse=item.startswith(INVERSE_PREFIX))
     return keys

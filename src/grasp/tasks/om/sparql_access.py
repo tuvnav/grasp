@@ -8,6 +8,7 @@ about (also where the entity is the object of a triple, e.g. incoming edges
 a speaking name (e.g. ?linked, ?usage_subject).
 """
 
+import json
 import re
 import hashlib
 from dataclasses import dataclass
@@ -208,12 +209,17 @@ def prepare_query(manager: KgManager, sparql: str) -> str:
 
 
 def stream_rows(manager: KgManager, sparql: str) -> Iterator[dict]:
-    """Layed out to handle big KGs later without the need to fundamentally
-    refactor the whole code."""
-    return stream_json(
-        manager.endpoint, prepare_query(manager, sparql),
-        manager.params, manager.headers, manager.auth
+    """
+    Layed out to handle big KGs later without the need to fundamentally
+    refactor the whole code.
+    """
+    try:
+        yield from stream_json(
+            manager.endpoint, prepare_query(manager, sparql),
+            manager.params, manager.headers, manager.auth
         )
+    except ValueError as error:
+        raise ValueError(query_failure_message(error)) from error
 
 
 def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
@@ -376,3 +382,24 @@ def retrieve_value_groups(
             counts[(entity, predicate_ref)], values
             )
     return groups
+
+
+def query_failure_message(
+        error: Exception, llm_written_patterns: Sequence[str] = ()
+        ) -> str:
+    """
+    The reason of a failed query for the LLM: QLever's "exception" text if the
+    error carries its JSON body, else the first line; without positions, which
+    refer to the whole built query.
+    """
+    error_text = str(error)
+    exception = re.search(r'"exception":\s*"((?:[^"\\]|\\.)*)"', error_text)
+    reason = json.loads(f'"{exception.group(1)}"') if exception else error_text.splitlines()[0]
+    reason = re.sub(r"\s*at position \d+", "", reason)
+    message = f"The SPARQL query failed: {reason}"
+    if llm_written_patterns:
+        message += (
+            " Your pattern (built into a larger query): "
+            + " | ".join(llm_written_patterns)
+            )
+    return message

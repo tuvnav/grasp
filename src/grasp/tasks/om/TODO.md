@@ -1,6 +1,6 @@
 ## Unbedingt notwendig
-- Klarstellen: Welche Ablation brauche ich, welche nicht + Trennung Ablation von echten Konfigurationen für Endprodukt (JudgeType etc.)
-- partition_names_by_entity zentralisieren (nur einmal abrufen)
+- Ablation: DEFAULTS ein- und ausschaltbar
+- partition_names_by_entity zentralisieren (nur einmal abrufen?)
 - Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
 - Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
 - Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
@@ -27,11 +27,8 @@
 ## Optimierungsideen aus Probeläufen
 ### Profiling:
 - Roles: 
-    - Tool für Namen aus lokalen Namen?
     - Präfixierte Prädikate in PredicatePattern korrekt behandeln!
-- Belegpflicht für Funde?
-- Funde optional machen!!
-- Strukturrollen, die über Blank Nodes gehen, zusätzlich ein Beispielpaar zeigen, das das Modell bestätigen muss
+- Strukturrollen, die über Blank Nodes gehen, zusätzlich ein Beispielpaar zeigen, das das Modell bestätigen muss / Strukturrollen möglichst Default + berechnen
 - Shortcut für Profilierung bei standartisierten KGs:
     - Space: Präfix bis einschließlich # bzw. letztem / der deklarierten Entitäten statt nur des Hosts. owl:Ontology-Knoten aus dem Space ausschließen.
     - Partitionen: class/instance konkurrieren nicht, wenn kein Punning vorliegt.

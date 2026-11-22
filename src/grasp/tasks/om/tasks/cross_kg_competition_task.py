@@ -100,7 +100,7 @@ class CrossKgCompetitionTask(GraspTask):
                      + (f" ({manager.description})" if manager.description else ""),
                      editor.input_for_llm()]
             parts += [editor.describe_member(name, f"Partition {name}")
-                      for name in editor.names() if editor.group_sizes.get(name)]
+                      for name in editor.member_names() if editor.group_sizes.get(name)]
             sections.append(format_section(f"Partitions of the {side.value} knowledge graph", "\n\n".join(parts)))
         sections.append(format_section("Partitions of the two knowledge graphs that do not compete",
                                        self.format_cross_kg_pairs()))

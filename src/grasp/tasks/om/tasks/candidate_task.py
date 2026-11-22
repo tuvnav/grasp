@@ -88,6 +88,7 @@ from grasp.tasks.om.foundation.rendering import (
 )
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
+    REGEX_REPLACE,
     TRANSFORM_OPERATIONS,
     NormalizationLevel,
     normalization_level_order,
@@ -113,6 +114,7 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     intersect_level_indices,
     key_entity_pairs_to_candidates,
     neighbour_entity_pairs_to_candidates,
+    get_normalization_examples,
     relation_keys_by_role_name,
     vector_entity_pairs_to_candidates,
     retrieve_entities,
@@ -301,17 +303,21 @@ def draw_trial_sample(
         )
 
 
-def check_value_pattern_source(value_pattern_source: ValuePatternSource, kg_profile: KgProfile) -> None:
-    """Every name in the value source is a role or a structure relation of the
-    profile (checked before querying, for a message the LLM can act on)."""
+def check_value_pattern_source(
+        value_pattern_source: ValuePatternSource, kg_profile: KgProfile
+        ) -> None:
+    """
+    Every name in the value source is a role, a structure relation of the
+    profile or a path of them (checked before querying, for a message the LLM
+    can act on).
+    """
     if not isinstance(value_pattern_source, list):
         return
     for name in value_pattern_source:
-        if isinstance(name, str):
-            try:
-                kg_profile.roles.predicate_pattern_by_name(name)
-            except ValueError as error:
-                raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
+        try:
+            kg_profile.roles.predicate_pattern_by_name(name)
+        except ValueError as error:
+            raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
 
 
 def retrieve_strategy_value_rows(
@@ -377,14 +383,16 @@ def get_key_candidates(
         entity_sample: EntitySample | None = None,
         ) -> tuple[
             dict[tuple[Side, IRI], EntityCandidates], list[KeyHub], list[tuple[IRI, IRI]],
-            dict[Side, frozenset[frozenset[str]]]
+            dict[Side, frozenset[frozenset[str]]],
+            dict[Side, list[tuple[str, str, str]]] | None
         ]:
     """
     The candidates of a key strategy for every entity in its population, on both
     sides, the keys whose entities would give too many entity pairs (above
     max_entity_pairs_per_bucket), the existing equivalences found again, and per
-    side the word sets of all values compared (value_wordsets). entity_sample: a
-    trial run compares only these entities on their side.
+    side the word sets of all values compared (value_wordsets) and, with
+    transforms, a few normalization examples. entity_sample: a trial run
+    compares only these entities on their side.
     Not yet ranked or cut by generator.selection.
     """
     strategy = generator.strategy
@@ -402,6 +410,14 @@ def get_key_candidates(
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
         indices_by_side[side] = build_side_indices(value_rows, strategy.normalization)
 
+    normalization_examples = {
+        side: get_normalization_examples(
+            indices_by_side[side][strategy.normalization.levels[0]],
+            strategy.normalization,
+            NUM_NORMALIZATION_EXAMPLES
+            ) for side in SIDES
+        } if strategy.normalization.transforms else None
+
     # 2. intersect the two sides: entity pairs with their shared keys
     entity_pairs, overfull_keys = intersect_level_indices(
         indices_by_side[Side.SOURCE],
@@ -417,8 +433,13 @@ def get_key_candidates(
         group_names_by_side, partition_names_by_entity, existing_equivalences
         )
     value_wordsets = {side: value_wordsets_of(indices_by_side[side]) for side in SIDES}
-    return (candidates_by_entity, overfull_keys, find_confirmed_equivalences(entity_pairs, existing_equivalences),
-            value_wordsets)
+    return (
+        candidates_by_entity,
+        overfull_keys,
+        find_confirmed_equivalences(entity_pairs, existing_equivalences),
+        value_wordsets,
+        normalization_examples
+        )
 
 
 def value_wordsets_of(indices_by_level: dict[NormalizationLevel, ValueIndex]) -> frozenset[frozenset[str]]:
@@ -438,11 +459,15 @@ def get_vector_candidates(
         max_entity_pairs_per_bucket: int | None = None,
         neighbours_per_text: int = 50,
         entity_sample: EntitySample | None = None,
-        ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[VectorHub], list[tuple[IRI, IRI]]]:
+        ) -> tuple[
+            dict[tuple[Side, IRI], EntityCandidates], list[VectorHub], list[tuple[IRI, IRI]],
+            dict[Side, list[tuple[str, str, str]]] | None
+        ]:
     """
     The candidates of a vector strategy for every entity in its population, on
-    both sides, and the text pairs whose entities would give too many entity
-    pairs (above max_entity_pairs_per_bucket). The strategy compares the texts
+    both sides, the text pairs whose entities would give too many entity
+    pairs (above max_entity_pairs_per_bucket), the existing equivalences found
+    again, and with transforms per side a few normalization examples. The strategy compares the texts
     of one normalization level. neighbours_per_text: how many nearest texts of
     the other side each text keeps (a pre-cut before the selection, larger than
     any top_k). entity_sample: a trial run compares only these entities on their
@@ -461,8 +486,16 @@ def get_vector_candidates(
         kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(kg_profile, generator.population, side)
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
-        # exactly one level: the unpacking fails otherwise
+        # exactly one level (VectorStrategy checks it)
         (index_by_side[side],) = build_side_indices(value_rows, strategy.normalization).values()
+
+    normalization_examples = {
+        side: get_normalization_examples(
+            index_by_side[side],
+            strategy.normalization,
+            NUM_NORMALIZATION_EXAMPLES
+            ) for side in SIDES
+        } if strategy.normalization.transforms else None
 
     # 2. vectorize, build similarity matrix, determine a preliminary
     # number of best neighbours per text on both sides (not top-k yet,
@@ -483,7 +516,8 @@ def get_vector_candidates(
     candidates_by_entity = vector_entity_pairs_to_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, witnesses_by_entity
         )
-    return candidates_by_entity, vector_hubs, find_confirmed_equivalences(entity_pairs, witnesses_by_entity)
+    return (candidates_by_entity, vector_hubs, find_confirmed_equivalences(entity_pairs, witnesses_by_entity),
+            normalization_examples)
 
 
 def get_neighbour_candidates(
@@ -531,7 +565,8 @@ def get_neighbour_candidates(
             )
         relation_keys = relation_keys_by_role_name(
             strategy.value_pattern_source(side, kg_profile.roles),
-            kg_profile.roles
+            kg_profile.roles,
+            named_relations=strategy.relations is not None
         )
         index_by_side[side] = build_side_witness_index(
             witnesses_by_entity[side],
@@ -610,15 +645,16 @@ def run_strategy(
 
     # 1. collect
     value_wordsets = None
+    normalization_examples = None
     match generator.strategy.kind:
         case CandidateStrategyType.KEY:
-            collected, hubs, confirmed_equivalences, value_wordsets = get_key_candidates(
+            collected, hubs, confirmed_equivalences, value_wordsets, normalization_examples = get_key_candidates(
                 managers, alignment_state, generator,
                 partition_names_by_entity, max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
         case CandidateStrategyType.VECTOR:
-            collected, hubs, confirmed_equivalences = get_vector_candidates(
+            collected, hubs, confirmed_equivalences, normalization_examples = get_vector_candidates(
                 managers, alignment_state, generator,
                 partition_names_by_entity, max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
@@ -653,6 +689,7 @@ def run_strategy(
         existing_equivalences=sum(len(witnesses) for witnesses in existing_equivalences_by_entity[Side.SOURCE].values()),
         hubs=hubs,
         value_wordsets=value_wordsets,
+        normalization_examples=normalization_examples
         )
 
 
@@ -704,7 +741,7 @@ class CandidateTaskState:
         return run_id
 
 
-class TaskFunctionName(StrEnum):
+class CandidateFunctionName(StrEnum):
     TRY_STRATEGY = auto()
     RESELECT = auto()
     SHOW_CANDIDATES = auto()
@@ -727,7 +764,7 @@ MAX_ENTITY_PAIRS_PER_BUCKET: dict[CandidateStrategyType, int] = {
 }
 
 
-@func_reg.register(TaskFunctionName.TRY_STRATEGY)
+@func_reg.register(CandidateFunctionName.TRY_STRATEGY)
 def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     try:
         generator = Generator(**fn_args.get("generator", {}))
@@ -777,7 +814,7 @@ def reselect_result(
         )
 
 
-@func_reg.register(TaskFunctionName.RESELECT)
+@func_reg.register(CandidateFunctionName.RESELECT)
 def reselect(state: CandidateTaskState, fn_args: dict) -> str:
     run_id = fn_args.get("run_id")
     if run_id not in state.runs:
@@ -816,7 +853,7 @@ def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
     return run_ensemble
 
 
-@func_reg.register(TaskFunctionName.EVALUATE_RUN_ENSEMBLE)
+@func_reg.register(CandidateFunctionName.EVALUATE_RUN_ENSEMBLE)
 def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
     """
     Merges the candidate lists of tried runs and shows the merge on the
@@ -849,7 +886,7 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
         ))
 
 
-@func_reg.register(TaskFunctionName.FINISH)
+@func_reg.register(CandidateFunctionName.FINISH)
 def finish(state: CandidateTaskState, fn_args: dict) -> str:
     """
     Selects the ensemble of runs whose generators are run in full later,
@@ -921,7 +958,7 @@ def find_listed_entities(
     return found, missing
 
 
-@func_reg.register(TaskFunctionName.SHOW_CANDIDATES)
+@func_reg.register(CandidateFunctionName.SHOW_CANDIDATES)
 def show_candidates(state: CandidateTaskState, fn_args: dict) -> str:
     """
     More candidate lists of a run than its examples: of one side, either of a
@@ -969,6 +1006,7 @@ def show_candidates(state: CandidateTaskState, fn_args: dict) -> str:
 NUM_EXAMPLE_ENTITIES = 3  # entities with candidates shown per side in a result
 NUM_SHOWN_HUBS = 3        # largest hubs shown in a result
 NUM_SHOWN_MATCHES = 2     # matches shown per candidate
+NUM_NORMALIZATION_EXAMPLES = 3  # values shown per side after the transforms and the normalization
 
 
 def display_entity(entity_displays: dict[Side, EntityDisplay], side: Side, entity: IRI) -> str:
@@ -979,6 +1017,25 @@ def display_entity(entity_displays: dict[Side, EntityDisplay], side: Side, entit
 
 def format_share(share: float) -> str:
     return f"{share:.0%}"
+
+
+def format_found_again(result: StrategyResult) -> str | None:
+    """
+    The existing equivalences the run finds again. Their entities are not in
+    the population: the coverage and the other signals leave them out.
+    """
+    if not result.existing_equivalences:
+        return None
+    line = (
+        f"Existing equivalences found again: {len(result.confirmed_equivalences)} of "
+        f"{result.existing_equivalences}. They are left out of the result: entities that already have an "
+        "equivalence get no candidate list and are not counted in the coverage or any other signal, "
+        "so a strategy can find many known equivalences and still show a low coverage."
+        )
+    if result.signals[Side.SOURCE].sampled_side is not None:
+        line += (" Not measured on the sampled side: its sample holds only entities without an equivalence, "
+                 "so this number is no estimate of recall here.")
+    return line
 
 
 def format_signals(signals: StrategySignals) -> Item:
@@ -1269,16 +1326,34 @@ def format_strategy_result(
     (choose_examples; prefetch_shown_entities first). The full result stays in
     the task state (show_candidates).
     """
+    found_again = format_found_again(result)
     subsections = [
         Section(
             "Signals",
-            [format_signals(result.signals[side]) for side in SIDES]
+            [format_signals(result.signals[side]) for side in SIDES] + ([found_again] if found_again else [])
             )
         ]
     if result.hubs:
         hubs_content = format_hubs(result.hubs, entity_displays)
         if hubs_content:
             subsections.append(Section("Hubs", hubs_content))
+
+    if result.normalization_examples:
+        subsections.append(
+            Section(
+                "Values after the transforms and the normalization "
+                "(raw value → transformed → key on the finest level)",
+                [
+                    Item(
+                        f"{side}: " + "; ".join(
+                            f"{value!r} → {transformed!r} → {key!r}"
+                            for value, transformed, key in side_examples)
+                        )
+                    for side, side_examples in result.normalization_examples.items()
+                    ]
+            )
+        )
+
     subsections.append(Section(
         "Example entities",
         [format_selected_candidates(selected, entity_displays) for selected in examples]
@@ -1582,8 +1657,9 @@ GROUP_REFS_SCHEMA = {
 VALUE_SOURCE_SCHEMA = {
     "anyOf": [
         {"type": "array", "items": {"type": "string"},
-         "description": "Role names of the profile (names, synonyms, definitions, codes, cross_references) "
-                        "or names of structure relations"},
+         "description": "Role names of the profile (names, synonyms, definitions, codes, cross_references), "
+                        "names of structure relations ('^name': the other direction), or paths of them joined "
+                        "by '/' (e.g. 'subclass_of/names': the names of the superclasses)"},
         {"type": "object", "properties": {
             "predicates": {"type": "array", "items": {"type": "string"}},
             "patterns": {"type": "array", "items": {"type": "string"},
@@ -1609,7 +1685,7 @@ GENERATOR_SCHEMA = {
         "population": {
             "type": "object",
             "description": "The entities compared. Entities that already have an equivalence get no "
-                           "candidates. Default: rest on both sides.",
+                           "candidates. Default: not yet matched entities inside the name spaces on both sides.",
             "properties": {"source_group_refs": GROUP_REFS_SCHEMA, "target_group_refs": GROUP_REFS_SCHEMA},
         },
         "strategy": {
@@ -1633,15 +1709,28 @@ GENERATOR_SCHEMA = {
                     "type": "object",
                     "description": "key and vector: how values are normalized before they are compared.",
                     "properties": {
-                        "transforms": {"type": "array", "items": {"type": "object", "properties": {
-                            "operation": {"type": "string", "enum": list(TRANSFORM_OPERATIONS)},
-                            "pattern": {"type": "string", "description": "regex_replace only"},
-                            "replacement": {"type": "string"},
-                        }, "required": ["operation"]}},
+                        "transforms": {
+                            "type": "array",
+                            "description": "String transforms applied to every value before the levels. Use them only for what the "
+                            "standard normalization levels cannot do: case, word splitting (camelCase, '-', '_'), word order, plural and "
+                            "inflection are all done by 'levels'.",
+                            "items": {
+                                "type": "object", "properties": {
+                                    "operation": {"type": "string", "enum": [*TRANSFORM_OPERATIONS, REGEX_REPLACE]},
+                                    "pattern": {"type": "string", "description": "regex_replace only: a Python re pattern"},
+                                    "replacement": {
+                                        "type": "string",
+                                        "description": "regex_replace only: Python re syntax; groups as \\1, not $1."
+                                        },
+                                    }, "required": ["operation"]
+                            }
+                        },
                         "levels": {
                             "type": "array", "items": {"type": "string", "enum": list(NORMALIZATION_LEVELS)},
                             "description": "Levels from fine to coarse, in this order; a key pair ranks by "
-                                           "its finest shared level. vector: one level, default words.",
+                                           "its finest shared level. vector: one level, words (default), or "
+                                           "plural or inflection for idf_tokens when the KGs inflect names "
+                                           "differently.",
                         },
                     },
                 },
@@ -1656,9 +1745,14 @@ GENERATOR_SCHEMA = {
                                    "in both directions. Default subsumption, partonomy, membership.",
                 },
                 "relations": {
-                    "type": "array", "items": {"type": "string"},
-                    "description": "neighbours: structure relations by name instead of relation_kinds "
-                                   "('^name': the other direction).",
+                    "type": "object",
+                    "description": "neighbours: the relations per side instead of relation_kinds. All relations "
+                                   "of a side count as one relation, so name only relations that mean the same "
+                                   "(e.g. one run for domain, another for range).",
+                    "properties": {
+                        "source": VALUE_SOURCE_SCHEMA,
+                        "target": {**VALUE_SOURCE_SCHEMA, "description": "Omit: like the source."},
+                    },
                 },
                 "min_witnesses": {"type": "integer", "minimum": 1,
                                   "description": "neighbours: equivalences a pair needs at least. Default 1."},
@@ -1695,7 +1789,7 @@ ENSEMBLE_RUNS_SCHEMA = {
 }
 
 FINISH_DEFINITION = {
-    "name": TaskFunctionName.FINISH,
+    "name": CandidateFunctionName.FINISH,
     "description": "Ends the task: selects the ensemble of tried runs whose strategies are run in full later "
                    "(on all entities, not a sample) and merged. Call it exactly once, at the end.",
     "parameters": {
@@ -1714,7 +1808,7 @@ FINISH_DEFINITION = {
 def candidate_functions() -> list[dict]:
     return [
         {
-            "name": TaskFunctionName.TRY_STRATEGY,
+            "name": CandidateFunctionName.TRY_STRATEGY,
             "description": (
                 "Tries a candidate generator (population, strategy, selection) in a trial run, on a sample "
                 "of the larger side if it is large, and returns the signals per side, the existing "
@@ -1724,7 +1818,7 @@ def candidate_functions() -> list[dict]:
             "parameters": {"type": "object", "properties": {"generator": GENERATOR_SCHEMA}, "required": ["generator"]},
         },
         {
-            "name": TaskFunctionName.RESELECT,
+            "name": CandidateFunctionName.RESELECT,
             "description": "Selects the candidates of a tried run again with another selection, without "
                            "running the strategy again; gives a new run.",
             "parameters": {"type": "object", "properties": {
@@ -1732,7 +1826,7 @@ def candidate_functions() -> list[dict]:
             }, "required": ["run_id", "selection"]},
         },
         {
-            "name": TaskFunctionName.SHOW_CANDIDATES,
+            "name": CandidateFunctionName.SHOW_CANDIDATES,
             "description": "Shows more candidate lists of a run: of a kind matching the signals, or of "
                            "given entities.",
             "parameters": {"type": "object", "properties": {
@@ -1748,7 +1842,7 @@ def candidate_functions() -> list[dict]:
             }, "required": ["run_id"]},
         },
         {
-            "name": TaskFunctionName.EVALUATE_RUN_ENSEMBLE,
+            "name": CandidateFunctionName.EVALUATE_RUN_ENSEMBLE,
             "description": (
                 f"Merges the candidate lists of tried runs per entity (at most {CANDIDATE_BUDGET_PER_ENTITY} "
                 f"candidates, more only if more than that are tied on the first rank) and shows the merge "
@@ -1818,13 +1912,13 @@ class OMCandidateTask(GraspTask):
         return [FINISH_DEFINITION]
 
     def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
-        function = func_reg.Registry.get(fn_name)
+        function = func_reg.handlers.get(fn_name)
         if function is None:
             raise FunctionCallException(f"Unknown function {fn_name}")
         return function(self.state, fn_args)
 
     def done(self, fn_name: str) -> bool:
-        return fn_name == TaskFunctionName.FINISH and self.state.finished
+        return fn_name == CandidateFunctionName.FINISH and self.state.finished
 
     @property
     def default_input_field(self) -> str | None:

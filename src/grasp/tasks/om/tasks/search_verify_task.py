@@ -501,7 +501,7 @@ class SearchVerifyTask(GraspTask):
         return f"You have {steps_left} steps left, including this one. Make sure to call finish before you run out."
 
     def call_function(self, fn_name: str, fn_args: dict, known: set[str], example_indices: dict | None) -> str:
-        function: Callable | None = func_reg.Registry.get(fn_name)
+        function: Callable | None = func_reg.handlers.get(fn_name)
         if function is None:
             raise FunctionCallException(
                 f"Unknown function {fn_name}, use one of {[name.value for name in SearchVerifyFunction]}")

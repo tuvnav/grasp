@@ -19,9 +19,9 @@ specific (the words of a name extended by another name of a KG) and extended
 """
 import random
 from enum import StrEnum, auto
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, WithJsonSchema
 
 from grasp.manager import KgManager
 from grasp.model import Message
@@ -45,7 +45,9 @@ from grasp.tasks.om.data_models.candidates import (
     Population,
     ValuePatterns,
 )
+from grasp.tasks.om.data_models.profile import PredicatePattern
 from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.tasks.om.foundation.text_normalization import STANDARD_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
     get_anchor_strata,
@@ -59,6 +61,7 @@ from grasp.tasks.om.tasks.candidate_task import (
     MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
     MAX_ENTITY_PAIRS_PER_BUCKET,
     CandidateTaskState,
+    format_found_again,
     format_hubs,
     format_share,
     format_start_message,
@@ -70,6 +73,7 @@ from grasp.tasks.om.tasks.candidate_task import (
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content
 from grasp.tasks.om.tasks.prompting import (
     add_equivalence_condition,
+    inline_schema,
     load_prompt,
 )
 from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
@@ -105,13 +109,24 @@ class AnchorListKind(StrEnum):
 # ---------------------------------------------------------------- runs
 
 def anchor_generator(fn_args: dict) -> Generator:
-    """A key generator with the anchor selection from the arguments of try_anchor_strategy."""
+    """
+    A key generator with the anchor selection from the
+    arguments of try_anchor_strategy.
+    """
     try:
+        arguments = AnchorStrategyArguments.model_validate(fn_args)
+        values = ValuePatterns(
+            source=arguments.source_values,
+            target=(
+                arguments.target_values if arguments.target_values is not None
+                else arguments.source_values
+                )
+        )
         return Generator(
-            population=Population(**(fn_args.get("population") or {})),
+            population=arguments.population,
             strategy=KeyStrategy(
-                values=ValuePatterns(**(fn_args.get("values") or {})),
-                normalization=Normalization(**(fn_args.get("normalization") or {})),
+                values=values,
+                normalization=Normalization(levels=arguments.normalization_levels),
                 ),
             selection=ANCHOR_SELECTION,
             )
@@ -120,8 +135,12 @@ def anchor_generator(fn_args: dict) -> Generator:
 
 
 def run_anchors_of(state: CandidateTaskState, run_id: str) -> list[Anchor]:
-    """The anchors of one tried run (a merge of the run alone: no conflicts)."""
-    return merge_anchors(RunEnsemble.model_validate({"runs": [{"run_id": run_id}]}), state.runs).anchors
+    """
+    The anchors of one tried run (a merge of the run alone: no conflicts).
+    """
+    return merge_anchors(RunEnsemble.model_validate(
+        {"runs": [{"run_id": run_id}]}), state.runs
+        ).anchors
 
 
 def run_full_anchor_ensemble(
@@ -345,13 +364,9 @@ def format_anchor_result(
             )
         ]
 
-    if result.existing_equivalences:
-        statistics_content.append(
-            Item(
-            f"existing equivalences found again as key matches: "
-            f"{len(result.confirmed_equivalences)} of {result.existing_equivalences}"
-        )
-        )
+    found_again = format_found_again(result)
+    if found_again:
+        statistics_content.append(Item(found_again))
 
     statistics_subsection = Section("Statistics", statistics_content)
 
@@ -412,29 +427,40 @@ def format_anchor_merge(
 
 # ---------------------------------------------------------------- functions for the LLM
 
-STRATEGY_PROPERTIES = GENERATOR_SCHEMA["properties"]["strategy"]["properties"]
-ANCHOR_STRATEGY_PARAMETERS = {
-    "type": "object",
-    "properties": {
-        "population": {
-            **GENERATOR_SCHEMA["properties"]["population"],
-            "description": "The entities that get anchors. Entities that already have an equivalence get "
-                           "none. Uniqueness is checked against all competing entities of both knowledge "
-                           "graphs, not only the population. Default: rest on both sides.",
-        },
-        "values": {**STRATEGY_PROPERTIES["values"],
-                   "description": "The values compared: a key shared by two entities. Default: names and synonyms."},
-        "normalization": {**STRATEGY_PROPERTIES["normalization"],
-                          "description": "How values are normalized before they are compared; an anchor "
-                                         "records the finest level on which it is unique."},
-    },
-    "additionalProperties": False,
-}
+
+class AnchorStrategyArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    population: Annotated[Population, WithJsonSchema(
+        GENERATOR_SCHEMA["properties"]["population"])
+        ] = Field(
+        default_factory=Population,
+        description="The entities that get anchors. Entities that "
+        "already have an equivalence get none. "
+        "Uniqueness is checked against all competing entities "
+        "of both knowledge graphs, not only "
+        "the population. Default: rest on both sides.")
+    source_values: list[str] | PredicatePattern = Field(
+        default=["names", "synonyms"],
+        description="The values compared, as a key shared by two entities: role names of the profile (names, "
+        "synonyms, definitions, codes, cross_references), or an own pattern over ?s (the entity) "
+        "and ?o (a value of the entity itself, such as a name or a code)."
+        )
+    target_values: list[str] | PredicatePattern | None = Field(
+        default=None, 
+        description="Like source_values; omit it for the same values as the source."
+        )
+    normalization_levels: list[NormalizationLevel] = Field(
+        default = list(STANDARD_LEVELS), min_length = 1,
+        description = "Levels from fine to coarse, in ladder order, on "
+        "which values are compared; an anchor "
+        "records the finest level on which it is unique."
+        )
+
 
 ANCHOR_ENSEMBLE_SCHEMA = {
     "type": "array",
     "description": "Tried runs whose anchors are merged. Runs of one family count as one kind of evidence "
-                   "when the anchors are grouped for certification (e.g. two runs on names in different groups).",
+                 "when the anchors are grouped for certification (e.g. two runs on names in different groups).",
     "items": {
         "type": "object",
         "properties": {
@@ -444,12 +470,14 @@ ANCHOR_ENSEMBLE_SCHEMA = {
         "required": ["run_id"],
         "additionalProperties": False,
     },
+
+
 }
 
 ANCHOR_FINISH_DEFINITION = {
-    "name": AnchorFunctionName.FINISH,
-    "description": "Ends the task: selects the tried runs whose anchors are computed in full later (on all "
-                   "entities, not a sample) and certified. Call it exactly once, at the end.",
+  "name": AnchorFunctionName.FINISH,
+   "description": "Ends the task: selects the tried runs whose anchors are computed in full later (on all "
+                 "entities, not a sample) and certified. Call it exactly once, at the end.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -467,8 +495,8 @@ ANCHOR_FINISH_DEFINITION = {
 
 def anchor_function_definitions() -> list[dict]:
     return [
-        {
-            "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
+      {
+           "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
             "description": (
                 "Tries a key strategy in a trial run and shows its "
                 "anchors: pairs whose key no other competing entity of either knowledge graph shares. It "
@@ -477,9 +505,9 @@ def anchor_function_definitions() -> list[dict]:
                 "paper', so they may name a broader or narrower thing), the existing equivalences found "
                 "again, keys shared by too many entities, and examples. The run gets an id (run-N)."
             ),
-            "parameters": ANCHOR_STRATEGY_PARAMETERS,
-        },
-        {
+           "parameters": inline_schema(AnchorStrategyArguments),
+           },
+       {
             "name": AnchorFunctionName.SHOW_ANCHORS,
             "description": "Shows more anchors of a run, or source entities without an anchor.",
             "parameters": {

@@ -7,7 +7,7 @@ Only key strategies give anchors. Similar names, translations or embeddings give
 
 If no strategy gives reliable anchors, select none: e.g. if the knowledge graphs share no language and no code system, or describe unrelated domains, so that equal names are coincidences. No anchors are better than wrong ones; the candidate stage still searches.
 
-You can try strategies with try_anchor_strategy: other values (names, synonyms, codes, cross-references, or a pattern of your own), another normalization ladder, and other groups on each side (the population). Uniqueness is always checked against all competing entities of both knowledge graphs, so a smaller population does not make its anchors look more unique.
+You can try strategies with try_anchor_strategy: other values (names, synonyms, codes, cross-references, or a pattern of your own), another normalization ladder, and other groups on each side (the population). Anchors come only from an entity's own values. Relations to other entities (superclasses, domain and range, part-of) need anchors first; they are used in the candidate stage, not here. Uniqueness is always checked against all competing entities of both knowledge graphs, so a smaller population does not make its anchors look more unique.
 
 Steps:
 1. Look at the descriptions of the knowledge graphs and at the existing equivalences. Do both describe the same kind of things? Do they have names in a common language? Do the entities carry codes or references of a shared system?
