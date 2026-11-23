@@ -32,33 +32,31 @@ from grasp.tasks.om.data_models.candidates import (
     AnchorMerge,
     AnchorSpecificity,
     AnchorStageResult,
+    CandidateRankIndex,
     CandidateStrategyType,
     Generator,
     KeyStrategy,
     Selection,
-    ParetoIndex,
     RunEnsemble,
     StrategyResult,
     Stratum,
     TriedRun,
     Normalization,
     Population,
+    ValuePatternSource,
     ValuePatterns,
 )
-from grasp.tasks.om.data_models.profile import PredicatePattern
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.text_normalization import STANDARD_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
+    build_candidate_rank_index,
     get_anchor_strata,
     merge_anchors,
-    merge_candidate_runs,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
 from grasp.tasks.om.tasks.candidate_task import (
-    CANDIDATE_BUDGET_PER_ENTITY,
     GENERATOR_SCHEMA,
-    MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
     MAX_ENTITY_PAIRS_PER_BUCKET,
     CandidateTaskState,
     format_found_again,
@@ -72,7 +70,9 @@ from grasp.tasks.om.tasks.candidate_task import (
 )
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content
 from grasp.tasks.om.tasks.prompting import (
+    BLANK_NODE_RULE,
     add_equivalence_condition,
+    format_validation_error,
     inline_schema,
     load_prompt,
 )
@@ -117,10 +117,7 @@ def anchor_generator(fn_args: dict) -> Generator:
         arguments = AnchorStrategyArguments.model_validate(fn_args)
         values = ValuePatterns(
             source=arguments.source_values,
-            target=(
-                arguments.target_values if arguments.target_values is not None
-                else arguments.source_values
-                )
+            target=arguments.target_values
         )
         return Generator(
             population=arguments.population,
@@ -131,7 +128,9 @@ def anchor_generator(fn_args: dict) -> Generator:
             selection=ANCHOR_SELECTION,
             )
     except ValidationError as error:
-        raise FunctionCallException(f"Invalid anchor strategy: {error}") from error
+        raise FunctionCallException(
+            f"Invalid anchor strategy: {format_validation_error(error)}"
+            ) from error
 
 
 def run_anchors_of(state: CandidateTaskState, run_id: str) -> list[Anchor]:
@@ -148,11 +147,11 @@ def run_full_anchor_ensemble(
         alignment_state: AlignmentState,
         run_ensemble: RunEnsemble,
         generators_by_run: dict[str, Generator],
-        ) -> tuple[AnchorMerge, list[Stratum], ParetoIndex]:
+        ) -> tuple[AnchorMerge, list[Stratum], CandidateRankIndex]:
     """
     The full runs of the selected ensemble: the merged anchors, their
-    certification strata, and the competitors of every entity (the uncut
-    Pareto layers of the runs with a wider selection) for judges that see them.
+    certification strata, and the candidate rank index of the runs with a
+    wider selection (COMPETITOR_SELECTION), for the candidate store.
     """
     partition_names_by_entity = retrieve_partition_names(managers, alignment_state)
     runs = {
@@ -163,13 +162,11 @@ def run_full_anchor_ensemble(
         for run_id in run_ensemble.run_ids()
         }
     anchor_merge = merge_anchors(run_ensemble, runs)
-    competitor_merge = merge_candidate_runs(
+    competitor_rank_index = build_candidate_rank_index(
         run_ensemble,
         {run_id: reselect_result(result, COMPETITOR_SELECTION) for run_id, (_, result) in runs.items()},
-        CANDIDATE_BUDGET_PER_ENTITY,
-        MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
         )
-    return anchor_merge, get_anchor_strata(anchor_merge), competitor_merge.uncut_pareto_layers_by_entity
+    return anchor_merge, get_anchor_strata(anchor_merge), competitor_rank_index
 
 
 # ---------------------------------------------------------------- formatting
@@ -439,19 +436,19 @@ class AnchorStrategyArguments(BaseModel):
         "Uniqueness is checked against all competing entities "
         "of both knowledge graphs, not only "
         "the population. Default: rest on both sides.")
-    source_values: list[str] | PredicatePattern = Field(
-        default=["names", "synonyms"],
+    source_values: ValuePatternSource = Field(
+        default="names",
         description="The values compared, as a key shared by two entities: role names of the profile (names, "
         "synonyms, definitions, codes, cross_references), or an own pattern over ?s (the entity) "
         "and ?o (a value of the entity itself, such as a name or a code)."
         )
-    target_values: list[str] | PredicatePattern | None = Field(
-        default=None, 
+    target_values: ValuePatternSource | None = Field(
+        default=None,
         description="Like source_values; omit it for the same values as the source."
         )
     normalization_levels: list[NormalizationLevel] = Field(
-        default = list(STANDARD_LEVELS), min_length = 1,
-        description = "Levels from fine to coarse, in ladder order, on "
+        default=list(STANDARD_LEVELS), min_length=1,
+        description="Levels from fine to coarse, in ladder order, on "
         "which values are compared; an anchor "
         "records the finest level on which it is unique."
         )
@@ -460,7 +457,7 @@ class AnchorStrategyArguments(BaseModel):
 ANCHOR_ENSEMBLE_SCHEMA = {
     "type": "array",
     "description": "Tried runs whose anchors are merged. Runs of one family count as one kind of evidence "
-                 "when the anchors are grouped for certification (e.g. two runs on names in different groups).",
+    "when the anchors are grouped for certification (e.g. two runs on names in different groups).",
     "items": {
         "type": "object",
         "properties": {
@@ -475,9 +472,9 @@ ANCHOR_ENSEMBLE_SCHEMA = {
 }
 
 ANCHOR_FINISH_DEFINITION = {
-  "name": AnchorFunctionName.FINISH,
-   "description": "Ends the task: selects the tried runs whose anchors are computed in full later (on all "
-                 "entities, not a sample) and certified. Call it exactly once, at the end.",
+    "name": AnchorFunctionName.FINISH,
+    "description": "Ends the task: selects the tried runs whose anchors are computed in full later (on all "
+    "entities, not a sample) and certified. Call it exactly once, at the end.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -495,8 +492,8 @@ ANCHOR_FINISH_DEFINITION = {
 
 def anchor_function_definitions() -> list[dict]:
     return [
-      {
-           "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
+        {
+            "name": AnchorFunctionName.TRY_ANCHOR_STRATEGY,
             "description": (
                 "Tries a key strategy in a trial run and shows its "
                 "anchors: pairs whose key no other competing entity of either knowledge graph shares. It "
@@ -504,10 +501,10 @@ def anchor_function_definitions() -> list[dict]:
                 "anchors are head anchors (their name is part of longer names, e.g. 'paper' of 'poster "
                 "paper', so they may name a broader or narrower thing), the existing equivalences found "
                 "again, keys shared by too many entities, and examples. The run gets an id (run-N)."
-            ),
-           "parameters": inline_schema(AnchorStrategyArguments),
-           },
-       {
+                ),
+            "parameters": inline_schema(AnchorStrategyArguments),
+            },
+        {
             "name": AnchorFunctionName.SHOW_ANCHORS,
             "description": "Shows more anchors of a run, or source entities without an anchor.",
             "parameters": {
@@ -523,7 +520,7 @@ def anchor_function_definitions() -> list[dict]:
                 "required": ["run_id"],
                 "additionalProperties": False,
             },
-        },
+            },
         {
             "name": AnchorFunctionName.EVALUATE_ANCHOR_ENSEMBLE,
             "description": "Merges the anchors of tried runs and shows the merge: the anchors per stratum "
@@ -531,7 +528,7 @@ def anchor_function_definitions() -> list[dict]:
                            "different partners in different runs).",
             "parameters": {"type": "object", "properties": {"runs": ANCHOR_ENSEMBLE_SCHEMA},
                            "required": ["runs"], "additionalProperties": False},
-        },
+            },
         ANCHOR_FINISH_DEFINITION,
     ]
 
@@ -540,7 +537,7 @@ def parse_anchor_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
     try:
         run_ensemble = RunEnsemble.model_validate({"runs": runs})
     except ValidationError as error:
-        raise FunctionCallException(f"Invalid runs: {error}") from error
+        raise FunctionCallException(f"Invalid runs: {format_validation_error(error)}") from error
     unknown_run_ids = [run_id for run_id in run_ensemble.run_ids() if run_id not in state.runs]
     if unknown_run_ids:
         raise FunctionCallException(f"Unknown run ids {unknown_run_ids}; existing runs: {list(state.runs)}")
@@ -578,7 +575,9 @@ def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
         anchors = anchors_of_kind(run_anchors_of(state, run_id), kind)[:n]
         prefetch_anchors(anchors, state.entity_displays)
         lines = [format_anchor(anchor, state.entity_displays) for anchor in anchors]
-    return format_display_content([(f"{kind} of {run_id}", lines or ["none"])])
+    return format_display_content(
+        [(f"{kind} of {run_id}", lines or ["none"])]
+        )
 
 
 def evaluate_anchor_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
@@ -644,6 +643,7 @@ class OMAnchorTask(GraspTask):
 
     def rules(self) -> list[str]:
         return [
+            BLANK_NODE_RULE,
             "Try every strategy you want to select with try_anchor_strategy; you can only select tried runs.",
             "Look at the examples, head anchors and ambiguous entities with show_anchors before you judge "
             "a strategy.",

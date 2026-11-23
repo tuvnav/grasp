@@ -24,9 +24,6 @@ from grasp.tasks.om.data_models.candidates import (
 from grasp.tasks.om.data_models.profile import (
     KgProfile,
     PredicatePattern,
-    StructureRelation,
-    StructureRelationKind,
-    INVERSE_PREFIX,
     PredicateRoles,
 )
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
@@ -40,9 +37,8 @@ from grasp.tasks.om.sparql_access import stream_rows, values_clause
 
 # normalized value -> [retrieved rows]. For key and vector strategies
 type ValueIndex = dict[str, list[ValueRow]]
-# (relation key, (source_iri, target_iri)) -> [retrieved rows]; the relation key
-# is the same on both sides for corresponding relations (relation_keys_by_role_name)
-type NeighbourIndex = dict[tuple[str, tuple[IRI, IRI]], list[ValueRow]]
+# (source_iri, target_iri) -> [retrieved rows]
+type NeighbourIndex = dict[tuple[IRI, IRI], list[ValueRow]]
 # (source entity, target entity) -> their pair; P: the pair kind of the strategy
 type EntityPairIndex[P: EntityPair] = dict[tuple[IRI, IRI], P]
 
@@ -58,7 +54,9 @@ def retrieve_value_rows(
 
     if object_iris is not None and not object_iris:
         return  # restricted to no values (e.g. no witnesses yet): no query
-    branches = prepare_value_branches_for_sparql(value_source, roles, object_iris)
+    branches = prepare_value_branches_for_sparql(
+        value_source, roles, object_iris
+        )
 
     if not branches:
         return  # none of the roles is set in the profile: no values
@@ -73,6 +71,8 @@ def retrieve_value_rows(
         entity = IRI(Binding.from_dict(row["s"]).identifier())
         group = Binding.from_dict(row["group"]).value
         role = Binding.from_dict(row["role"]).value
+        if "o" not in row:
+            continue  # the pattern bound no value for this entity
         value_binding = Binding.from_dict(row["o"])
         if value_binding.typ == BindingType.BNODE:
             continue
@@ -122,14 +122,9 @@ def named_value_patterns(
     match value_source:
         case PredicatePattern():
             return [(new_role_name, value_source)]
-        case [*predicate_pattern_refs]:
-            named = []
-            for pattern_ref in predicate_pattern_refs:
-                if (
-                    predicate_pattern := roles.predicate_pattern_by_name(pattern_ref)
-                        ) is not None:
-                    named.append((pattern_ref, predicate_pattern))
-            return named
+        case str():
+            pattern = roles.predicate_pattern_by_name(value_source)
+            return [(value_source, pattern)] if pattern is not None else []
 
 
 def retrieve_entities(
@@ -277,57 +272,6 @@ def get_normalization_examples(
     return (changed_by_transform + unchanged)[:number]
 
 
-# structure relations of these kinds correspond across the KGs by their kind and
-# direction (e.g. part_of and UNDEFINED_part_of, subclass_of and skos broader);
-# the others by their name (e.g. two inline relations "domain")
-RELATION_KINDS_MATCHED_BY_KIND = frozenset({
-    StructureRelationKind.SUBSUMPTION, StructureRelationKind.PARTONOMY, StructureRelationKind.MEMBERSHIP})
-
-
-def relation_key(relation: StructureRelation, inverse: bool) -> str:
-    """The key a relation is compared by across the KGs: "kind:partonomy",
-    "^kind:partonomy" (the other direction) or "name:domain" (prefixed, so that
-    a relation named like a kind cannot collide with it)."""
-    base = (
-        f"kind:{relation.kind.value}"
-        if relation.kind in RELATION_KINDS_MATCHED_BY_KIND
-        else f"name:{relation.name}"
-        )
-    return f"{INVERSE_PREFIX}{base}" if inverse else base
-
-
-NAMED_RELATIONS_KEY = "named"
-
-
-def relation_keys_by_role_name(
-        value_pattern_source: ValuePatternSource,
-        roles: PredicateRoles,
-        named_relations: bool
-        ) -> dict[str, str]:
-    """
-    For each relation of a value source, by the role name of its rows
-    ("part_of", "^part_of"): its relation key. Relations named by the LLM
-    (named_relations: names, paths, an own pattern) all get NAMED_RELATIONS_KEY;
-    otherwise (relation_kinds) roles (names, ...) and an own pattern have none.
-    """
-    if named_relations:
-        return {
-            role_name: NAMED_RELATIONS_KEY for role_name, _
-            in named_value_patterns(value_pattern_source, roles)
-            }
-    if isinstance(value_pattern_source, PredicatePattern):
-        return {}
-    keys: dict[str, str] = {}
-    for item in value_pattern_source:
-        relation_name = item.removeprefix(INVERSE_PREFIX)
-        relation = next((
-            relation for relation in roles.structure
-            if relation.name == relation_name), None)
-        if relation is not None:
-            keys[item] = relation_key(relation, inverse=item.startswith(INVERSE_PREFIX))
-    return keys
-
-
 def find_confirmed_equivalences(
         entity_pairs: EntityPairIndex,
         witnesses_by_entity: ExistingEquivalences,
@@ -343,21 +287,18 @@ def find_confirmed_equivalences(
 def build_side_witness_index(
         witnesses_by_entity: dict[IRI, list[tuple[IRI, IRI]]],
         value_rows: Iterable[ValueRow],
-        relation_keys: dict[str, str],
 ) -> NeighbourIndex:
     """
-    (relation key, witness) → the rows whose neighbour takes part in the
-    witness; a row whose neighbour has no equivalence, or whose role has no
-    relation key (relation_keys_by_role_name), gives no entry.
+    witness → the rows whose neighbour takes part in it; a row whose
+    neighbour has no equivalence gives no entry.
     """
     index: NeighbourIndex = {}
     for row in value_rows:
-        key_of_relation = relation_keys.get(row.role_name)
         witness_pairs = witnesses_by_entity.get(IRI(row.raw_projection_value))
-        if key_of_relation is None or witness_pairs is None:
+        if witness_pairs is None:
             continue
         for witness_pair in witness_pairs:
-            index.setdefault((key_of_relation, witness_pair), []).append(row)
+            index.setdefault(witness_pair, []).append(row)
     return index
 
 
@@ -427,8 +368,8 @@ def intersect_level_indices(
 type CompetingCounterparts = dict[tuple[Side, IRI, NormalizationLevel], set[IRI]]
 
 
-# a bucket of a witness index: (key, rows by source entity, rows by target entity)
-type WitnessBucket = tuple[tuple[str, tuple[IRI, IRI]], dict[IRI, list[ValueRow]], dict[IRI, list[ValueRow]]]
+# a bucket of a witness index: (witness, rows by source entity, rows by target entity)
+type WitnessBucket = tuple[tuple[IRI, IRI], dict[IRI, list[ValueRow]], dict[IRI, list[ValueRow]]]
 
 
 def add_neighbour_match(
@@ -439,7 +380,7 @@ def add_neighbour_match(
         witness_weighting: WitnessWeighting,
         ) -> None:
     """Adds the match of one bucket to the pair of two of its entities (creating the pair)."""
-    (relation_key, witness), rows_by_source_entity, rows_by_target_entity = bucket
+    witness, rows_by_source_entity, rows_by_target_entity = bucket
     entity_pairs.setdefault(
         (source_entity, target_entity),
         NeighbourEntityPair(source_entity=source_entity, target_entity=target_entity, matches=[],
@@ -448,7 +389,6 @@ def add_neighbour_match(
         NeighbourMatch(
             source_rows=tuple(rows_by_source_entity[source_entity]),
             target_rows=tuple(rows_by_target_entity[target_entity]),
-            relation_key=relation_key,
             witness=witness,
             num_source_entities=len(rows_by_source_entity),
             num_target_entities=len(rows_by_target_entity),
@@ -465,7 +405,7 @@ def compare_witness_indices(
 ) -> tuple[EntityPairIndex[NeighbourEntityPair], list[NeighbourHub]]:
     """
     The entity pairs that share witnesses, in two passes:
-    1. every bucket (a key of both indices: relation key and witness) with at
+    1. every bucket (a witness of both indices) with at
        most max_entity_pairs_per_bucket entity pairs creates its pairs; a larger
        one (a hub) is set aside;
     2. a hub creates no pairs, but adds its match to the pairs of pass 1 whose
@@ -481,16 +421,28 @@ def compare_witness_indices(
         target_bucket_rows = target_index.get(key)
         if not target_bucket_rows:
             continue
-        bucket: WitnessBucket = (key, group_value_rows_by_entity(source_bucket_rows),
-                                 group_value_rows_by_entity(target_bucket_rows))
+        bucket: WitnessBucket = (
+            key,
+            group_value_rows_by_entity(source_bucket_rows),
+            group_value_rows_by_entity(target_bucket_rows)
+            )
         _, rows_by_source_entity, rows_by_target_entity = bucket
-        if (max_entity_pairs_per_bucket is not None
-                and len(rows_by_source_entity) * len(rows_by_target_entity) > max_entity_pairs_per_bucket):
+        if (
+            max_entity_pairs_per_bucket is not None
+                and len(rows_by_source_entity) * len(rows_by_target_entity)
+                > max_entity_pairs_per_bucket
+                ):
             hub_buckets.append(bucket)
             continue
         for source_entity in rows_by_source_entity:
             for target_entity in rows_by_target_entity:
-                add_neighbour_match(entity_pairs, bucket, source_entity, target_entity, witness_weighting)
+                add_neighbour_match(
+                    entity_pairs,
+                    bucket,
+                    source_entity,
+                    target_entity,
+                    witness_weighting
+                    )
 
     # 2. the hubs add their matches to the existing pairs: per entity, the
     # numbers of the hub buckets it is in; a pair gets the hubs both its
@@ -517,8 +469,10 @@ def compare_witness_indices(
     hubs = [
         NeighbourHub(num_source_entities=len(rows_by_source_entity),
                      num_target_entities=len(rows_by_target_entity),
-                     relation_key=relation_key, witness=witness)
-        for (relation_key, witness), rows_by_source_entity, rows_by_target_entity in hub_buckets
+                     witness=witness,
+                     relations=(next(iter(rows_by_source_entity.values()))[0].role_name,
+                                next(iter(rows_by_target_entity.values()))[0].role_name))
+        for witness, rows_by_source_entity, rows_by_target_entity in hub_buckets
     ]
     return entity_pairs, hubs
 
@@ -744,6 +698,7 @@ def entity_pairs_to_candidates[P: EntityPair](
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         build_candidate: Callable[[P, Side], Candidate],
         existing_equivalences: "ExistingEquivalences | None" = None,
+        rival_keys: Collection[tuple[IRI, IRI]] = frozenset()
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     For each entity: the candidates and the summarized other counterparts in its
@@ -755,6 +710,9 @@ def entity_pairs_to_candidates[P: EntityPair](
     entity is
     - not counted at all if an entity has no partition (uncategorized),
     - non-competing (counted by its partition) if the partitions do not compete,
+    - a rival over the other name role if the pair is in rival_keys (a key run
+      on a name role: matched only over the other name role), counted by the
+      rank key of the pair only,
     - a candidate if it is in its own population (built by build_candidate from
       the pair and the side of the entity: the strategy's own candidate fields),
       marked candidate_already_matched if it already has an equivalence (it
@@ -763,30 +721,44 @@ def entity_pairs_to_candidates[P: EntityPair](
       rank key of the pair).
     Pairs with both entities outside their population are left out.
     """
-    matched_entities = {side: set(existing_equivalences[side]) if existing_equivalences else set()
-                        for side in SIDES}
+    already_matched_entities = {
+        side: set(existing_equivalences[side])
+        if existing_equivalences else set()
+        for side in SIDES}
     candidates_by_entity: dict[tuple[Side, IRI], EntityCandidates] = {}
 
     for entity_pair in entity_pairs.values():
-        competing = partitions_compete(alignment_state, entity_pair, partition_names_by_entity)
+        competing = partitions_compete(
+            alignment_state, entity_pair, partition_names_by_entity
+            )
         if competing is None:
             continue
         groups_by_side = entity_pair.entity_groups()
-        in_population = {side: not population_group_names[side].isdisjoint(groups_by_side[side]) for side in SIDES}
+        in_population = {
+            side: not population_group_names[side].isdisjoint(
+                groups_by_side[side]
+                ) for side in SIDES
+            }
 
         for side in SIDES:
             other_side = Side.other_side(side)
             entity = entity_pair.get_entity(side)
-            if not in_population[side] or entity in matched_entities[side]:
+            if not in_population[side] or entity in already_matched_entities[side]:
                 continue  # only entities in population without an equivalence get candidates
             entity_candidates = candidates_by_entity.setdefault(
                 (side, entity), EntityCandidates(side=side, entity=entity))
             if not competing:
                 other_partition = partition_names_by_entity[other_side][entity_pair.get_entity(other_side)]
                 entity_candidates.num_non_competing_counterparts_by_partition[other_partition] += 1
+            elif (entity_pair.source_entity, entity_pair.target_entity) in rival_keys:
+                # matched only over the other name role:
+                # takes its place, but is no candidate
+                entity_candidates.num_counterparts_outside_population_by_rank[
+                    entity_pair.rank_key
+                    ] += 1
             elif in_population[other_side]:
                 candidate = build_candidate(entity_pair, side)
-                if entity_pair.get_entity(other_side) in matched_entities[other_side]:
+                if entity_pair.get_entity(other_side) in already_matched_entities[other_side]:
                     candidate = dataclasses.replace(candidate, candidate_already_matched=True)
                 entity_candidates.candidates.append(candidate)
             else:
@@ -796,12 +768,51 @@ def entity_pairs_to_candidates[P: EntityPair](
     return candidates_by_entity
 
 
+def split_name_key_runs(
+        entity_pairs: EntityPairIndex[KeyEntityPair],
+        set_role_names: dict[Side, str]
+) -> tuple[EntityPairIndex[KeyEntityPair], set[tuple[IRI, IRI]]]:
+    """
+    The pairs of a key run on a name role, compared over all name roles: a pair
+    with matches between the set roles keeps only those (a candidate pair);
+    a pair without any is a rival of its entities. Returns all pairs and the
+    keys of the rival pairs.
+    """
+    def is_set_role(row: ValueRow, side: Side) -> bool:
+        return row.role_name == set_role_names[side]
+
+    index: EntityPairIndex[KeyEntityPair] = {}
+    rival_keys: set[tuple[IRI, IRI]] = set()
+
+    for iri_pair, entity_pair_object in entity_pairs.items():
+        set_role_matches = [
+            dataclasses.replace(
+                match,
+                source_rows=tuple(row for row in match.source_rows if is_set_role(row, Side.SOURCE)),
+                target_rows=tuple(row for row in match.target_rows if is_set_role(row, Side.TARGET)),
+            ) for match in entity_pair_object.matches
+            if any(is_set_role(row, Side.SOURCE) for row in match.source_rows)
+            and any(is_set_role(row, Side.TARGET) for row in match.target_rows)
+        ]
+
+        if set_role_matches:
+            index[iri_pair] = dataclasses.replace(
+                entity_pair_object, matches=set_role_matches
+            )
+        else:
+            index[iri_pair] = entity_pair_object
+            rival_keys.add(iri_pair)
+
+    return index, rival_keys
+
+
 def key_entity_pairs_to_candidates(
         alignment_state: AlignmentState,
         entity_pairs: EntityPairIndex[KeyEntityPair],
         population_group_names: dict[Side, set[str]],
         partition_names_by_entity: dict[Side, dict[IRI, str]],
         existing_exquivalences: "ExistingEquivalences | None" = None,
+        rival_keys: Collection[tuple[IRI, IRI]] = frozenset()
         ) -> dict[tuple[Side, IRI], EntityCandidates]:
     """
     entity_pairs_to_candidates for the key strategy: 
@@ -818,6 +829,7 @@ def key_entity_pairs_to_candidates(
             entity_pair, side, counterparts
             ),
         existing_equivalences=existing_exquivalences,
+        rival_keys=rival_keys
     )
 
 

@@ -3,12 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from grasp.configs import GraspConfig
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
+
+# a rule of every task with SPARQL functions: models copy blank node labels from
+# results into their queries, where they name no node
+BLANK_NODE_RULE = (
+    "Blank nodes (shown as _:bn…) cannot be named in a query; reach them through the "
+    "triple that links them to an entity (e.g. ?s ?p ?node . ?node ?q ?value)."
+    )
 
 
 def load_prompt(filename: str) -> str:
@@ -76,3 +83,16 @@ def inline_schema(
         return node
 
     return resolve(schema)
+
+
+def format_validation_error(error: ValidationError) -> str:
+    """
+    One line per error: where (dotted path of field names and list positions)
+    and what, without pydantic's links and its internal names of the
+    alternatives of a type (e.g. "list[str]", "function-after[...]").
+    """
+    def path(location: tuple) -> str:
+        parts = [str(part) for part in location if isinstance(part, int) or str(part).isidentifier()]
+        return ".".join(parts) or "input"
+
+    return "; ".join(f"{path(detail['loc'])}: {detail['msg']}" for detail in error.errors())

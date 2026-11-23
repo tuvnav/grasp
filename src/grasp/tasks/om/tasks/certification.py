@@ -30,12 +30,10 @@ from grasp.manager import KgManager
 from grasp.model import Message, get_model
 from grasp.tasks import get_task
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.candidates import (
-    ParetoIndex,
-    Stratum,
-)
+from grasp.tasks.om.data_models.candidates import Stratum
 from grasp.tasks.om.data_models.verification import (
     RECALL_STRATA,
+    CandidatesOf,
     CertificationParams,
     CertificationResult,
     JudgeVariant,
@@ -59,7 +57,6 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     retrieve_linked_entities,
 )
 from grasp.tasks.om.tasks.candidate_task import sample_position
-from grasp.tasks.om.kg_operations.candidate_selection import flatten_layers
 from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"
@@ -405,52 +402,41 @@ def certify_strata(
 
 # ---------------------------------------------------------------- judge input
 
-def ranked_candidates(
-        pareto_index: ParetoIndex,
-        side: Side,
-        entity: IRI
-        ) -> list[IRI]:
-    """
-    The candidates of an entity in rank order (Pareto layers, then sublayers);
-    within a sublayer (tied) sorted, so that the choice is the same in every run.
-    """
-    return flatten_layers(pareto_index.get((side, entity), []))
-
-
 def choose_competitors(
-        pareto_index: ParetoIndex,
+        candidates_of: CandidatesOf,
         pair: tuple[IRI, IRI],
-        num_per_side: int
+        max_per_side: int
         ) -> dict[Side, list[IRI]]:
     """
-    The best-ranked rivals of the pair on each side. The rivals of the source
-    entity are source entities, so they come from the candidate list of the
-    target entity, and vice versa; the partner of the pair is left out.
+    The best-ranked rivals of the pair on each side, from all candidates the
+    strategies found so far. The rivals of the source entity are source
+    entities, so they are the candidates of the target entity, and vice
+    versa; the partner of the pair is left out.
     """
     source_entity, target_entity = pair
     source_rivals = [
-        candidate for candidate in ranked_candidates(pareto_index, Side.TARGET, target_entity)
+        candidate for candidate in candidates_of(Side.TARGET, target_entity)
         if candidate != source_entity
         ]
     target_rivals = [
-        candidate for candidate in ranked_candidates(pareto_index, Side.SOURCE, source_entity)
+        candidate for candidate in candidates_of(Side.SOURCE, source_entity)
         if candidate != target_entity
         ]
     return {
-        Side.SOURCE: source_rivals[:num_per_side],
-        Side.TARGET: target_rivals[:num_per_side]
+        Side.SOURCE: source_rivals[:max_per_side],
+        Side.TARGET: target_rivals[:max_per_side]
         }
 
 
 def verify_input_builder(
         alignment_state: AlignmentState,
-        competitor_index: ParetoIndex | None,
+        candidates_of: CandidatesOf | None,
         num_competitors_per_side: int = NUM_COMPETITORS_PER_SIDE
         ) -> BuildVerifyInput:
     """
     Builds the judge's input of a pair: the two KGs with their profiles and,
-    with a competitor index (the uncut pareto index resulting from the merge
-    of runs), the rivals of the pair. Without one, no competitors.
+    with candidates_of (all candidates found so far per entity, best first),
+    the rivals of the pair. Without it, no competitors.
     """
     def build_verify_input(pair: tuple[IRI, IRI]) -> VerifyInput:
         return VerifyInput(
@@ -461,8 +447,8 @@ def verify_input_builder(
             source_iri=pair[0],
             target_iri=pair[1],
             competitors=(
-                choose_competitors(competitor_index, pair, num_competitors_per_side)
-                if competitor_index is not None else {}
+                choose_competitors(candidates_of, pair, num_competitors_per_side)
+                if candidates_of is not None else {}
                 )
             )
 
@@ -472,7 +458,7 @@ def verify_input_builder(
 def certify(
         alignment_state: AlignmentState,
         strata: list[Stratum],
-        competitor_index: ParetoIndex | None,
+        candidates_of: CandidatesOf,
         judge_variant: JudgeVariant,
         judge_for_stratum: JudgeForStratum,
         certification_params: CertificationParams,
@@ -481,13 +467,12 @@ def certify(
     Certifies every stratum of pairs of the alignment state's two KGs.
     judge_for_stratum: the judge function per stratum, built by the caller
     with judge_variant (which here only selects the competitors and names the
-    result). competitor_index: the uncut Pareto layers of the merge (the cut
-    ones of an anchor may hold its partner only); used only by variants with
-    competitors.
+    result). candidates_of: all candidates found so far per entity, best
+    first; used only by variants with competitors.
     """
     build_verify_input = verify_input_builder(
         alignment_state,
-        competitor_index if judge_variant.competitors else None,
+        candidates_of if judge_variant.competitors else None,
         )
     certified_strata = certify_strata(
         strata,

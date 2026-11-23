@@ -22,7 +22,7 @@ from grasp.tasks.om.data_models.candidates import (
     Candidate, StrategyResult, StrategySignals, Stratum, VennIndex,
 
     )
-from grasp.tasks.om.data_models.verification import CandidateSignal, FocusEntity, JudgingUnit, ListedCandidate
+from grasp.tasks.om.data_models.verification import CandidateSignal, CandidatesOf, FocusEntity, JudgingUnit, ListedCandidate
 from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
@@ -596,14 +596,20 @@ def families_by_pair(venn_index: VennIndex) -> dict[tuple[IRI, IRI], frozenset[s
     return {pair: families for families, pairs in venn_index.items() for pair in pairs}
 
 
-def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[JudgingUnit, str]]:
+def build_judging_units(
+        merged_candidates: MergedCandidates,
+        candidates_of: CandidatesOf
+        ) -> list[tuple[JudgingUnit, str]]:
     """
     The units of the candidate judging, each with its stratum (for the
     evaluation only): every mutual pair (each entity the other's only best
     candidate) with both cut lists, and every entity with a cut list, on
     both sides, alone (so an entity of a mutual pair is judged three times:
-    conflicts between the judgments are information). Stratum:
-    kind/cell of the best pair/list length class, e.g. "source/key+vector/2-3".
+    conflicts between the judgments are information). After the cut list
+    of the round, every further candidate the strategies found so far
+    (candidates_of: this and earlier stages, best first), without layer and
+    signals. Stratum: kind/cell of the best pair/length class of the cut list,
+    e.g. "source/key+vector/2-3".
     """
     layers_by_entity = merged_candidates.pareto_layers_by_entity
     cell_of = families_by_pair(merged_candidates.venn_index)
@@ -612,7 +618,8 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
 
     def listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
         """
-        The candidates in list order, with their Pareto layer and the best rank per family.
+        The candidates in list order, with their Pareto layer and the best
+        rank per family; then the further candidates found so far.
         """
         ranks_by_candidate = merged_candidates.candidate_rank_index.get((side, entity), {})
         listed = []
@@ -627,6 +634,12 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
                     signals=[CandidateSignal(family=family, rank=rank)
                              for family, rank in sorted(best_rank_by_family.items())],
                     ))
+        listed_entities = {listed_candidate.entity for listed_candidate in listed}
+        listed.extend(
+            ListedCandidate(entity=candidate, pareto_layer=None, signals=[])
+            for candidate in candidates_of(side, entity)
+            if candidate not in listed_entities
+            )
         return listed
 
     def focus_entity(side: Side, entity: IRI) -> FocusEntity:
@@ -642,14 +655,19 @@ def build_judging_units(merged_candidates: MergedCandidates) -> list[tuple[Judgi
     units: list[tuple[JudgingUnit, str]] = []
     for (side, entity), layers in sorted(layers_by_entity.items()):
         candidates = flatten_layers(layers)
+
         if not candidates:
             continue
+
         units.append((
             JudgingUnit(focus=[focus_entity(side, entity)]),
             f"{Side(side).value}/{venn_cell_name(side, entity, candidates[0])}/{list_length_class(len(candidates))}"
             ))
+
         best = only_best_candidate(layers)
+
         if Side(side) == Side.SOURCE and best is not None:
+
             partner_layers = layers_by_entity.get((Side.TARGET, best), [])
             if only_best_candidate(partner_layers) == entity:
                 units.append((
@@ -695,12 +713,15 @@ def extension_counter(wordsets: frozenset[frozenset[str]]) -> Callable[[frozense
 
 
 def compares_names(generator: Generator) -> bool:
-    """The key strategy compares names (roles names, synonyms) on both sides."""
+    """
+    The key strategy compares names (roles names, synonyms) on both sides.
+    """
     strategy = generator.strategy
     if not isinstance(strategy, KeyStrategy):
         return False
     return all(
-        isinstance(source := strategy.values.by_side(side), list) and set(source) <= NAME_ROLES
+        isinstance(value_source := strategy.values.by_side(side), str)
+        and value_source in NAME_ROLES
         for side in SIDES
         )
 

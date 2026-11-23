@@ -116,8 +116,11 @@ def presented_entities(unit: JudgingUnit, variant: CandidateJudgeVariant) -> dic
 
 def format_signals(candidate: ListedCandidate) -> str:
     """
-    e.g. 'Pareto layer 1; key: rank 1, vector: rank 3'.
+    e.g. 'Pareto layer 1; key: rank 1, vector: rank 3'; for a candidate
+    outside the round's list: 'found by a strategy, not in this round's ranked list'.
     """
+    if candidate.pareto_layer is None:
+        return "found by a strategy, not in this round's ranked list"
     ranks = ", ".join(f"{signal.family}: rank {signal.rank}" for signal in candidate.signals)
     return f"Pareto layer {candidate.pareto_layer}" + (f"; {ranks}" if ranks else "")
 

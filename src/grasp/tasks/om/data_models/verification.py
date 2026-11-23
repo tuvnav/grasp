@@ -11,6 +11,10 @@ from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
+# all candidates the strategies found so far for an entity (side, IRI), best first
+type CandidatesOf = Callable[[Side, IRI], list[IRI]]
+
+
 class VerdictOption(StrEnum):
     ACCEPT = "accept"
     REJECT = "reject"
@@ -156,16 +160,21 @@ class ListedCandidate(BaseModel):
     """A candidate of a focus entity's list, with the signals that ranked it."""
     model_config = ConfigDict(extra="forbid", frozen=True)
     entity: IRI
-    pareto_layer: int  # 1: no other candidate ranks better in every run
+    # 1: no other candidate ranks better in every run of this round; None:
+    # found by a strategy (this or an earlier stage), but not in this round's list
+    pareto_layer: int | None
     signals: list[CandidateSignal] = []
 
 
 class FocusEntity(BaseModel):
-    """An entity a judge has to find the partner(s) of, with its candidates."""
+    """
+    An entity a judge has to find the partner(s) of, with its candidates.
+    """
     model_config = ConfigDict(extra="forbid", frozen=True)
     side: Side
     entity: IRI
-    # the cut Pareto list in rank order; empty: a bare search
+    # the cut Pareto list of the round in rank order, then every further
+    # candidate found so far, best first; empty: a bare search
     candidates: list[ListedCandidate] = []
 
     @property

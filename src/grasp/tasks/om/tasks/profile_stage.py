@@ -104,7 +104,7 @@ from grasp.tasks.om.sparql_access import (
     select_rows,
     union_of,
 )
-from grasp.tasks.om.tasks.prompting import inline_schema, load_prompt
+from grasp.tasks.om.tasks.prompting import BLANK_NODE_RULE, format_validation_error, inline_schema, load_prompt
 from grasp.utils import FunctionCallException, format_section
 
 
@@ -678,7 +678,7 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
                 self.kg_manager, grouping, self.entity_space
                 )
         except Exception as e:
-            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+            raise FunctionCallException(query_failure_message(e)) from e
 
     def describe_member(self, name: str, title: str) -> Section:
         """
@@ -1051,7 +1051,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
                                    predicate_coverage(self.kg_manager, merged, self.entity_space).get(ALL, {}).items()}
             self.all_types = type_coverage(self.kg_manager, merged, self.entity_space).get(ALL, {})
         except Exception as e:
-            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+            raise FunctionCallException(query_failure_message(e)) from e
 
     def sizes_outside_of_member(self, kind: Literal["predicates", "types"], name: str) -> tuple[dict[str, int], int]:
         if kind == "predicates":
@@ -1171,7 +1171,7 @@ class GroupEditor(GroupingEditor[GroupDefinition]):
         try:
             excluded_share = self.excluded_share(exclusions)
         except Exception as e:
-            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+            raise FunctionCallException(query_failure_message(e)) from e
         result = f"Group {name} {'excluded' if excluded else 'included'}; {excluded_share:.0%} of the entities in groups are excluded now."
         if excluded and excluded_share > LARGE_EXCLUDED_GROUP_SHARE:
             result += (" This is a large part. Exclude only entities that would not be matched for this task; "
@@ -1466,7 +1466,11 @@ class RoleEditor(Editor):
                 usage_by_direction
                 )
         except Exception as e:
-            raise FunctionCallException(f"The SPARQL query failed: {e}") from e
+            own_patterns = [
+                element.definition for element in new_elements
+                if element.kind == RoleElementKind.PATTERN and isinstance(element.definition, str)
+                ]
+            raise FunctionCallException(query_failure_message(e, own_patterns)) from e
         for member, counts in usage.items():
             self.role_element_usage.setdefault(member, {}).update(counts)
         for member, counts in usage_by_direction.items():
@@ -1546,7 +1550,7 @@ class RoleEditor(Editor):
                 )
         except ValidationError as e:
             raise FunctionCallException(
-                f"Invalid predicate_pattern: {e}"
+                f"Invalid predicate_pattern: {format_validation_error(e)}"
                 ) from e
         member = fn_args.get("show_examples_from")
         if member is not None and member not in self.scope:
@@ -1658,7 +1662,7 @@ class RoleEditor(Editor):
             try:
                 add = PredicatePattern.model_validate(fn_args["add"])
             except ValidationError as e:
-                raise FunctionCallException(f"Invalid add: {e}") from e
+                raise FunctionCallException(f"Invalid add: {format_validation_error(e)}") from e
             predicates += [p for p in add.predicates if p not in predicates]
             patterns += [p for p in add.patterns if p not in patterns]
         new = PredicatePattern(predicates=predicates, patterns=patterns) if predicates or patterns else None
@@ -1673,7 +1677,7 @@ class RoleEditor(Editor):
                 fn_args.get("relation") or {}
                 )
         except ValidationError as e:
-            raise FunctionCallException(f"Invalid relation: {e}") from e
+            raise FunctionCallException(f"Invalid relation: {format_validation_error(e)}") from e
         relation.source = "llm"
         self.update_role_element_usage(PredicateRoles(structure=[relation]))
         relation_item = self.format_structure_relation(relation)
@@ -1959,6 +1963,7 @@ class ProfileStageTask(GraspTask):
 
     def rules(self) -> list[str]:
         return self.stage_rules() + [
+            BLANK_NODE_RULE,
             "Inspect the knowledge graph with the SPARQL functions before you change anything.",
             "You can execute multiple tool calls in one step. Prefer several tool calls and "
             "SPARQL queries per step over single calls.",

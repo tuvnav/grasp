@@ -223,17 +223,22 @@ class PredicateRoles(BaseModel):
     def validate_structure_relation_names(self) -> Self:
         clashing_structure_relation_names = [
             name for name in self.structure_relation_names()
-            if name in ROLE_FIELDS or name.startswith(INVERSE_PREFIX)
+            if name in ROLE_FIELDS
+            or name in set(StructureRelationKind)
+            or name.startswith(INVERSE_PREFIX)
         ]
         if (
             clashing_structure_relation_names
             or len(set(self.structure_relation_names())) != len(self.structure)
                 ):
             raise ValueError(
-                f"structure relation names must be unique, no role name and not start with "
-                f"{INVERSE_PREFIX!r}: {
-                    clashing_structure_relation_names or self.structure_relation_names()
-                    }"
+                f"structure relation names must be unique, "
+                "no role name, no structure relation kind name, "
+                f"and not start with {INVERSE_PREFIX!r}: "
+                + str(
+                    clashing_structure_relation_names
+                    or self.structure_relation_names()
+                )
             )
 
         return self
@@ -244,8 +249,10 @@ class PredicateRoles(BaseModel):
     def predicate_pattern_by_name(self, name: str) -> PredicatePattern | None:
         """
         The pattern of a value source by name: a role ("names"),
-        a structure relation ("part_of") or its inverse ("^part_of")
-        or a path of them joined by '/' ("subclass_of/names": the names of the superclasses).
+        a structure relation ("part_of") or its inverse ("^part_of"),
+        a relation kind (subsumption, membership, …) or its inverse,
+        or a path of them joined by '/' ("subclass_of/names":
+        the names of the superclasses).
         'None' means a role is not set yet.
         Raises ValueError for an unknown name.
         """
@@ -264,14 +271,36 @@ class PredicateRoles(BaseModel):
         if name in ROLE_FIELDS:
             return getattr(self, name)  # may be 'None'
         relation_name = name.removeprefix(INVERSE_PREFIX)
+        if relation_name in set(StructureRelationKind):
+            of_kind = [
+                relation.predicate_pattern for relation in self.structure
+                if relation.kind == relation_name
+            ]
+            if not of_kind:
+                return None
+            pattern = PredicatePattern(
+                predicates=list(
+                    dict.fromkeys(
+                        p for pattern in of_kind for p in pattern.predicates
+                        )
+                    ),
+                patterns=list(
+                    dict.fromkeys(
+                        p for pattern in of_kind for p in pattern.patterns
+                        )
+                )
+            )
+            return pattern.inverted() if name.startswith(INVERSE_PREFIX) else pattern
+
         relation = next(
             (relation for relation in self.structure if relation.name == relation_name),
             None,
             )
         if relation is None:
             raise ValueError(
-                f"{name!r} is neither a role {ROLE_FIELDS} nor a structure relation "
-                f"{self.structure_relation_names()} (prefix {INVERSE_PREFIX!r}: the "
+                f"{name!r} is neither a role {ROLE_FIELDS}, a structure relation "
+                f"{self.structure_relation_names()} nor a relation kind "
+                f"{[str(kind) for kind in StructureRelationKind]} (prefix {INVERSE_PREFIX!r}: the "
                 f"other direction; join names with {PATH_SEPARATOR!r} for a path)"
             )
         return (
@@ -347,7 +376,7 @@ class RoleElement(BaseModel):
                 if isinstance(self.definition, RelationProperties):
                     raise ValueError(
                         "RoleElement has kind 'RELATION_PROPERTIES' "
-                        "but it's definition is a RelationProperties."
+                        "but its definition is a RelationProperties."
                         )
                 return self.definition
             case _:

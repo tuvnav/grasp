@@ -16,8 +16,6 @@ from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
     PredicatePattern,
     StructureRelationKind,
-    INVERSE_PREFIX,
-    PredicateRoles,
 )
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 
@@ -44,7 +42,7 @@ class ValueRow:
 
 
 # the entities of a side that are not matched yet
-REST = "rest"
+POPULATION_REST = "rest"
 
 # a group of the profile by name, REST, or a definition for this strategy only
 type GroupRef = str | GroupDefinition
@@ -61,8 +59,8 @@ def group_name_from_group_ref(group_ref: GroupRef):
 class Population(BaseModel):
     """Source and target entities a strategy compares."""
     model_config = ConfigDict(extra="forbid")
-    source_group_refs: list[GroupRef] = Field(default=[REST], min_length=1)
-    target_group_refs: list[GroupRef] = Field(default=[REST], min_length=1)
+    source_group_refs: list[GroupRef] = Field(default=[POPULATION_REST], min_length=1)
+    target_group_refs: list[GroupRef] = Field(default=[POPULATION_REST], min_length=1)
 
     def group_names(self) -> dict[Side, list[str]]:
         return {
@@ -71,14 +69,18 @@ class Population(BaseModel):
         }
 
 
-# values of an entity: one or more roles of its (effective) profile, or an own
-# pattern over ?s (the entity) and ?o (the value); a pattern may compute ?o (BIND)
-type ValuePatternSource = list[str] | PredicatePattern
+# values of an entity: one role name of its profile (names, codes, ...),
+# one structure relation kind (subsumption, partonomy, ...),
+# a structure relation name (subclass_of), '^' for the other direction,
+# a path of these joined by '/' (subsumption/names)
+# or an own pattern over ?s (the entity) and ?o (the value);
+# a pattern may compute ?o (BIND)
+type ValuePatternSource = str | PredicatePattern
 
 
 class ValuePatterns(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: ValuePatternSource = ["names", "synonyms"]
+    source: ValuePatternSource = "names"
     target: ValuePatternSource | None = None  # None: like the source
 
     def by_side(self, side: Side) -> ValuePatternSource:
@@ -156,8 +158,10 @@ class KeyStrategy(BaseModel):
     values: ValuePatterns = ValuePatterns()
     normalization: Normalization = Normalization()
 
-    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
-        """The values compared on one side (roles: unused, all strategies take it)."""
+    def value_pattern_source(
+            self, side: Side
+            ) -> ValuePatternSource:
+        """The values compared on one side: one name (role, relation, kind or path) or one own pattern."""
         return self.values.by_side(side)
 
 
@@ -191,8 +195,8 @@ class VectorStrategy(BaseModel):
                 "inflected forms meet (mainly for idf_tokens)")
         return self
 
-    def value_pattern_source(self, side: Side, roles: PredicateRoles) -> ValuePatternSource:
-        """The values compared on one side (roles: unused, all strategies take it)."""
+    def value_pattern_source(self, side: Side) -> ValuePatternSource:
+        """The values compared on one side: one name (role, relation, kind or path) or one own pattern."""
         return self.values.by_side(side)
 
 
@@ -210,16 +214,7 @@ class NeighbourStrategy(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.NEIGHBOURS] = CandidateStrategyType.NEIGHBOURS
-    # the structure relations of these kinds in the profiles, in both directions ...
-    relation_kinds: list[StructureRelationKind] = [
-        StructureRelationKind.SUBSUMPTION,
-        StructureRelationKind.PARTONOMY,
-        StructureRelationKind.MEMBERSHIP
-        ]
-    # ... unless relations are named here per side, taken as written: names
-    # ("^part_of": the other direction), paths ("part_of/^part_of") or an own
-    # pattern; all relations of a side count as one relation
-    relations: ValuePatterns | None = None
+    values: ValuePatterns = ValuePatterns(source=StructureRelationKind.SUBSUMPTION)
     min_witnesses: int = Field(default=1, ge=1)
     witness_weighting: WitnessWeighting = "count"
     # generate: candidates from the neighbours of matched pairs; corroborate:
@@ -227,23 +222,13 @@ class NeighbourStrategy(BaseModel):
     mode: Literal["generate", "corroborate"] = "generate"
 
     def value_pattern_source(
-            self, side: Side, roles: PredicateRoles
+            self, side: Side
             ) -> ValuePatternSource:
         """
         The structure relations whose neighbours are compared
-        on one side: named per side (names, paths or an own pattern);
-        all of a side count as one relation.
+        on one side: named per side (names, paths or an own pattern).
         """
-        if self.relations is not None:
-            return self.relations.by_side(side)
-        names = [
-            relation.name for relation in roles.structure
-            if relation.kind in self.relation_kinds
-            ]
-        both_directions: list[str] = [
-            *names, *(INVERSE_PREFIX + name for name in names)
-            ]
-        return both_directions
+        return self.values.by_side(side)
 
 
 CandidateStrategy = Annotated[KeyStrategy | VectorStrategy | NeighbourStrategy, Field(discriminator="kind")]
@@ -331,11 +316,18 @@ class NeighbourMatch(Match):
     and one target entity over corresponding relations,
     with the rows of just these two entities.
     """
-    relation_key: str                # e.g. "kind:partonomy"
     witness: tuple[IRI, IRI]         # the equivalence (a, b) of the neighbours
-    # entities that share this witness over this relation (the bucket), per side
+    # entities that share this witness (the bucket), per side
     num_source_entities: int
     num_target_entities: int
+
+    @property
+    def relations(self) -> tuple[str, str]:
+        """
+        (source, target): the projections the neighbours were reached over,
+        e.g. ("subsumption", "^property_domain").
+        """
+        return self.source_rows[0].role_name, self.target_rows[0].role_name
 
     @property
     def weight(self) -> float:
@@ -409,7 +401,9 @@ class KeyEntityPair(EntityPair[KeyMatch]):
         """
         The levels on which the pair shares a key, from fine to coarse.
         """
-        return sort_normalization_levels(key_match.level for key_match in self.matches)
+        return sort_normalization_levels(
+            key_match.level for key_match in self.matches
+            )
 
     def finest_normalization_level(self) -> NormalizationLevel:
         return self.levels()[0]  # a pair has at least one key match
@@ -502,8 +496,8 @@ class NeighbourHub(Hub):
     too many entity pairs: it creates no pairs,
     but counts for the pairs created by other witnesses.
     """
-    relation_key: str
     witness: tuple[IRI, IRI]
+    relations: tuple[str, str]  # (source, target): the projections the neighbours were reached over
 
 
 @dataclass(frozen=True)
@@ -580,8 +574,9 @@ class EntityCandidates:
     # group -> competing counterparts outside the population (a counterpart in two
     # groups counts in both)
     num_counterparts_outside_population_by_group: Counter[str] = field(default_factory=Counter)
-    # rank key of the pair -> competing counterparts outside the population
-    # (each counted once); they take places in the tie groups of the selection
+    # rank key of the pair -> competing counterparts outside the population, and
+    # (key runs on a name role) counterparts matched only over the other name
+    # role (each counted once); they take places in the tie groups of the selection
     num_counterparts_outside_population_by_rank: Counter[float] = field(default_factory=Counter)
     # partition -> counterparts whose partition does not compete with the entity's
     num_non_competing_counterparts_by_partition: Counter[str] = field(default_factory=Counter)
@@ -623,8 +618,10 @@ class EntityCandidates:
 
     @property
     def ambiguous_at_top_rank(self) -> bool:
-        """More than one entity on the best rank: the strategy cannot tell which
-        one is best. Rivals outside the population count too."""
+        """
+        More than one entity on the best rank: the strategy cannot tell which
+        one is best. Rivals outside the population count too.
+        """
         entries_by_rank = Counter(candidate.rank_key for candidate in self.candidates)
         entries_by_rank.update(self.num_counterparts_outside_population_by_rank)
         entries_by_rank = +entries_by_rank          # drops ranks with count 0
@@ -917,3 +914,43 @@ class AnchorMerge:
     """
     anchors: list[Anchor]
     conflicts: list[tuple[IRI, IRI, frozenset[str]]]  # (source, target, families)
+
+
+
+# ----------------------------------------------- Signals for Judges
+# class KeyMatchSignal(BaseModel):
+#     kind: Literal["key"] = "key"
+#     key: str
+#     level: NormalizationLevel
+#     transforms: list[StringTransform]
+#     projection: tuple[str, str]  # role or sparql pattern
+#     values: tuple[list[str], list[str]]
+
+
+# class VectorMatchSignal(BaseModel):
+#     kind: Literal["vector"] = "vector"
+#     vectorizer: Vectorizer
+#     texts: tuple[str, str]
+#     level: NormalizationLevel
+#     transforms: list[StringTransform]
+#     cosine: float
+#     projection: tuple[str, str]  # role or sparql pattern
+
+
+# class NeighboursMatchSignal(BaseModel):
+#     kind: Literal["neighbours"] = "neighbours"
+#     witness: tuple[IRI, IRI]
+#     relations: tuple[str, str]  # structure relation/kind or sparql
+#     bucket_size: tuple[int, int]  # entities sharing the witness, per side
+
+
+# type MatchSignal = Annotated[
+#     KeyMatchSignal | VectorMatchSignal | NeighboursMatchSignal,
+#     Field(discriminator="kind")
+#     ]
+
+
+# class PairEvidence(BaseModel):
+#     source_entity: IRI
+#     target_entity: IRI
+#     matches: list[MatchSignal]

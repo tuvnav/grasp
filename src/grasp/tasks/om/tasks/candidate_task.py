@@ -29,6 +29,7 @@ from collections import Counter
 import dataclasses
 from enum import StrEnum, auto
 import hashlib
+from itertools import chain
 import random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Iterable, Iterator, Sequence, get_args
@@ -66,7 +67,7 @@ from grasp.tasks.om.data_models.candidates import (
     NeighbourMatch,
     VectorHub,
     VectorMatch,
-    REST,
+    POPULATION_REST,
     GroupRef,
     Population,
     ValuePatternSource,
@@ -97,7 +98,7 @@ from grasp.tasks.om.foundation.text_normalization import (
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    evaluate_merged_candidates, flatten_layers, merge_candidate_runs, select_candidates, summarize_candidate_selection,
+    NAME_ROLES, compares_names, evaluate_merged_candidates, flatten_layers, merge_candidate_runs, select_candidates, summarize_candidate_selection,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
@@ -115,7 +116,7 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     key_entity_pairs_to_candidates,
     neighbour_entity_pairs_to_candidates,
     get_normalization_examples,
-    relation_keys_by_role_name,
+    split_name_key_runs,
     vector_entity_pairs_to_candidates,
     retrieve_entities,
     retrieve_partitions_by_entity,
@@ -123,7 +124,12 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
 )
 from grasp.tasks.om.sparql_access import values_clause
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
+from grasp.tasks.om.tasks.prompting import (
+    BLANK_NODE_RULE,
+    add_equivalence_condition,
+    format_validation_error,
+    load_prompt,
+)
 from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
 from grasp.utils import FunctionCallException, format_section
 from pydantic import ValidationError
@@ -157,14 +163,14 @@ def population_group_names(kg_profile: KgProfile, population: Population, side: 
     for group_ref in group_refs_of_side(population, side):
         if isinstance(group_ref, GroupDefinition):
             names.add(group_ref.name)
-        elif group_ref == REST:
+        elif group_ref == POPULATION_REST:
             names |= set(kg_profile.group_names()) - set(kg_profile.excluded_group_names())
         elif kg_profile.has_group(group_ref):
             names.add(group_ref)
         else:
             raise FunctionCallException(
                 f"{group_ref} is not a group of {kg_profile.kg_name}; groups: {kg_profile.group_names()}, "
-                f"or {REST!r} for all of them, or define a group inline")
+                f"or {POPULATION_REST!r} for all of them, or define a group inline")
     return names
 
 
@@ -305,19 +311,23 @@ def draw_trial_sample(
 
 def check_value_pattern_source(
         value_pattern_source: ValuePatternSource, kg_profile: KgProfile
-        ) -> None:
+        ):
     """
-    Every name in the value source is a role, a structure relation of the
-    profile or a path of them (checked before querying, for a message the LLM
-    can act on).
+    A name in the value source is a role, a structure relation or relation
+    kind of the profile, or a path of them (each step checked), and has a
+    pattern there: a role that is not set, or a kind without a relation, gives
+    no values. Checked before querying, for a message the LLM can act on.
     """
-    if not isinstance(value_pattern_source, list):
-        return
-    for name in value_pattern_source:
-        try:
-            kg_profile.roles.predicate_pattern_by_name(name)
-        except ValueError as error:
-            raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
+    if not isinstance(value_pattern_source, str):
+        return  # an own pattern
+    try:
+        pattern = kg_profile.roles.predicate_pattern_by_name(value_pattern_source)
+    except ValueError as error:
+        raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
+    if pattern is None:
+        raise FunctionCallException(
+            f"{kg_profile.kg_name}: {value_pattern_source!r} gives no values: a role in it is not set in the "
+            "profile, or the profile has no structure relation of a kind in it")
 
 
 def retrieve_strategy_value_rows(
@@ -327,6 +337,7 @@ def retrieve_strategy_value_rows(
         side: Side,
         entity_sample: EntitySample | None = None,
         object_iris: Collection[IRI] | None = None,
+        alternative_value_pattern_source: ValuePatternSource | None = None
         ) -> Iterator[ValueRow]:
     """
     The values a strategy compares on one side (its value_pattern_source: roles,
@@ -334,8 +345,13 @@ def retrieve_strategy_value_rows(
     groups (rivals outside the population included); on a sampled side only
     those of the sampled entities. object_iris: only values among these (a
     neighbour strategy: the entities of the witnesses).
+    alternative_value_pattern_source: these values instead of the strategy's
+    (a key run on a name role: the other name roles, for its rivals).
     """
-    value_pattern_source = generator.strategy.value_pattern_source(side, kg_profile.roles)
+    value_pattern_source = (
+        alternative_value_pattern_source if alternative_value_pattern_source is not None
+        else generator.strategy.value_pattern_source(side)
+        )
     check_value_pattern_source(value_pattern_source, kg_profile)
     side_sample = entity_sample if entity_sample is not None and entity_sample.side == side else None
     value_rows = retrieve_value_rows(
@@ -374,6 +390,15 @@ CANDIDATE_BUDGET_PER_ENTITY = 8
 MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER = 30
 
 
+def no_values_error(side: Side) -> ValueError:
+    """A key or vector run without any value on one side: why, for the LLM."""
+    return ValueError(
+        f"No values on the {side} side for the compared entities: the role is not set, has no values "
+        "in these groups (or in the trial sample), or your pattern binds no ?o (inside a nested { } "
+        "group of its own, ?s is unbound)."
+        )
+
+
 def get_key_candidates(
         managers: dict[Side, KgManager],
         alignment_state: AlignmentState,
@@ -397,9 +422,13 @@ def get_key_candidates(
     """
     strategy = generator.strategy
     if not isinstance(strategy, KeyStrategy):
-        raise FunctionCallException(f"get_key_candidates needs a key strategy, not {strategy.kind!r}")
+        raise FunctionCallException(
+            f"get_key_candidates needs a key strategy, not {strategy.kind!r}"
+            )
 
     # 1. per side: the values of the entities in the groups -> indices per level
+    retrieve_all_name_roles = compares_names(generator)
+
     indices_by_side = {}
     group_names_by_side = {}
     for side in SIDES:
@@ -407,9 +436,25 @@ def get_key_candidates(
         group_names_by_side[side] = population_group_names(
             kg_profile, generator.population, side
             )
-        value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
+        if retrieve_all_name_roles:
+            # the projection must give values; the rivals come from every name role that is set
+            check_value_pattern_source(strategy.values.by_side(side), kg_profile)
+            value_rows = chain.from_iterable(
+                retrieve_strategy_value_rows(
+                    managers[side], kg_profile, generator,
+                    side, entity_sample, alternative_value_pattern_source=role)
+                for role in sorted(NAME_ROLES)
+                if kg_profile.roles.predicate_pattern_by_name(role) is not None
+            )
+        else:
+            value_rows = retrieve_strategy_value_rows(
+                managers[side], kg_profile, generator, side, entity_sample
+            )
         indices_by_side[side] = build_side_indices(value_rows, strategy.normalization)
+        if not any(indices_by_side[side].values()):
+            raise no_values_error(side)
 
+    # examples for raw value -> transform -> string normalization for LLM
     normalization_examples = {
         side: get_normalization_examples(
             indices_by_side[side][strategy.normalization.levels[0]],
@@ -428,15 +473,31 @@ def get_key_candidates(
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
     existing_equivalences = alignment_state.existing_equivalences()
+
+    rival_keys: set[tuple[IRI, IRI]] = set()
+    if retrieve_all_name_roles:
+        entity_pairs, rival_keys = split_name_key_runs(
+            entity_pairs, {
+                side: strategy.values.by_side(side)
+                for side in SIDES
+                }
+        )
+
+    candidate_pairs = {
+        keys: pair for keys, pair in entity_pairs.items()
+        if keys not in rival_keys
+        }
+
     candidates_by_entity = key_entity_pairs_to_candidates(
         alignment_state, entity_pairs,
-        group_names_by_side, partition_names_by_entity, existing_equivalences
+        group_names_by_side, partition_names_by_entity,
+        existing_equivalences, rival_keys
         )
     value_wordsets = {side: value_wordsets_of(indices_by_side[side]) for side in SIDES}
     return (
         candidates_by_entity,
         overfull_keys,
-        find_confirmed_equivalences(entity_pairs, existing_equivalences),
+        find_confirmed_equivalences(candidate_pairs, existing_equivalences),
         value_wordsets,
         normalization_examples
         )
@@ -488,6 +549,8 @@ def get_vector_candidates(
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
         # exactly one level (VectorStrategy checks it)
         (index_by_side[side],) = build_side_indices(value_rows, strategy.normalization).values()
+        if not any(index_by_side[side].values()):
+            raise no_values_error(side)
 
     normalization_examples = {
         side: get_normalization_examples(
@@ -563,15 +626,9 @@ def get_neighbour_candidates(
             managers[side], kg_profile, generator,
             side, entity_sample, witnesses_by_entity[side].keys()
             )
-        relation_keys = relation_keys_by_role_name(
-            strategy.value_pattern_source(side, kg_profile.roles),
-            kg_profile.roles,
-            named_relations=strategy.relations is not None
-        )
         index_by_side[side] = build_side_witness_index(
             witnesses_by_entity[side],
             value_rows,
-            relation_keys
         )
 
     # 2. compare the two sides: entity pairs with their shared witnesses (the
@@ -769,7 +826,7 @@ def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     try:
         generator = Generator(**fn_args.get("generator", {}))
     except ValidationError as error:
-        raise FunctionCallException(f"Invalid generator: {error}") from error
+        raise FunctionCallException(f"Invalid generator: {format_validation_error(error)}") from error
 
     try:
         result = run_strategy(
@@ -822,7 +879,7 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
     try:
         selection = Selection(**fn_args.get("selection", {}))
     except ValidationError as error:
-        raise FunctionCallException(f"Invalid selection object: {error}") from error
+        raise FunctionCallException(f"Invalid selection object: {format_validation_error(error)}") from error
 
     generator, result = state.runs[run_id]
     new_generator = generator.model_copy(update={"selection": selection})
@@ -846,7 +903,7 @@ def parse_run_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
     try:
         run_ensemble = RunEnsemble.model_validate({"runs": runs})
     except ValidationError as error:
-        raise FunctionCallException(f"Invalid runs: {error}") from error
+        raise FunctionCallException(f"Invalid runs: {format_validation_error(error)}") from error
     unknown_run_ids = [run_id for run_id in run_ensemble.run_ids() if run_id not in state.runs]
     if unknown_run_ids:
         raise FunctionCallException(f"Unknown run ids {unknown_run_ids}; existing runs: {list(state.runs)}")
@@ -1067,8 +1124,16 @@ def format_signals(signals: StrategySignals) -> Item:
         )
 
 
+def format_relations(relations: tuple[str, str]) -> str:
+    """The projections of a neighbour match or hub: one if both sides use the same."""
+    source_relation, target_relation = relations
+    return source_relation if source_relation == target_relation else f"{source_relation} ~ {target_relation}"
+
+
 def format_hub(hub: Hub, entity_displays: dict[Side, EntityDisplay]) -> str:
-    """A hub with the size of its bucket."""
+    """
+    A hub with the size of its bucket.
+    """
     match hub:
         case KeyHub():
             shared = f'{hub.level} key "{hub.key}"'
@@ -1076,8 +1141,11 @@ def format_hub(hub: Hub, entity_displays: dict[Side, EntityDisplay]) -> str:
             shared = f'texts "{hub.source_text}" ~ "{hub.target_text}"'
         case NeighbourHub():
             source_witness, target_witness = hub.witness
-            shared = (f"witness {display_entity(entity_displays, Side.SOURCE, source_witness)} = "
-                      f"{display_entity(entity_displays, Side.TARGET, target_witness)} over {hub.relation_key}")
+            shared = (
+                f"witness {display_entity(entity_displays, Side.SOURCE, source_witness)} = "
+                f"{display_entity(entity_displays, Side.TARGET, target_witness)} "
+                f"over {format_relations(hub.relations)}"
+                )
         case _:
             raise NotImplementedError(f"format_hub does not support {type(hub).__name__}")
     return f"{shared}: {hub.num_source_entities} source x {hub.num_target_entities} target entities"
@@ -1132,7 +1200,7 @@ def format_match(
                 f", shared by {match.num_source_entities} source x {match.num_target_entities} "
                 f"target entities" if bucket > 1 else ""
                 )
-            return f"matched by witness {witness} over relation '{match.relation_key}'{witness_shared_by}"
+            return f"matched by witness {witness} over {format_relations(match.relations)}{witness_shared_by}"
         case _:
             raise NotImplementedError(
                 f"format_match does not support {type(match).__name__}"
@@ -1648,7 +1716,7 @@ GROUP_REFS_SCHEMA = {
         }, "required": ["name", "membership_sparql"]},
     ]},
     "description": (
-        f"Groups of the profile by name, {REST!r} for all groups that are not excluded, or a group "
+        f"Groups of the profile by name, {POPULATION_REST!r} for all groups that are not excluded, or a group "
         "defined inline for this strategy (a new name and a SPARQL pattern over ?s). "
         "Entities of excluded groups are never compared."
     ),
@@ -1656,15 +1724,17 @@ GROUP_REFS_SCHEMA = {
 
 VALUE_SOURCE_SCHEMA = {
     "anyOf": [
-        {"type": "array", "items": {"type": "string"},
-         "description": "Role names of the profile (names, synonyms, definitions, codes, cross_references), "
-                        "names of structure relations ('^name': the other direction), or paths of them joined "
-                        "by '/' (e.g. 'subclass_of/names': the names of the superclasses)"},
+        {"type": "string",
+         "description": "One name: a role of the profile (names, synonyms, definitions, codes, cross_references), "
+                        "a structure relation of the profile, or a relation kind (" + ", ".join(StructureRelationKind)
+                        + "; all relations of that kind); '^' before a relation or kind for the other direction; "
+                        "or a path of these joined by '/' (e.g. 'subsumption/names': the names of the broader "
+                        "entities)."},
         {"type": "object", "properties": {
             "predicates": {"type": "array", "items": {"type": "string"}},
             "patterns": {"type": "array", "items": {"type": "string"},
                          "description": "SPARQL patterns over ?s (the entity) and ?o (the value)"},
-        }},
+        }, "description": "One own pattern instead of a name."},
     ],
 }
 
@@ -1699,7 +1769,10 @@ GENERATOR_SCHEMA = {
                 "kind": {"type": "string", "enum": [str(kind) for kind in CandidateStrategyType]},
                 "values": {
                     "type": "object",
-                    "description": "key and vector: the values compared. Default: names and synonyms.",
+                    "description": "The values compared, one per side: key and vector compare them directly, "
+                                   "neighbours compares the entities they lead to by their equivalences. "
+                                   "Default: names (key, vector), subsumption (neighbours). For several, try "
+                                   "several runs.",
                     "properties": {
                         "source": VALUE_SOURCE_SCHEMA,
                         "target": {**VALUE_SOURCE_SCHEMA, "description": "Omit: like the source."},
@@ -1738,21 +1811,6 @@ GENERATOR_SCHEMA = {
                     "type": "string", "enum": list(get_args(Vectorizer.__value__)),
                     "description": "vector: idf_tokens (rare words count more), char_3grams (spelling "
                                    "variants), embedding (meaning, multilingual). Default idf_tokens.",
-                },
-                "relation_kinds": {
-                    "type": "array", "items": {"type": "string", "enum": [str(kind) for kind in StructureRelationKind]},
-                    "description": "neighbours: the structure relations of these kinds of the profiles, "
-                                   "in both directions. Default subsumption, partonomy, membership.",
-                },
-                "relations": {
-                    "type": "object",
-                    "description": "neighbours: the relations per side instead of relation_kinds. All relations "
-                                   "of a side count as one relation, so name only relations that mean the same "
-                                   "(e.g. one run for domain, another for range).",
-                    "properties": {
-                        "source": VALUE_SOURCE_SCHEMA,
-                        "target": {**VALUE_SOURCE_SCHEMA, "description": "Omit: like the source."},
-                    },
                 },
                 "min_witnesses": {"type": "integer", "minimum": 1,
                                   "description": "neighbours: equivalences a pair needs at least. Default 1."},
@@ -1897,6 +1955,7 @@ class OMCandidateTask(GraspTask):
 
     def rules(self) -> list[str]:
         return [
+            BLANK_NODE_RULE,
             "Try every strategy you want to select with try_strategy; you can only select tried runs.",
             "Look at the examples and at more lists with show_candidates before you judge a strategy; "
             "use reselect to change only the selection of a run.",
