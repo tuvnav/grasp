@@ -32,8 +32,8 @@ from grasp.tasks.om.foundation.text_vectors import (
     count_text_vectors, vectorize_texts,
 )
 from grasp.tasks.om.foundation.types import IRI, SIDES, BindingType, Side
-from grasp.tasks.om.kg_operations.grouping import Grouping, grouping_to_sparql_query, profile_partitions_to_grouping
-from grasp.tasks.om.sparql_access import stream_rows, values_clause
+from grasp.tasks.om.kg_operations.grouping import Grouping, profile_partitions_to_grouping, retrieve_groups_by_entity
+from grasp.tasks.om.sparql_access import retrieve_values, stream_rows, values_clause
 
 # normalized value -> [retrieved rows]. For key and vector strategies
 type ValueIndex = dict[str, list[ValueRow]]
@@ -54,60 +54,29 @@ def retrieve_value_rows(
 
     if object_iris is not None and not object_iris:
         return  # restricted to no values (e.g. no witnesses yet): no query
-    branches = prepare_value_branches_for_sparql(
-        value_source, roles, object_iris
-        )
+    restricted_to_values = set(object_iris) if object_iris is not None else None
 
-    if not branches:
-        return  # none of the roles is set in the profile: no values
+    groups_by_entity = retrieve_groups_by_entity(manager, grouping, entity_space)
 
-    query_sparql = grouping_to_sparql_query(
-        manager, grouping, entity_space,
-        "?s ?group ?o ?role",
-        branches=branches
-        )
-    rows = stream_rows(manager, query_sparql)
-    for row in rows:
-        entity = IRI(Binding.from_dict(row["s"]).identifier())
-        group = Binding.from_dict(row["group"]).value
-        role = Binding.from_dict(row["role"]).value
-        if "o" not in row:
-            continue  # the pattern bound no value for this entity
-        value_binding = Binding.from_dict(row["o"])
-        if value_binding.typ == BindingType.BNODE:
-            continue
-        value = value_binding.value
-        language = value_binding.lang
-
-        yield ValueRow(
-            entity=entity,
-            group_name=group,
-            role_name=role,
-            raw_projection_value=value,
-            value_language=language
+    for role_name, pattern in named_value_patterns(value_source, roles):
+        values_by_entity = retrieve_values(
+            manager, groups_by_entity, pattern.sparql_branches(), literals_only=False
             )
-
-
-def prepare_value_branches_for_sparql(
-        value_source: ValuePatternSource,
-        roles: PredicateRoles,
-        restrict_to_object_iris: Collection[IRI] | None = None,
-        new_role_name: str = "own"
-        ) -> list[str]:
-    """
-    SPARQL alternatives over ?s (entity) and ?o (value), each binding ?role.
-    """
-    restriction_to_values = (
-        f"{values_clause('o', restrict_to_object_iris)}\n"
-        if restrict_to_object_iris is not None else ""
-        )
-    return [
-        f'{restriction_to_values}{branch} BIND("{role_name}" AS ?role)'
-        for role_name, pattern in named_value_patterns(
-            value_source, roles, new_role_name
-            )
-        for branch in pattern.branches_for_union()
-    ]
+        for entity, values in values_by_entity.items():
+            for value in values:
+                if value.typ == BindingType.BNODE:
+                    continue
+                if restricted_to_values is not None \
+                        and IRI(value.value) not in restricted_to_values:
+                    continue
+                for group_name in groups_by_entity[entity]:
+                    yield ValueRow(
+                        entity=entity,
+                        group_name=group_name,
+                        role_name=role_name,
+                        raw_projection_value=value.value,
+                        value_language=value.lang,
+                        )
 
 
 def named_value_patterns(
@@ -127,19 +96,6 @@ def named_value_patterns(
             return [(value_source, pattern)] if pattern is not None else []
 
 
-def retrieve_entities(
-        manager: KgManager,
-        grouping: Grouping,
-        entity_space: Iterable[str],
-        ) -> list[IRI]:
-    """
-    The entities of a grouping, each once, sorted (so that a sample drawn
-    from them with a fixed seed is the same in every run).
-    """
-    query = grouping_to_sparql_query(manager, grouping, entity_space, "DISTINCT ?s")
-    return sorted({IRI(Binding.from_dict(row["s"]).identifier()) for row in stream_rows(manager, query)})
-
-
 def retrieve_linked_entities(
         manager: KgManager,
         grouping: Grouping,
@@ -151,18 +107,17 @@ def retrieve_linked_entities(
     The entities of a grouping linked by a triple, in either direction, to
     one of the given entities (e.g. the neighbours of matched entities).
     """
-    entity_space = list(entity_space)
+    members = set(retrieve_groups_by_entity(manager, grouping, entity_space))
     linked_entities: set[IRI] = set()
     for batch in batched(sorted(linked_to), batch_size):
-        query = grouping_to_sparql_query(
-            manager, grouping, entity_space, "DISTINCT ?s",
-            where=f"{values_clause('linked', batch)}\n"
-            "{ ?s ?p ?linked } UNION { ?linked ?p ?s }"
-            )
-        linked_entities.update(
-            IRI(Binding.from_dict(row["s"]).identifier()) for row in stream_rows(manager, query)
-            )
-    return linked_entities
+        restriction = values_clause("linked", batch)
+        for direction in ("?s ?p ?linked", "?linked ?p ?s"):
+            query = f"SELECT DISTINCT ?s WHERE {{ {restriction} {direction} }}"
+            linked_entities |= {
+                IRI(Binding.from_dict(row["s"]).identifier())
+                for row in stream_rows(manager, query)
+                }
+    return linked_entities & members
 
 
 def retrieve_partitions_by_entity(
@@ -170,22 +125,13 @@ def retrieve_partitions_by_entity(
         kg_profile: KgProfile,
         entity_space: Iterable[str]
         ) -> dict[IRI, str]:
-    partitions_grouping = profile_partitions_to_grouping(kg_profile)
-    query = grouping_to_sparql_query(
-        manager, partitions_grouping,
-        entity_space, "?s ?group"
-    )
-
-    rows = stream_rows(manager, query)
-
-    partition_names_by_entity: dict[IRI, str] = {}
-
-    for row in rows:
-        entity = IRI(Binding.from_dict(row["s"]).identifier())
-        partition = Binding.from_dict(row["group"]).value
-        partition_names_by_entity[entity] = partition
-
-    return partition_names_by_entity
+    partitions_by_entity = retrieve_groups_by_entity(
+        manager, profile_partitions_to_grouping(kg_profile), entity_space
+        )
+    return {
+        entity: next(iter(group_names))
+        for entity, group_names in partitions_by_entity.items()
+        }
 
 
 def distinct_entities(rows: list[ValueRow]) -> set[IRI]:

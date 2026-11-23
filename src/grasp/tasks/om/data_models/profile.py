@@ -81,13 +81,16 @@ class PredicatePattern(BaseModel):
             raise ValueError("SPARQL pattern or predicates required")
         return self
 
-    def branches_for_union(self) -> list[str]:
+    def sparql_branches(self) -> list[str]:
         """
-        The alternatives for querying: each pattern, and each predicate on
-        its own (not a path <a>|<b>, because Qlever resolves single predicates
-        much faster than predicate paths).
+        The alternatives for querying: each a pattern over ?s and ?o: the
+        predicates as one path (<a>|<b>), then each pattern. Not joined by
+        UNION: a pattern may need ?s bound before it (BIND(... STR(?s) ...)),
+        and an alternative of a UNION is evaluated on its own; so each
+        alternative is queried in the block that binds ?s.
         """
-        return list(self.patterns) + [f"?s <{p}> ?o" for p in self.predicates]
+        predicate_path = "|".join(f"<{p}>" for p in self.predicates)
+        return ([f"?s {predicate_path} ?o"] if predicate_path else []) + list(self.patterns)
 
     def inverted(self) -> PredicatePattern:
         """
@@ -97,7 +100,7 @@ class PredicatePattern(BaseModel):
         """
         return PredicatePattern(
             patterns=[
-                swap(alternative) for alternative in self.branches_for_union()
+                swap(alternative) for alternative in self.sparql_branches()
                 ]
             )
 
@@ -128,8 +131,8 @@ def compose(
 
     return PredicatePattern(patterns=[
         f"{rename(first_branch, '?s', link, f'{step}a')} . {rename(second_branch, link, '?o', f'{step}b')}"
-        for first_branch in first.branches_for_union()
-        for second_branch in second.branches_for_union()
+        for first_branch in first.sparql_branches()
+        for second_branch in second.sparql_branches()
         ])
 
 

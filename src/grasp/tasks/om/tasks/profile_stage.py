@@ -9,12 +9,13 @@ observations), finish with findings and flags, and the editors of the profile
 parts, which hold a part under editing and its functions (RoleEditor: roles,
 for the role stages).
 """
+import random
 import re
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from typing import Any, Callable, ClassVar, Literal, Self, Sequence, TypedDict
+from typing import Any, Callable, ClassVar, Iterable, Literal, Self, TypedDict
 
 from pydantic import ValidationError
 
@@ -61,7 +62,7 @@ from grasp.tasks.om.foundation.configuration import (
     load_task_instructions,
 )
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
-from grasp.tasks.om.foundation.types import LocalNameType
+from grasp.tasks.om.foundation.types import IRI, BindingType, LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     DEFAULT_LABEL_PREDICATES,
     RDF_TYPE,
@@ -76,7 +77,8 @@ from grasp.tasks.om.kg_operations.grouping import (
     ensure_groups,
     ensure_partitions,
     retrieve_group_sizes,
-    grouping_to_sparql_query,
+    retrieve_groups_by_entity,
+    retrieve_members,
     groups_to_grouping,
     get_default_partitions,
     partitions_to_grouping,
@@ -92,7 +94,6 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     element_usage_in_roles,
     ensure_space,
     member_coverage,
-    members_query,
     membership_overlap,
     predicate_coverage,
     rest,
@@ -100,9 +101,9 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     unassigned_predicates,
 )
 from grasp.tasks.om.sparql_access import (
+    count_entities_by_key,
     query_failure_message,
-    select_rows,
-    union_of,
+    retrieve_values,
 )
 from grasp.tasks.om.tasks.prompting import BLANK_NODE_RULE, format_validation_error, inline_schema, load_prompt
 from grasp.utils import FunctionCallException, format_section
@@ -170,52 +171,54 @@ def format_share(n: int, size: int) -> str:
     return f"{n}/{size} ({n / size:.0%})" if size else str(n)
 
 
-def run_retrieve_rows(
-        manager: KgManager, sparql: str, llm_written_patterns: Sequence[str] = ()
-        ) -> list[dict[str, Binding]]:
-    try:
-        return select_rows(manager, sparql)
-    except Exception as e:
-        raise FunctionCallException(
-            query_failure_message(e, llm_written_patterns)
-            ) from e
+# examples are drawn with a fixed seed: the same examples on every call
+EXAMPLE_SEED = 0
+
+
+def format_entity_examples(
+        manager: KgManager,
+        entities: Iterable[IRI],
+        names: PredicatePattern,
+        k: int,
+        groups_by_entity: dict[IRI, set[str]] | None = None
+        ) -> list[Item]:
+    """
+    Up to k of the entities, drawn at random, each with a name if it has one
+    and with its groups if given.
+    """
+    candidates = sorted(entities)
+    drawn = random.Random(EXAMPLE_SEED).sample(candidates, min(k, len(candidates)))
+    names_by_entity = retrieve_values(manager, drawn, names.sparql_branches(), literals_only=False)
+    items: list[Item] = []
+    for entity in drawn:
+        entity_names = sorted(value.value for value in names_by_entity.get(entity, []))
+        name = f' "{clip(entity_names[0], 50)}"' if entity_names else ""
+        groups = f" ({', '.join(sorted(groups_by_entity[entity]))})" if groups_by_entity else ""
+        items.append(Item(f"{entity}{name}{groups}"))
+    return items
 
 
 def get_entity_examples(
         manager: KgManager,
         grouping: Grouping,
         space: list[str],
-        name_pattern: str,
-        where: str,
+        names: PredicatePattern,
+        group_name: str | None,
         k: int
         ) -> list[Item]:
     """
-    Up to k entities with a name (name_pattern binds it to ?o; see
-    Editor.name_sparql) and their partition or group.
+    Up to k entities of the grouping (of one group, if group_name is given),
+    with a name (see names_pattern) and their groups.
     """
-    rows = run_retrieve_rows(
-        manager,
-        grouping_to_sparql_query(
-            manager,
-            grouping,
-            space,
-            "?s ?group ?o",
-            f"""{where}\nOPTIONAL {{ {name_pattern} }}""",
-            f"LIMIT {k * 4}"
-            )
-        )
-    seen: set[str] = set()
-    items: list[Item] = []
-    for row in rows:
-        entity = row["s"].value
-        if entity in seen:
-            continue
-        seen.add(entity)
-        name = f' "{clip(row["o"].value, 50)}"' if "o" in row else ""
-        items.append(Item(f"{entity}{name} ({row['group'].value})"))
-        if len(items) == k:
-            break
-    return items
+    try:
+        groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+        entities = [
+            entity for entity, group_names in groups_by_entity.items()
+            if group_name is None or group_name in group_names
+            ]
+        return format_entity_examples(manager, entities, names, k, groups_by_entity)
+    except Exception as e:
+        raise FunctionCallException(query_failure_message(e, names.sparql_branches())) from e
 
 
 def size_text(
@@ -406,14 +409,12 @@ class EditorBaseFields(TypedDict):
     name_predicate_pattern: PredicatePattern | None
 
 
-def names_to_sparql(name_predicate_pattern: PredicatePattern | None) -> str:
+def names_pattern(name_predicate_pattern: PredicatePattern | None) -> PredicatePattern:
     """
-    The names of ?s (bound to ?o), as a SPARQL union: the names role, or the
-    default label predicates before stage c sets it.
+    The names of ?s (bound to ?o): the names role, or the default label
+    predicates before stage c sets it.
     """
-    if name_predicate_pattern:
-        return union_of(name_predicate_pattern.branches_for_union())
-    return union_of([f"?s <{predicate}> ?o" for predicate in DEFAULT_LABEL_PREDICATES])
+    return name_predicate_pattern or PredicatePattern(predicates=list(DEFAULT_LABEL_PREDICATES))
 
 
 @dataclass(eq=False)
@@ -429,9 +430,9 @@ class Editor(ABC):
     entity_space: list[str]
     name_predicate_pattern: PredicatePattern | None  # the KG-wide names role of the profile
 
-    def name_sparql(self) -> str:
+    def names_pattern(self) -> PredicatePattern:
         """The names of ?s for examples (bound to ?o)."""
-        return names_to_sparql(self.name_predicate_pattern)
+        return names_pattern(self.name_predicate_pattern)
 
     @staticmethod
     def base_fields(
@@ -540,30 +541,13 @@ class EntitySpaceEditor(Editor):
                     ["No entities with IRIs starting with it found."]
                     )
                 )
-        named_entities = run_retrieve_rows(
-            self.kg_manager,
-            grouping_to_sparql_query(
-                self.kg_manager,
-                self.partition_grouping,
-                [prefix],
-                "(COUNT(DISTINCT ?s) AS ?n)",
-                "FILTER EXISTS {" + self.name_sparql() + "}"
-                )
-        )
-        named_count = int(
-            named_entities[0]["n"].value
-            ) if named_entities and "n" in named_entities[0] else 0
-        types = run_retrieve_rows(
-            self.kg_manager,
-            grouping_to_sparql_query(
-                self.kg_manager,
-                self.partition_grouping,
-                [prefix],
-                "?t (COUNT(DISTINCT ?s) AS ?n)",
-                f"?s <{RDF_TYPE}> ?t",
-                "GROUP BY ?t ORDER BY DESC(?n) LIMIT 8",
-                )
-            )
+        names = self.names_pattern()
+        try:
+            entities = retrieve_groups_by_entity(self.kg_manager, self.partition_grouping, [prefix])
+            named_count = len(retrieve_values(self.kg_manager, entities, names.sparql_branches(), literals_only=False))
+            types = count_entities_by_key(self.kg_manager, entities, f"?s <{RDF_TYPE}> ?t", "t").most_common(8)
+        except Exception as e:
+            raise FunctionCallException(query_failure_message(e, names.sparql_branches())) from e
         return format_display_content(
             Section(
                 f"Namespace {prefix}", [
@@ -572,17 +556,15 @@ class EntitySpaceEditor(Editor):
                     Item(f"{named_count} with a canon name"),
                     "most frequent types:",
                     *(
-                        [
-                            Item(f"{short_iri(row['t'].value)}: {row['n'].value}")
-                            for row in types if "t" in row
-                            ] if types else [Item("none")]
+                        [Item(f"{short_iri(rdf_type)}: {n}") for rdf_type, n in types]
+                        or [Item("none")]
                         ),
                     "examples:", *get_entity_examples(
                         self.kg_manager,
                         self.partition_grouping,
                         [prefix],
-                        self.name_sparql(),
-                        "",
+                        names,
+                        None,
                         8
                         ),
                     ]
@@ -692,8 +674,8 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
                 self.kg_manager,
                 self.grouping(),
                 self.entity_space,
-                self.name_sparql(),
-                f'FILTER(?group = "{name}")', 3)
+                self.names_pattern(),
+                name, 3)
                 ),
             Item("predicates (share of entities with the predicate):", [
                 item for item in format_predicate_usage(
@@ -773,20 +755,16 @@ class GroupingEditor[T: (Partition, GroupDefinition)](Editor):
                         Item(f"{kind} (share of the matches vs. the rest of {compare}):",
                              usage_items)
                         )
-        rows = run_retrieve_rows(
-            self.kg_manager,
-            # the membership pattern is in a subquery that returns only ?s, so
-            # its own ?o does not meet the ?o of the names
-            "SELECT DISTINCT ?s ?o WHERE {" + members_query(
-                membership_pattern, self.entity_space
-                ) + f"\nOPTIONAL {{ {self.name_sparql()} }} "
-            + "} LIMIT 6",
-            [membership_pattern]
-        )
-        content.append(Item("examples:", [
-            Item(r["s"].value + (f' "{clip(r["o"].value, 50)}"' if "o" in r else ""))
-            for r in rows if "s" in r
-            ]))
+        names = self.names_pattern()
+        try:
+            examples = format_entity_examples(
+                self.kg_manager, retrieve_members(self.kg_manager, membership_pattern, self.entity_space), names, 6
+                )
+        except Exception as e:
+            raise FunctionCallException(
+                query_failure_message(e, [membership_pattern, *names.sparql_branches()])
+                ) from e
+        content.append(Item("examples:", examples))
         return format_display_content(Section(title, content))
 
     def checked_membership(self, fn_args: dict) -> str:
@@ -1557,37 +1535,42 @@ class RoleEditor(Editor):
             raise FunctionCallException(
                 f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}"
                 )
-        rows = run_retrieve_rows(
-            self.kg_manager,
-            grouping_to_sparql_query(
-                self.kg_manager,
-                self.grouping,
-                self.entity_space,
-                "?group (COUNT(DISTINCT ?s) AS ?subjects) (COUNT(DISTINCT ?o) AS ?objects) "
-                "(SUM(IF(isLiteral(?o), 1, 0)) AS ?literals) (COUNT(*) AS ?n)",
-                "",
-                "GROUP BY ?group",
-                predicate_pattern.branches_for_union(),
-                ),
-            predicate_pattern.branches_for_union()
-            )
-        counts = {row["group"].value: row for row in rows if "group" in row}
-        value = lambda row, key: int(row[key].value) if key in row else 0
+        try:
+            groups_by_entity = retrieve_groups_by_entity(self.kg_manager, self.grouping, self.entity_space)
+            values_by_entity = retrieve_values(
+                self.kg_manager, groups_by_entity, predicate_pattern.sparql_branches(), literals_only=False
+                )
+        except Exception as e:
+            raise FunctionCallException(query_failure_message(e, predicate_pattern.sparql_branches())) from e
+        # per group: entities as ?s, matches, distinct ?o, literal matches
+        subjects: Counter[str] = Counter()
+        matches: Counter[str] = Counter()
+        literal_matches: Counter[str] = Counter()
+        objects: dict[str, set[Binding]] = defaultdict(set)
+        for entity, values in values_by_entity.items():
+            for group_name in groups_by_entity[entity]:
+                subjects[group_name] += 1
+                matches[group_name] += len(values)
+                literal_matches[group_name] += sum(value.typ == BindingType.LITERAL for value in values)
+                objects[group_name].update(values)
         content: list[SectionContent] = []
         for partition in self.scope:
-            row = counts.get(partition, {})
             content.append(
-                Item(f"{self.unit} {partition}: {format_share(value(row, 'subjects'),
+                Item(f"{self.unit} {partition}: {format_share(subjects[partition],
                                                               self.unit_sizes.get(partition, 0))} entities are ?s; "
-                     f"{value(row, 'n')} matches, {value(row, 'objects')} distinct ?o, "
-                     f"{value(row, 'literals')} literal matches"))
+                     f"{matches[partition]} matches, {len(objects[partition])} distinct ?o, "
+                     f"{literal_matches[partition]} literal matches"))
         if member is None:
-            in_scope = [p for p in self.scope if value(counts.get(p, {}), "subjects")]
-            member = max(in_scope, key=lambda p: value(counts[p], "subjects"), default=None)
-        if member is not None and value(counts.get(member, {}), "subjects"):
+            in_scope = [p for p in self.scope if subjects[p]]
+            member = max(in_scope, key=lambda p: subjects[p], default=None)
+        if member is not None and subjects[member]:
+            member_values = {
+                entity: values for entity, values in values_by_entity.items()
+                if member in groups_by_entity[entity]
+                }
             content.append(
                 Item(f"examples in {member} (?s -> ?o, with names in quotes):",
-                     self.format_examples(member, predicate_pattern.branches_for_union()))
+                     self.format_examples(member_values))
                 )
         return format_display_content(
             Section(
@@ -1595,54 +1578,37 @@ class RoleEditor(Editor):
                 content)
             )
 
-    def name_sparql(self) -> str:
-        """The names of ?s by the working names role (the functions may change it)."""
-        return names_to_sparql(self.roles.names)
-
-    def format_examples(self, member: str, predicate_patterns: list[str]) -> list[Item]:
+    def format_examples(self, values_by_entity: dict[IRI, list[Binding]]) -> list[Item]:
         """
-        Example matches with a name of ?s and of ?o
-        (local names alone might say little).
+        Example matches (?s -> ?o), drawn at random, with a name of ?s and of
+        ?o (local names alone might say little): by the role's predicates (not
+        its patterns) and the defaults, as ?o may be an entity of another
+        part, where the role need not hold.
         """
-        # not name_sparql(): the tested pattern itself binds ?o, which the
-        # names (bound to ?o) would join; so the name predicates with own
-        # variables, the role's predicates (not its patterns) and the defaults
-        # (?o may be an entity of another part, where the role need not hold)
-        names = self.roles.names.predicates if self.roles.names else []
-        name_predicates = list(dict.fromkeys(names + DEFAULT_LABEL_PREDICATES))
-        rows = run_retrieve_rows(
-            self.kg_manager,
-            grouping_to_sparql_query(
-                self.kg_manager,
-                self.grouping,
-                self.entity_space,
-                "?s ?o ?s_name ?o_name",
-                f'FILTER(?group = "{member}")\n'
-                f"OPTIONAL {{ {union_of([f'?s <{p}> ?s_name' for p in name_predicates])} }}\n"
-                f"OPTIONAL {{ {union_of([f'?o <{p}> ?o_name' for p in name_predicates])} }}",
-                f"LIMIT {NUM_EXAMPLE_MATCHES_TRY_PATTERN * 4}", predicate_patterns,
-                ),
-            predicate_patterns
+        matches = sorted(
+            ((entity, value) for entity, values in values_by_entity.items()
+             for value in set(values) if value.typ != BindingType.BNODE),
+            key=lambda match: (match[0], match[1].value, match[1].typ, match[1].lang or "")
             )
-        seen: set[tuple[str, str]] = set()
-        items: list[Item] = []
-        for row in rows:
-            if "s" not in row or "o" not in row:
-                continue
-            s, o = row["s"].value, row["o"].value
-            if (s, o) in seen:
-                continue
-            seen.add((s, o))
-            named = lambda var: row[var].value + (
-                f' "{clip(row[var + "_name"].value, 40)}"'
-                if var + "_name" in row else ""
-                )
-            items.append(
-                Item(f"{named('s')} -> {clip(named('o'), MAX_VALUE_CHARS)}")
-                )
-            if len(items) == NUM_EXAMPLE_MATCHES_TRY_PATTERN:
-                break
-        return items
+        drawn = random.Random(EXAMPLE_SEED).sample(matches, min(NUM_EXAMPLE_MATCHES_TRY_PATTERN, len(matches)))
+        role_names = self.roles.names.predicates if self.roles.names else []
+        name_pattern = PredicatePattern(predicates=list(dict.fromkeys(role_names + DEFAULT_LABEL_PREDICATES)))
+        named_iris = {entity for entity, _ in drawn} | {
+            IRI(value.value) for _, value in drawn if value.typ == BindingType.URI
+            }
+        try:
+            names_by_entity = retrieve_values(self.kg_manager, named_iris, name_pattern.sparql_branches())
+        except Exception as e:
+            raise FunctionCallException(query_failure_message(e)) from e
+
+        def named(term: str) -> str:
+            names = sorted(value.value for value in names_by_entity.get(IRI(term), []))
+            return term + (f' "{clip(names[0], 40)}"' if names else "")
+
+        return [
+            Item(f"{named(entity)} -> {clip(named(value.value), MAX_VALUE_CHARS)}")
+            for entity, value in drawn
+            ]
 
     def edit_role(self, fn_args: dict) -> str:
         role = fn_args.get("role")

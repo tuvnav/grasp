@@ -8,6 +8,7 @@ The six stages of the KG profile (data_models/profile.py), each a GRASP task on 
     om-profile-revision    f.  open flags resolved or dismissed, findings condensed
 """
 import copy
+from collections import Counter
 from functools import partial
 from typing import Callable, Literal
 
@@ -27,6 +28,7 @@ from grasp.tasks.om.data_models.profile import (
     unknown_name_message,
 )
 from grasp.tasks.om.foundation.configuration import configured_namespaces
+from grasp.tasks.om.kg_operations.grouping import retrieve_groups_by_entity
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
 from grasp.tasks.om.foundation.types import LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
@@ -41,8 +43,9 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     local_name_type,
     predicate_coverage,
     group_name_stats,
-    prefix_per_group_counts,
-    prefix_total_counts,
+    count_entities_by_prefix,
+    count_kinds_by_prefix,
+    retrieve_named_entities,
 )
 from grasp.tasks.om.tasks.profile_stage import (
     MAX_FINDINGS_AFTER_REVISION,
@@ -87,10 +90,13 @@ class SpaceTask(ProfileStageTask):
                 f"Large knowledge graphs (more than {LARGE_TRIPLES:_} triples, or whose triples cannot "
                 "be counted) are not supported yet."
                 )
-        named_entities_counts_per_group = prefix_per_group_counts(self.kg_manager, True)
-        all_entities_counts_per_group = prefix_per_group_counts(self.kg_manager, False)
-        prefix_counts_named_entities = prefix_total_counts(named_entities_counts_per_group)
-        prefix_counts_all_entities = prefix_total_counts(all_entities_counts_per_group)
+        # the entities of the default partitions (kinds), with the rest
+        kinds_by_entity = retrieve_groups_by_entity(self.kg_manager, None, ())
+        kinds_by_prefix = count_kinds_by_prefix(kinds_by_entity)
+        prefix_counts_all_entities = count_entities_by_prefix(kinds_by_entity)
+        prefix_counts_named_entities = count_entities_by_prefix(
+            retrieve_named_entities(self.kg_manager) & kinds_by_entity.keys()
+            )
 
         # the default space
         configured = configured_namespaces(self.config, self.kg_manager.kg)
@@ -123,13 +129,7 @@ class SpaceTask(ProfileStageTask):
             hosts.setdefault(namespace_of(prefix), []).append(prefix)
 
         def prefix_item(prefix: str) -> Item:
-            members = sorted(
-                (
-                    (member, n) for (other_prefix, member), n
-                    in all_entities_counts_per_group.items()
-                    if other_prefix == prefix
-                    ),
-                key=lambda x: -x[1])
+            members = kinds_by_prefix.get(prefix, Counter()).most_common()
             more_text = (
                 f", ... {len(members) - NUM_MEMBERS_LISTED_PER_PREFIX} more"
                 if len(members) > NUM_MEMBERS_LISTED_PER_PREFIX else ""
@@ -160,7 +160,7 @@ class SpaceTask(ProfileStageTask):
                 f"{prefix}:",
                 get_entity_examples(
                     self.kg_manager, DEFAULT_SPACE_PARTITION_GROUPING, [prefix],
-                    self.space_editor.name_sparql(), "", 4
+                    self.space_editor.names_pattern(), None, 4
                     )
                 )
             for prefix, _ in prefix_counts_all_entities.most_common(3)

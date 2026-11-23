@@ -598,7 +598,8 @@ def families_by_pair(venn_index: VennIndex) -> dict[tuple[IRI, IRI], frozenset[s
 
 def build_judging_units(
         merged_candidates: MergedCandidates,
-        candidates_of: CandidatesOf
+        candidates_of: CandidatesOf,
+        max_listed_candidates: int
         ) -> list[tuple[JudgingUnit, str]]:
     """
     The units of the candidate judging, each with its stratum (for the
@@ -608,7 +609,8 @@ def build_judging_units(
     conflicts between the judgments are information). After the cut list
     of the round, every further candidate the strategies found so far
     (candidates_of: this and earlier stages, best first), without layer and
-    signals. Stratum: kind/cell of the best pair/length class of the cut list,
+    signals, up to max_listed_candidates in all. Stratum: kind/cell of the
+    best pair/length class of the cut list,
     e.g. "source/key+vector/2-3".
     """
     layers_by_entity = merged_candidates.pareto_layers_by_entity
@@ -619,7 +621,8 @@ def build_judging_units(
     def listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
         """
         The candidates in list order, with their Pareto layer and the best
-        rank per family; then the further candidates found so far.
+        rank per family; then the further candidates found so far; at most
+        max_listed_candidates.
         """
         ranks_by_candidate = merged_candidates.candidate_rank_index.get((side, entity), {})
         listed = []
@@ -640,7 +643,7 @@ def build_judging_units(
             for candidate in candidates_of(side, entity)
             if candidate not in listed_entities
             )
-        return listed
+        return listed[:max_listed_candidates]
 
     def focus_entity(side: Side, entity: IRI) -> FocusEntity:
         return FocusEntity(

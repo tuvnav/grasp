@@ -343,7 +343,7 @@ def input_instructions(
     for side, entities in ((Side.SOURCE, source_entities), (Side.TARGET, target_entities)):
         state.entity_displays[side].prefetch(entities)
     for src_ent in source_entities:
-        input += state.entity_displays[Side.SOURCE].show(src_ent) + "\n\n"
+        input += state.entity_displays[Side.SOURCE].show(src_ent, LONG_VIEW) + "\n\n"
 
     if len(target_entities) == 1:
         input += "**Target entity**: "
@@ -351,7 +351,7 @@ def input_instructions(
         input += "**Target entities:**\n"
 
     for tgt_ent in target_entities:
-        input += state.entity_displays[Side.TARGET].show(tgt_ent) + "\n\n"
+        input += state.entity_displays[Side.TARGET].show(tgt_ent, LONG_VIEW) + "\n\n"
 
     return input
 
@@ -401,8 +401,8 @@ class OMVerifyTask(GraspTask):
             source_iri=verify_input.source_iri,
             target_iri=verify_input.target_iri,
             entity_displays={
-                Side.SOURCE: EntityDisplay(managers[Side.SOURCE], verify_input.source_profile, LONG_VIEW),
-                Side.TARGET: EntityDisplay(managers[Side.TARGET], verify_input.target_profile, LONG_VIEW),
+                Side.SOURCE: EntityDisplay(managers[Side.SOURCE], verify_input.source_profile),
+                Side.TARGET: EntityDisplay(managers[Side.TARGET], verify_input.target_profile),
             },
             agentic=verify_input.agentic,
             competitors_by_side=verify_input.competitors

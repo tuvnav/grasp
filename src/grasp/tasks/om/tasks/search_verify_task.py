@@ -134,12 +134,12 @@ def focused_input(state: SearchVerifyState) -> str:
     with_candidates = any(focus.candidates for focus in state.unit.focus)
     for number, focus in enumerate(state.unit.focus, start=1):
         side, other_side = Side(focus.side), Side.other_side(Side(focus.side))
-        body = state.entity_displays[side].show(focus.entity)
+        body = state.entity_displays[side].show(focus.entity, LONG_VIEW)
         candidates = ordered_candidates(focus, state.variant, state.unit.key)
         if candidates:
             lines = []
             for candidate_number, candidate in enumerate(candidates, start=1):
-                line = f"{candidate_number}. {state.entity_displays[other_side].show(candidate.entity)}"
+                line = f"{candidate_number}. {state.entity_displays[other_side].show(candidate.entity, LONG_VIEW)}"
                 if state.variant.show_signals:
                     line += f"\n   ({format_signals(candidate)})"
                 lines.append(line)
@@ -163,7 +163,7 @@ def clusters_input(state: SearchVerifyState) -> str:
     sections = []
     for side in SIDES:
         entities = state.presented[side]
-        body = "\n\n".join(f"{number}. {state.entity_displays[side].show(entity)}"
+        body = "\n\n".join(f"{number}. {state.entity_displays[side].show(entity, LONG_VIEW)}"
                            for number, entity in enumerate(entities, start=1))
         sections.append(format_section(
             f"Entities of the {side.value} ontology {kg_names[side]}", body or "none", level=3))
@@ -457,7 +457,7 @@ class SearchVerifyTask(GraspTask):
             unit=search_verify_input.unit,
             variant=search_verify_input.variant,
             entity_displays={
-                side: EntityDisplay(managers[side], alignment_state.get_kg_profile(side), LONG_VIEW)
+                side: EntityDisplay(managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES
             },
             know_before_use=know_before_use(self.config),

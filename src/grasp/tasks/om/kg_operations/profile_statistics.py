@@ -4,9 +4,10 @@ entity space, predicate coverage, distinguishing features, the default canon
 restricted to what the KG uses, and local names. Every statistic is computed per
 member of a grouping (grouping.py), partitions and groups alike.
 
-Scales with the KG: counting is done by the SPARQL server (GROUP BY), so only
-aggregates are transferred, and the local name sample is drawn while streaming
-the entities (reservoir sampling), so memory stays at the sample size.
+Generic, flat SPARQL: the entities of the groups are retrieved once per
+statistic (grouping.retrieve_groups_by_entity, one query per membership), then
+each group is counted over its entities in VALUES blocks (GROUP BY on the
+server, so only aggregates are transferred); the groups are combined in Python.
 """
 import random
 import re
@@ -47,20 +48,18 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
 )
 from grasp.tasks.om.kg_operations.grouping import (
     Grouping,
-    count_rows,
+    members_by_group,
     retrieve_counts_by_group,
-    grouping_to_sparql_query,
-    grouping_to_sparql_subquery,
+    retrieve_groups_by_entity,
+    retrieve_members,
     single_group_grouping,
 )
 from grasp.tasks.om.sparql_access import (
-    select_rows,
-    stream_rows,
-    make_sparql_prologue,
-    sparql_filter_by_space,
-    union_of,
-    down_pushed_union,
+    INVALID_IRI_CHARACTERS,
     as_batched_values_blocks,
+    count_entities_by_key,
+    retrieve_values,
+    select_rows,
 )
 
 # a KG with more triples, or whose triples cannot be counted, is not supported yet
@@ -117,45 +116,36 @@ CODE_SHARE = 0.2
 # follows (http://dbkwik.webdatacommons.org/stexpanded.wikia.com/), otherwise
 # scheme and host (http://mouse.owl#MA_0000001 -> http://mouse.owl); without a
 # host, up to the last # or / (as namespace_of)
-HOST_EXPRESSION = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+).*$", "$1")'
-HOST_AND_SEGMENT_EXPRESSION = 'REPLACE(STR(?s), "^([^:/]+://[^/#?]+/[^/#?]+/).*$", "$1")'
-PREFIX_EXPRESSION = (
-    f'IF(REGEX(STR(?s), "^[^:/]+://[^/#?]+/[^/#?]+/"), {HOST_AND_SEGMENT_EXPRESSION}, '
-    f'IF(CONTAINS(STR(?s), "://"), {HOST_EXPRESSION}, REPLACE(STR(?s), "[^#/]*$", "")))'
-)
-# characters not allowed in a SPARQL IRI reference
-INVALID_IRI_CHARACTERS = re.compile(r'[\s<>"{}|^`\\]')
+HOST_AND_SEGMENT = re.compile(r"^[^:/]+://[^/#?]+/[^/#?]+/")
+HOST = re.compile(r"^[^:/]+://[^/#?]+")
 
 
-def prefix_per_group_counts(
-        manager: KgManager, named_only: bool
-        ) -> dict[tuple[str, str], int]:
-    """
-    (prefix, kind) -> entities, optionally only entities with a
-    canon name or synonym (keeps out e.g. image files of wiki KGs).
-    """
-    named = (
-        f"""FILTER EXISTS {{ {union_of([
-            f'?s <{p}> ?name'
-            for p in DEFAULT_LABEL_PREDICATES + SYNONYM_PREDICATES]
-            )}  }}"""
-
-        if named_only else ""
-        )
-    sparql = grouping_to_sparql_query(
-        manager, None, (), "?prefix ?group (COUNT(DISTINCT ?s) AS ?n)",
-        f"{named}\nBIND({PREFIX_EXPRESSION} AS ?prefix)", "GROUP BY ?prefix ?group",
-    )
-    return count_rows(select_rows(manager, sparql), "prefix", "group")
+def prefix_of(iri: str) -> str:
+    """The prefix of an entity (see HOST_AND_SEGMENT and HOST)."""
+    if match := HOST_AND_SEGMENT.match(iri):
+        return match.group(0)
+    if "://" in iri and (match := HOST.match(iri)):
+        return match.group(0)
+    return re.sub(r"[^#/]*$", "", iri)
 
 
-def prefix_total_counts(
-        prefix_per_group_counts: dict[tuple[str, str], int]
-        ) -> Counter[str]:
-    totals: Counter[str] = Counter()
-    for (prefix, _), n in prefix_per_group_counts.items():
-        totals[prefix] += n
-    return totals
+def retrieve_named_entities(manager: KgManager) -> set[IRI]:
+    """The IRIs with a canon name or synonym."""
+    names = "|".join(f"<{p}>" for p in DEFAULT_LABEL_PREDICATES + SYNONYM_PREDICATES)
+    return retrieve_members(manager, f"?s {names} ?name")
+
+
+def count_kinds_by_prefix(kinds_by_entity: dict[IRI, set[str]]) -> dict[str, Counter[str]]:
+    """prefix -> kind (default partition) -> entities."""
+    counts: dict[str, Counter[str]] = defaultdict(Counter)
+    for entity, kinds in kinds_by_entity.items():
+        counts[prefix_of(entity)].update(kinds)
+    return dict(counts)
+
+
+def count_entities_by_prefix(entities: Iterable[IRI]) -> Counter[str]:
+    """prefix -> entities."""
+    return Counter(prefix_of(entity) for entity in entities)
 
 
 def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[str], str]:
@@ -167,9 +157,12 @@ def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[
     configured = configured_namespaces(config, manager.kg)
     if configured:
         return list(configured), "configured"
-    for named_only, source in ((True, "prefix with the most named entities"),
-                               (False, "prefix with the most entities")):
-        totals = prefix_total_counts(prefix_per_group_counts(manager, named_only))
+    # the entities of the default partitions (kinds), with the rest
+    entities = set(retrieve_groups_by_entity(manager, None, ()))
+    named_entities = retrieve_named_entities(manager) & entities
+    for counted, source in ((named_entities, "prefix with the most named entities"),
+                            (entities, "prefix with the most entities")):
+        totals = count_entities_by_prefix(counted)
         if totals:
             return [totals.most_common(1)[0][0]], source
     return [], "no entities found"
@@ -205,37 +198,39 @@ def predicate_coverage(
     group -> outgoing predicate (entities of the group as subject)
     -> coverage, with the kinds of its values (objects).
     """
-    sparql = grouping_to_sparql_query(
-        manager, grouping, space,
-        "?group ?p (COUNT(DISTINCT ?s) AS ?n) (COUNT(?o) AS ?m) "
-        "(SUM(IF(isLiteral(?o), 1, 0)) AS ?lit) (SUM(IF(isBlank(?o), 1, 0)) AS ?blank)",
-        "?s ?p ?o .", "GROUP BY ?group ?p",
-    )
-    coverage: dict[str, dict[IRI, PredicateCoverage]] = defaultdict(dict)
-    for row in select_rows(manager, sparql):
-        if "group" in row and "p" in row:
-            coverage[row["group"].value][IRI(row["p"].value)] = PredicateCoverage(
-                entities=int(row["n"].value), values=int(row["m"].value),
-                literals=int(row["lit"].value) if "lit" in row else 0,
-                blanks=int(row["blank"].value) if "blank" in row else 0,
-            )
-    return dict(coverage)
+    sums: dict[str, dict[IRI, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items():
+        for block in as_batched_values_blocks(members):
+            sparql = (
+                "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) (COUNT(?o) AS ?m) "
+                "(SUM(IF(isLiteral(?o), 1, 0)) AS ?lit) (SUM(IF(isBlank(?o), 1, 0)) AS ?blank) "
+                f"WHERE {{ VALUES ?s {{ {block} }} ?s ?p ?o }} GROUP BY ?p"
+                )
+            for row in select_rows(manager, sparql):
+                if "p" in row:
+                    # the blocks are disjoint: their counts add up
+                    sums[group_name][IRI(row["p"].value)].update(
+                        {key: int(row[key].value) for key in ("n", "m", "lit", "blank") if key in row}
+                        )
+    return {
+        group_name: {
+            predicate: PredicateCoverage(
+                entities=counts["n"], values=counts["m"], literals=counts["lit"], blanks=counts["blank"]
+                )
+            for predicate, counts in by_predicate.items()
+            }
+        for group_name, by_predicate in sums.items()
+        }
 
 
 def type_coverage(
     manager: KgManager, grouping: Grouping | None, space: Iterable[str]
         ) -> dict[str, dict[str, int]]:
     """group -> rdf:type value -> entities."""
-    sparql = grouping_to_sparql_query(
-        manager, grouping, space, "?group ?t (COUNT(DISTINCT ?s) AS ?n)",
-        f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "GROUP BY ?group ?t",
-    )
-    coverage: dict[str, dict[str, int]] = defaultdict(dict)
-    for (group, t), n in count_rows(
-            select_rows(manager, sparql), "group", "t"
-            ).items():
-        coverage[group][t] = n
-    return dict(coverage)
+    return {
+        group_name: dict(count_entities_by_key(manager, members, f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "t"))
+        for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items()
+        }
 
 
 @dataclass
@@ -309,11 +304,6 @@ def rest(total: dict[str, int], total_size: int, inside: dict[str, int], size: i
         }, max(0, total_size - size)
 
 
-def members_query(membership: str, space: Iterable[str]) -> str:
-    return f"""{{ SELECT DISTINCT ?s WHERE {{ {
-        membership} }} }}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}"""
-
-
 def membership_overlap(
     manager: KgManager,
     grouping: Grouping | None,
@@ -324,22 +314,13 @@ def membership_overlap(
     (entities matching a membership pattern, those per current group or
     partition, UNCATEGORIZED for matches in none).
     """
-    prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
-    sparql = (
-        f"{make_sparql_prologue(prefixes)}\nSELECT ?part (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-        f"{members_query(membership, space)}\nOPTIONAL {subquery}\n"
-        f'BIND(COALESCE(?group, "{UNCATEGORIZED}") AS ?part)\n}} GROUP BY ?part'
+    matches = retrieve_members(manager, membership, space)
+    groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+    overlap = Counter(
+        group_name for entity in matches
+        for group_name in groups_by_entity.get(entity) or {UNCATEGORIZED}
         )
-    overlap = {
-        part: n
-        for (part,), n in count_rows(select_rows(manager, sparql), "part").items()
-        }
-    size = select_rows(
-        manager,
-        f"{make_sparql_prologue(prefixes)}\nSELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n"
-        f"{members_query(membership, space)}\n}}"
-        )
-    return (int(size[0]["n"].value) if size and "n" in size[0] else 0), overlap
+    return len(matches), dict(overlap)
 
 
 def member_coverage(
@@ -348,12 +329,9 @@ def member_coverage(
     """
     (predicate -> num entities, rdf:type value -> num entities) among the matches of a membership pattern.
     """
-    members = members_query(membership, space)
-    predicates = select_rows(manager, f"SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n?s ?p ?o }} GROUP BY ?p")
-    types = select_rows(manager, (f"SELECT ?t (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{members}\n"
-                                  f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t)) }} GROUP BY ?t"))
-    return ({p: n for (p,), n in count_rows(predicates, "p").items()},
-            {t: n for (t,), n in count_rows(types, "t").items()})
+    members = retrieve_members(manager, membership, space)
+    return (dict(count_entities_by_key(manager, members, "?s ?p ?o", "p")),
+            dict(count_entities_by_key(manager, members, f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "t")))
 
 
 def canon_roles() -> PredicateRoles:
@@ -379,25 +357,16 @@ def count_entities_by_predicate(
         ) -> dict[str, dict[str, int]]:
     """
     predicate -> group name -> num entities of the group in the triple pattern
-    (?s the entity, ?p the predicate), for all predicates in one query.
+    (?s the entity, ?p the predicate), all predicates in one query per block.
     """
     predicates = sorted(set(predicates))
     counts: dict[str, dict[str, int]] = defaultdict(dict)
     if not predicates:
         return counts
     values = " ".join(f"<{p}>" for p in predicates)
-    sparql = grouping_to_sparql_query(
-        manager,
-        grouping,
-        space,
-        "?group ?p (COUNT(DISTINCT ?s) AS ?n)",
-        f"VALUES ?p {{ {values} }}\n{triple} .",
-        "GROUP BY ?group ?p"
-        )
-    for (group, predicate), n in count_rows(
-            select_rows(manager, sparql), "group", "p"
-            ).items():
-        counts[predicate][group] = n
+    for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items():
+        for predicate, n in count_entities_by_key(manager, members, f"VALUES ?p {{ {values} }} {triple}", "p").items():
+            counts[predicate][group_name] = n
     return counts
 
 
@@ -529,44 +498,18 @@ def sample_entities_for_local_name_type(
         space: Iterable[str],
         k: int = SAMPLE_SIZE,
         seed: int = SAMPLE_SEED,
-        where: str = "") -> dict[str, list[IRI]]:
+        ) -> dict[str, list[IRI]]:
     """
-    Up to k random entities per group, drawn while streaming (reservoir
-    sampling), so memory stays at k per group whatever the KG size.
+    Up to k random entities per group (IRIs that can be written in SPARQL),
+    the same for the same seed.
     """
     rng = random.Random(seed)
-    samples: dict[str, list[IRI]] = defaultdict(list)
-    seen: Counter[str] = Counter()
-    sparql = grouping_to_sparql_query(manager, grouping, space, "?s ?group", where, "ORDER BY ?s")
-    for row in stream_rows(manager, sparql):
-        entity, group = IRI(row["s"]["value"]), row["group"]["value"]
-        if INVALID_IRI_CHARACTERS.search(entity):
-            continue
-        seen[group] += 1
-        if len(samples[group]) < k:
-            samples[group].append(entity)
-        elif (j := rng.randrange(seen[group])) < k:
-            samples[group][j] = entity
-    return dict(samples)
-
-
-def retrieve_values(
-        manager: KgManager,
-        entities: Iterable[IRI],
-        pattern: PredicatePattern | None,
-        literals_only: bool = True
-        ) -> dict[IRI, list[str]]:
-    """?o of the pattern per entity (?s)."""
-    values: dict[IRI, list[str]] = defaultdict(list)
-    if pattern is None:
-        return values
-    literal = "FILTER(isLiteral(?o))" if literals_only else ""
-    for block in as_batched_values_blocks(entities):
-        sparql = f"SELECT ?s ?o WHERE {{ {down_pushed_union(f'VALUES ?s {{ {block} }}', pattern.branches_for_union())} {literal} }}"
-        for row in select_rows(manager, sparql):
-            if "s" in row and "o" in row:
-                values[IRI(row["s"].value)].append(row["o"].value)
-    return values
+    members = members_by_group(retrieve_groups_by_entity(manager, grouping, space))
+    samples: dict[str, list[IRI]] = {}
+    for group_name in sorted(members):
+        candidates = sorted(e for e in members[group_name] if not INVALID_IRI_CHARACTERS.search(e))
+        samples[group_name] = rng.sample(candidates, min(k, len(candidates)))
+    return samples
 
 
 NAME_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
@@ -628,7 +571,10 @@ def local_name_type(stats: LocalNameStats) -> LocalNameType:
 def local_name_stats(
         manager: KgManager, sample: list[IRI], names: PredicatePattern | None
         ) -> LocalNameStats:
-    entity_names = retrieve_values(manager, sample, names)
+    entity_names = {
+        entity: [value.value for value in values]
+        for entity, values in retrieve_values(manager, sample, names.sparql_branches() if names else []).items()
+        }
     local_names = {entity: local_name(entity) for entity in sample}
     stats = LocalNameStats(sample_size=len(sample), labelled=sum(entity in entity_names for entity in sample))
     if sample:
@@ -647,9 +593,7 @@ def group_name_stats(
         group: str,
         roles: PredicateRoles
         ) -> LocalNameStats:
-    sample = sample_entities_for_local_name_type(
-        manager, grouping, space, where=f'FILTER(?group = "{group}")'
-        )
+    sample = sample_entities_for_local_name_type(manager, grouping, space)
     return local_name_stats(manager, sample.get(group, []), roles.names)
 
 

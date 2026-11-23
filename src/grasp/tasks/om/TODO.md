@@ -39,3 +39,7 @@
 - Kandidatenstrategie: TF-IDF: Stopwortentfernung mit Sprachangabe als Option
 - Kandidatenstrategie: deterministische Zusammenführung von Familien
 - Präfixe in describe_profile kürzen: Auf KgManager zugreifen (Setup muss davor gelaufen sein) oder eigene Funktionalität für gekürzte Präfixe umsetzen...
+
+
+## Komische Stellen in Prompts:
+- Profiling common: "inverse_of is only for two relations that cannot be expressed as one"; " Before you state a number that compares entities (e.g. how many names collide), exclude the entity itself and helper nodes (e.g. nodes that hold the synonyms or values of the entity) from the comparison, and check the count with a second query."

@@ -8,6 +8,7 @@ about (also where the entity is the object of a triple, e.g. incoming edges
 a speaking name (e.g. ?linked, ?usage_subject).
 """
 
+from collections import Counter, defaultdict
 import json
 import re
 import hashlib
@@ -35,6 +36,8 @@ PREFIX_RE = re.compile(
     r"^\s*PREFIX\s+([^:\s]*):\s*<([^>]*)>\s*$", re.IGNORECASE
     )
 IRI_REFERENCE = re.compile(r"<[^\s<>\"{}|^`\\]*>")
+# characters not allowed in a SPARQL IRI reference
+INVALID_IRI_CHARACTERS = re.compile(r'[\s<>"{}|^`\\]')
 # statistics queries of the profile may take longer than a query of the model
 STATS_TIMEOUT = (6, 120)
 
@@ -128,27 +131,6 @@ def sparql_literal(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def down_pushed_union(
-        search_space_restriction: str,
-        branch_patterns: list[str],
-        ) -> str:
-    """
-    Builds a SPARQL query with the space restriction down pushed
-    into the branch patterns:
-    '{<restriction_condiction> <branch_1>} UNION {<restriction_condiction> <branch_2>}'
-    instead of '<restriction_condition> {branch_1} UNION {branch_2}'.
-    A Qlever server evaluates an alternative in braces on its own,
-    so it would scan the whole KG for it if the group were outside.
-    The restriction binds ?s (the entity) before each branch, so the server
-    looks the branch up from the entities (index scan).
-    """
-    if len(branch_patterns) == 1:
-        return f"{search_space_restriction}\n{branch_patterns[0]}"
-    return " UNION ".join(
-        f"{{ {search_space_restriction}\n{part} }}" for part in branch_patterns
-        )
-
-
 def values_clause(var: str, iris: Iterable[str]) -> str:
     """
     VALUES ?var { <iri> ... }; a large one as a placeholder IRI that
@@ -160,20 +142,6 @@ def values_clause(var: str, iris: Iterable[str]) -> str:
     return f"VALUES ?{var} {{ {replace_values_by_placeholder(terms)} }}"
 
 
-def values_table(variables: list[str], rows: Iterable[tuple[str, ...]]) -> str:
-    """
-    VALUES (?a ?b) { (term term) ... } of SPARQL terms; a large one as a
-    placeholder row that prepare_query replaces by the rows.
-    """
-    head = "(" + " ".join(f"?{v}" for v in variables) + ")"
-    rows = list(rows)
-    terms = " ".join("(" + " ".join(row) + ")" for row in rows)
-    if len(rows) <= MAX_INLINE_VALUES:
-        return f"VALUES {head} {{ {terms} }}"
-    undef = " UNDEF" * (len(variables) - 1)
-    return f"VALUES {head} {{ ({replace_values_by_placeholder(terms)}{undef}) }}"
-
-
 def replace_values_by_placeholder(terms: str) -> str:
     key = f"{VALUES_PLACEHOLDER_IRI}{hashlib.sha1(terms.encode()).hexdigest()}"
     VALUES_PLACEHOLDER_INDEX[key] = terms
@@ -183,17 +151,17 @@ def replace_values_by_placeholder(terms: str) -> str:
 def expand_values_blocks(sparql: str) -> str:
     if VALUES_PLACEHOLDER_IRI not in sparql:
         return sparql
-    # a placeholder row of a table (<key> UNDEF ...), or a placeholder IRI
     return re.sub(
-        rf"\(\s*<({re.escape(VALUES_PLACEHOLDER_IRI)}[0-9a-f]+)>(?:\s+UNDEF)+\s*\)|<({re.escape(VALUES_PLACEHOLDER_IRI)}[0-9a-f]+)>",
-        lambda m: VALUES_PLACEHOLDER_INDEX[m.group(1) or m.group(2)], sparql)
+        rf"<({re.escape(VALUES_PLACEHOLDER_IRI)}[0-9a-f]+)>",
+        lambda match: VALUES_PLACEHOLDER_INDEX[match.group(1)], sparql)
 
 
 def as_batched_values_blocks(iris: Iterable[IRI]) -> Iterable[str]:
     """
-    The IRIs as VALUES contents (<a> <b> ...) in blocks of BATCH_SIZE.
+    The IRIs as VALUES contents (<a> <b> ...) in blocks of BATCH_SIZE; IRIs
+    that cannot be written in SPARQL (INVALID_IRI_CHARACTERS) are left out.
     """
-    iris = sorted(set(iris))
+    iris = sorted({iri for iri in iris if not INVALID_IRI_CHARACTERS.search(iri)})
     for start in range(0, len(iris), BATCH_SIZE):
         yield " ".join(f"<{iri}>" for iri in iris[start:start + BATCH_SIZE])
 
@@ -236,6 +204,51 @@ def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
     if not isinstance(result, SelectResult):
         return []
     return [dict(row) for row in result.rows()]
+
+
+def retrieve_values(
+        manager: KgManager,
+        entities: Iterable[IRI],
+        branches: Sequence[str],
+        literals_only: bool = True
+        ) -> dict[IRI, list[Binding]]:
+    """
+    ?o per entity (?s) of the alternatives of a pattern (e.g. the
+    sparql_branches of a PredicatePattern): one query per alternative and per
+    block of entities, the alternative in the block of VALUES ?s (an
+    alternative may need ?s bound, e.g. BIND(... STR(?s) ...)). Entities
+    without a value are missing.
+    """
+    values: dict[IRI, list[Binding]] = defaultdict(list)
+    literal_filter = "FILTER(isLiteral(?o))" if literals_only else ""
+    for branch in branches:
+        for block in as_batched_values_blocks(entities):
+            sparql = f"SELECT ?s ?o WHERE {{ VALUES ?s {{ {block} }} {branch} {literal_filter} }}"
+            for row in select_rows(manager, sparql):
+                if "s" in row and "o" in row:
+                    values[IRI(row["s"].value)].append(row["o"])
+    return values
+
+
+def count_entities_by_key(
+        manager: KgManager, entities: Iterable[IRI], pattern: str, key: str
+        ) -> Counter[str]:
+    """
+    Value of ?{key} -> entities (?s) with a match of the pattern binding it
+    (e.g. pattern "?s ?p ?o", key "p": entities per predicate). One query per
+    block of entities, the pattern in the block of VALUES ?s; the blocks are
+    disjoint, so their counts add up.
+    """
+    counts: Counter[str] = Counter()
+    for block in as_batched_values_blocks(entities):
+        sparql = (
+            f"SELECT ?{key} (COUNT(DISTINCT ?s) AS ?n) WHERE {{ VALUES ?s {{ {block} }} {pattern} }} "
+            f"GROUP BY ?{key}"
+            )
+        for row in select_rows(manager, sparql):
+            if key in row and "n" in row:
+                counts[row[key].value] += int(row["n"].value)
+    return counts
 
 
 def entity_exists_in_kg(manager: KgManager, iri: str) -> bool:
@@ -311,77 +324,47 @@ class ValueGroup:
 def retrieve_value_groups(
         manager: KgManager,
         entities: Iterable[IRI],
-        branches: list[str],
+        predicate_branches: list[str],
         sample_size: int,
-        # entity -> role name or predicate IRI -> group;
+        left_out_values: dict[IRI, set[Binding]] | None = None,
+        # entity ->
+        #   role name or predicate IRI ->
+        #       value sample + total values count;
         # entities without any value are missing
         ) -> dict[IRI, dict[str, ValueGroup]]:
     """
-    The values of the entities, grouped by ?predicate_ref, with the number of all
-    values and at most sample_size of them. SPARQL has no LIMIT per group:
-    the groups are counted first, small groups are retrieved in batches and
-    only the large ones (hubs) one by one.
-    branches: SPARQL alternatives over ?s (the entity), ?predicate_ref and ?o (the
-    value). A branch binds ?predicate_ref by VALUES, not by BIND: BIND to a variable
-    that the restriction VALUES (?s ?predicate_ref) already binds is not allowed.
+    The values of the entities, grouped by ?predicate_ref, with the number of
+    all distinct values and at most sample_size of them (sorted).
+    predicate_branches: SPARQL patterns over ?s (the entity), ?predicate_ref
+    (a role name bound by BIND, or the predicate IRI) and ?o (the value).
+    Each is queried on its own, in the block of VALUES ?s, so that a branch
+    that needs ?s bound (BIND(... STR(?s) ...)) sees it. All values are
+    retrieved: the count is exact also over several branches of one group.
+    left_out_values: values of an entity that are neither counted nor shown
+    (e.g. the noise of the profile).
     """
-    if not branches:
-        return {}
-    # 1. count per (entity, predicate_ref)
-    counts: dict[tuple[IRI, Binding], int] = {}
-    for values_block in as_batched_values_blocks(entities):
-        query = (
-            "SELECT ?s ?predicate_ref (COUNT(DISTINCT ?o) AS ?count) WHERE {\n"
-            + down_pushed_union(f"VALUES ?s {{ {values_block} }}", branches)
-            + "\n} GROUP BY ?s ?predicate_ref"
-        )
-        for row in select_rows(manager, query):
-            counts[(IRI(row["s"].value), row["predicate_ref"])] = int(row["count"].value)
-    # 2. small groups in batches, 3. large groups one by one, with a sample
-    small_value_groups = [
-        entity_predicate_pair for entity_predicate_pair, count in counts.items()
-        if count <= sample_size
-        ]
-    queries = [
-        # ((entity, predicate_binding), <modifier>): no modifiers here
-        (small_value_groups[start:start + BATCH_SIZE], ""
-         ) for start in range(0, len(small_value_groups), BATCH_SIZE)
-        ]
-    queries += [
-        # ((entity, predicate_binding), <modifier>)
-        ([entity_predicate_pair], f"ORDER BY ?o LIMIT {sample_size}")
-        for entity_predicate_pair, count in counts.items() if count > sample_size
-    ]
-    values_by_entity_predicate_pair: dict[tuple[IRI, Binding], list[Binding]] = {
-        pair: [] for pair in counts
-        }
-    for pairs, modifiers in queries:
-        restriction = values_table(
-            ["s", "predicate_ref"],
-            [
-                (
-                    f"<{entity}>", f"<{predicate_ref.value}>"
-                    if predicate_ref.typ == BindingType.URI
-                    else sparql_literal(predicate_ref.value)
-                    )  # profile role name
-                for entity, predicate_ref in pairs
-            ],
-        )
-        query = (
-            "SELECT DISTINCT ?s ?predicate_ref ?o WHERE {\n"
-            + down_pushed_union(restriction, branches)
-            + "\n} " + modifiers
-        )
-        for row in select_rows(manager, query):
-            values_by_entity_predicate_pair[
-                (IRI(row["s"].value), row["predicate_ref"])
-                ].append(row["o"])
-    groups: dict[IRI, dict[str, ValueGroup]] = {}
-    for (entity, predicate_ref), values in values_by_entity_predicate_pair.items():
-        groups.setdefault(entity, {})[predicate_ref.value] = ValueGroup(
-            counts[(entity, predicate_ref)], values
+    left_out_values = left_out_values or {}
+    values_by_group: dict[tuple[IRI, str], set[Binding]] = defaultdict(set)
+    for branch in predicate_branches:
+        for entities_block in as_batched_values_blocks(entities):
+            query = ("SELECT ?s ?predicate_ref ?o WHERE { VALUES ?s"
+                     f"{{ {entities_block} }} {branch} }}")
+            for row in select_rows(manager, query):
+                if "predicate_ref" in row and "o" in row \
+                        and row["o"] not in left_out_values.get(IRI(row["s"].value), set()):
+                    values_by_group[
+                        (IRI(row["s"].value), row["predicate_ref"].value)
+                        ].add(row["o"])
+    value_groups: dict[IRI, dict[str, ValueGroup]] = {}
+    for (entity, predicate_ref), values in values_by_group.items():
+        sorted_values = sorted(
+            values, key=lambda value: (value.value, value.typ, value.lang or "")
             )
-    return groups
+        value_groups.setdefault(entity, {})[predicate_ref] = ValueGroup(
+            len(values), sorted_values[:sample_size]
+            )
+
+    return value_groups
 
 
 def query_failure_message(

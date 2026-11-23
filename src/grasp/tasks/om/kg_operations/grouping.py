@@ -1,13 +1,15 @@
 """
 Groupings: named membership patterns over ?s, as exclusive partitions or
-overlapping groups, and the queries over their entities (?s ?group) that
-every statistic and value retrieval builds on.
+overlapping groups, and their entities with the names of their groups
+(retrieve_groups_by_entity), which every statistic and value retrieval
+builds on. One query per membership: the groups are combined (priority of
+partitions, excluded groups, entity space) in Python, not in SPARQL.
 """
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from grasp.manager import KgManager
-from grasp.sparql.types import Binding
 from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
     GroupOrigin,
@@ -20,16 +22,11 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     KIND_ALTERNATIVES,
     UNCATEGORIZED,
     UNIVERSE,
-    VOCABULARY_PROLOGUE,
 )
 from grasp.tasks.om.sparql_access import (
+    retrieve_values,
     select_rows,
-    sparql_literal,
-    make_sparql_prologue,
-    sparql_filter_by_space,
-    split_prologue,
     union_of,
-    down_pushed_union,
     as_batched_values_blocks,
 )
 from grasp.tasks.om.foundation.types import IRI
@@ -55,8 +52,14 @@ class Grouping:
 
     def merged(self, name: str) -> "Grouping":
         """All members as one: the entities of any member."""
-        return Grouping(tuple((name, membership) for _, membership in self.members if membership != UNIVERSE),
-                        exclusive=True, minus=self.minus)
+        return Grouping(
+            tuple(
+                (name, membership) for _, membership in self.members
+                if membership != UNIVERSE
+                ),
+            exclusive=True,
+            minus=self.minus
+            )
 
     def extended_by(
             self,
@@ -145,66 +148,6 @@ def single_group_grouping(profile: KgProfile, group: str) -> Grouping:
         )
 
 
-def grouping_to_sparql_subquery(
-        manager: KgManager,
-        grouping: Grouping | None,
-        space: Iterable[str] = ()
-        ) -> tuple[dict[str, str], str]:
-    """
-    Generates a SPARQL query with prefixes as dict. Returns:
-    ({shortened_prefix: <http://full_prefix_iri>}, sparql_subquery_for_grouping).
-    binding ?s ?group within the entity space.
-    Without a grouping: the kind partitions.
-    """
-    grouping = grouping or default_partitions_to_grouping()
-    prefixes, _ = split_prologue(
-        manager, VOCABULARY_PROLOGUE + "\nSELECT * WHERE { ?s ?p ?o }"
-        )
-    branches = " UNION ".join(
-        f"{{ {{ SELECT DISTINCT ?s WHERE {{ {membership} }} }} BIND({rank} AS ?rank) }}"
-        for rank, (_, membership) in enumerate(grouping.members)
-    )
-    minus_part = "".join(f"\nMINUS {{ SELECT DISTINCT ?s WHERE {{ {membership} }} }}" for membership in grouping.minus)
-    internal_wheres = f"{branches}\nFILTER(isIRI(?s))\n{sparql_filter_by_space(space)}{minus_part}"
-    names_rank_mapping = " ".join(f"({rank} {sparql_literal(name)})" for rank, (name, _) in enumerate(grouping.members))
-    if grouping.exclusive:
-        return prefixes, (f"{{ SELECT ?s ?group WHERE {{\n"
-                          f"{{ SELECT ?s (MIN(?rank) AS ?first) WHERE {{\n{internal_wheres}\n}} GROUP BY ?s }}\n"
-                          f"VALUES (?first ?group) {{ {names_rank_mapping} }}\n}} }}")
-    return prefixes, (
-        f"{{ SELECT DISTINCT ?s ?group WHERE {{\n{internal_wheres}\n"
-        f"VALUES (?rank ?group) {{ {names_rank_mapping} }}\n}} }}"
-        )
-
-
-def grouping_to_sparql_query(
-    manager: KgManager,
-    grouping: Grouping | None,
-    space: Iterable[str],
-    select: str,
-    where: str = "",
-    tail: str = "",
-    branches: list[str] | None = None,
-        ) -> str:
-    """
-    Query over the entities of a grouping (?s ?group), joined with the
-    given patterns; with branches, joined with the alternatives of a pattern
-    over ?s (the entity).
-    """
-    # TODO: down push only cheap parts, not whole subquery.
-    # E. g. reach down only value-tables.
-    prefixes, subquery = grouping_to_sparql_subquery(manager, grouping, space)
-    body = (
-        down_pushed_union(subquery, branches)
-        if branches is not None
-        else subquery
-        )
-    return (
-        f"{make_sparql_prologue(prefixes)}\nSELECT {select}"
-        f" WHERE {{\n{body}\n{where}\n}} {tail}"
-    )
-
-
 def profile_partitions_to_grouping(
         kg_profile: KgProfile
         ) -> Grouping:
@@ -213,26 +156,20 @@ def profile_partitions_to_grouping(
         )
 
 
-def groups_by_entity(
+def get_group_names_by_entity(
         manager: KgManager, kg_profile: KgProfile, entities: Iterable[IRI]
         ) -> dict[IRI, frozenset[str]]:
     """
     The names of the groups of each entity (empty: in no group).
     """
     group_names: dict[IRI, set[str]] = {entity: set() for entity in entities}
-    branches = [
-        f"{group.definition.membership_sparql} BIND({sparql_literal(group.name)} AS ?group)"
-        for group in kg_profile.groups
-    ]
-    if branches:
+    for group in kg_profile.groups:
         for values_block in as_batched_values_blocks(group_names):
             query = (
-                "SELECT DISTINCT ?s ?group WHERE {\n"
-                + down_pushed_union(f"VALUES ?s {{ {values_block} }}", branches)
-                + "\n}"
-            )
+                f"SELECT DISTINCT ?s WHERE {{ VALUES ?s {{ {values_block} }} "
+                f"{group.definition.membership_sparql} }}")
             for row in select_rows(manager, query):
-                group_names[IRI(row["s"].value)].add(row["group"].value)
+                group_names[IRI(row["s"].value)].add(group.name)
     return {entity: frozenset(names) for entity, names in group_names.items()}
 
 
@@ -283,41 +220,87 @@ def default_non_competing_pairs(
         ]
 
 
-def count_rows(
-        rows: list[dict[str, Binding]], *keys: str
-        ) -> dict[tuple[str, ...], int]:
+def retrieve_members(
+        manager: KgManager, membership_sparql: str, entity_space: Iterable[str] = ()
+        ) -> set[IRI]:
+    """The IRIs that match a membership pattern (?s), in the entity space if one is given."""
+    query = f"SELECT DISTINCT ?s WHERE {{ {membership_sparql} FILTER(isIRI(?s)) }}"
+    space = tuple(entity_space)
     return {
-        tuple(row[k].value for k in keys): int(row["n"].value)
-        for row in rows if all(k in row for k in keys)
+        IRI(row["s"].value) for row in select_rows(manager, query)
+        if not space or row["s"].value.startswith(space)
         }
+
+
+def retrieve_groups_by_entity(
+        manager: KgManager, grouping: Grouping | None, entity_space: Iterable[str]
+        ) -> dict[IRI, set[str]]:
+    """
+    The entities of a grouping in the entity space with the names of their
+    groups, one query per membership; the entities of grouping.minus are left
+    out. Exclusive (partitions): an entity belongs to the first group that
+    has it. Without a grouping: the default partitions.
+    """
+    grouping = grouping or default_partitions_to_grouping()
+    excluded: set[IRI] = set()
+    for membership_sparql in grouping.minus:
+        excluded |= retrieve_members(manager, membership_sparql)
+    groups_by_entity: dict[IRI, set[str]] = defaultdict(set)
+    # exclusive: the members in order, the first group of an entity wins
+    for group_name, membership_sparql in grouping.members:
+        for entity in retrieve_members(manager, membership_sparql, entity_space) - excluded:
+            # - {group_name}: a group may be defined by several memberships
+            if grouping.exclusive and groups_by_entity[entity] - {group_name}:
+                continue
+            groups_by_entity[entity].add(group_name)
+    return dict(groups_by_entity)
+
+
+def members_by_group(groups_by_entity: dict[IRI, set[str]]) -> dict[str, set[IRI]]:
+    """The entities of each group, from the groups of each entity."""
+    members: dict[str, set[IRI]] = defaultdict(set)
+    for entity, group_names in groups_by_entity.items():
+        for group_name in group_names:
+            members[group_name].add(entity)
+    return dict(members)
 
 
 def retrieve_counts_by_group(
         manager: KgManager,
         grouping: Grouping | None,
         space: Iterable[str],
-        where: str,
-        branches: list[str] | None = None
+        sparql_pattern: str
         ) -> dict[str, int]:
-    sparql = grouping_to_sparql_query(
+    """
+    Per group: its entities with at least one value
+    of the pattern (over ?s and ?o).
+    """
+    groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+    entities_with_value = retrieve_values(
         manager,
-        grouping,
-        space,
-        "?group (COUNT(DISTINCT ?s) AS ?n)",
-        where,
-        "GROUP BY ?group",
-        branches
+        groups_by_entity,
+        [sparql_pattern],
+        literals_only=False
         )
-    return {
-        group: n for (group,), n in
-        count_rows(select_rows(manager, sparql), "group").items()
-        }
+
+    return dict(Counter(
+        group_name for entity in entities_with_value
+        for group_name in groups_by_entity[entity]
+        ))
 
 
 def retrieve_group_sizes(
         manager: KgManager, grouping: Grouping | None, space: Iterable[str]
         ) -> dict[str, int]:
-    return retrieve_counts_by_group(manager, grouping, space, "")
+    """
+    Per group: its entities (an entity in several
+    groups counts in each).
+    """
+    return dict(Counter(
+        group_name
+        for group_names in retrieve_groups_by_entity(manager, grouping, space).values()
+        for group_name in group_names
+        ))
 
 
 def profile_groups_to_grouping(

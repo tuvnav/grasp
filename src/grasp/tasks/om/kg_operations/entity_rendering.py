@@ -40,7 +40,7 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     VOCABULARY_PREFIXES,
     local_name,
 )
-from grasp.tasks.om.kg_operations.grouping import groups_by_entity
+from grasp.tasks.om.kg_operations.grouping import get_group_names_by_entity
 from grasp.tasks.om.kg_operations.candidate_generation import (
     named_value_patterns,
 )
@@ -49,11 +49,8 @@ from grasp.tasks.om.sparql_access import (
     ValueGroup,
     retrieve_blank_nodes,
     retrieve_value_groups,
-    down_pushed_union,
+    retrieve_values,
     sparql_literal,
-    union_of,
-    as_batched_values_blocks,
-    values_clause,
 )
 
 # ---------------------------------------------------------------- building blocks
@@ -256,15 +253,18 @@ def context_role_names(roles: PredicateRoles) -> list[str]:
     ]
 
 
-def role_branches(roles: PredicateRoles, role_names: Iterable[str]) -> list[str]:
+def role_branches(
+        roles: PredicateRoles, role_names: Iterable[str]
+        ) -> list[str]:
     """
     SPARQL alternatives over ?s (entity), ?predicate_ref (role name) and ?o (value),
     for retrieve_value_groups; roles that are not set are left out.
     """
     return [
-        f"VALUES ?predicate_ref {{ {sparql_literal(name)} }}\n{branch}"
-        for name, pattern in named_value_patterns(list(role_names), roles)
-        for branch in pattern.branches_for_union()
+        f"{branch} BIND({sparql_literal(name)} AS ?predicate_ref)"
+        for role_name in role_names
+        for name, pattern in named_value_patterns(role_name, roles)
+        for branch in pattern.sparql_branches()
     ]
 
 
@@ -293,52 +293,8 @@ class EntityContext:
     incoming: dict[str, ValueGroup]  # predicate -> subjects
     used_as_predicate: PredicateUsage | None
     blank_nodes: BlankNodeTree = field(default_factory=dict)
-    # IRIs that only carry a value (e.g. synonym nodes): their name stands for them
-    helper_nodes: set[IRI] = field(default_factory=set)
-
 
 # ---------------------------------------------------------------- context: gathering
-
-def find_helper_nodes(
-        manager: KgManager, iris: Iterable[IRI], roles: PredicateRoles
-        ) -> set[IRI]:
-    """
-    The IRIs that only carry a value: at least one name, and otherwise only
-    edges of plain predicates of the names, synonyms and membership roles (e.g.
-    definition and synonym nodes in the OAEI anatomy ontologies). Their name
-    stands for them like a literal. Patterns of the profile cannot be checked
-    here, only plain predicates.
-    """
-    names = roles.predicate_pattern_by_name("names")
-    if names is None:
-        return set()
-    plain_preds = sorted(
-        plain_predicates(roles, STANDARD_VIEW_ROLES)
-        | set(membership_predicates(roles))
-        )
-    named: set[IRI] = set()
-    with_other_edges: set[IRI] = set()
-    for values in as_batched_values_blocks(iris):
-        has_name_sparql = down_pushed_union(
-            f"VALUES ?s {{ {values} }}", names.branches_for_union()
-            )
-        named |= {
-            IRI(row["s"].value)
-            for row in select_rows(
-                manager, f"SELECT DISTINCT ?s WHERE {{\n{has_name_sparql}\n}}"
-                )
-            }
-        not_plain = (
-            f"FILTER(?p NOT IN ({', '.join(f'<{p}>' for p in plain_preds)}))"
-            if plain_preds else ""
-        )
-        with_other_edges |= {
-            IRI(row["s"].value)
-            for row in select_rows(
-                manager, f"SELECT DISTINCT ?s WHERE {{ VALUES ?s {{ {values} }} ?s ?p ?o {not_plain} }}"
-                )
-            }
-    return named - with_other_edges
 
 
 def retrieve_predicate_usage(
@@ -350,13 +306,15 @@ def retrieve_predicate_usage(
     if not count:
         return None
 
+    type_path = "|".join(f"<{predicate}>" for predicate in type_predicates)
+
     def top_types(position: str) -> list[tuple[IRI, int]]:
         if not type_predicates:
             return []
         return [
             (IRI(r["t"].value), int(r["n"].value)) for r in select_rows(
                 manager,
-                f"SELECT ?t (COUNT(*) AS ?n) WHERE {{ ?usage_subject {term} ?usage_object . ?{position} {union_of(type_predicates)} ?t }} "
+                f"SELECT ?t (COUNT(*) AS ?n) WHERE {{ ?usage_subject {term} ?usage_object . ?{position} {type_path} ?t }} "
                 f"GROUP BY ?t ORDER BY DESC(?n) LIMIT 3",
             )
         ]
@@ -402,43 +360,52 @@ class EntityDisplay:
         and the names of all IRIs in them.
         """
         entities = set(entities)
-        # only prefetch  which are not in cache
+        # only prefetch entities which are not in cache
         new_entities = entities - self.contexts_by_entity.keys()
-        for roles, members in self.roles_by_group_names(new_entities).values():
-            # main entities: retrieve all roles (also if retrieved before as a neighbour with names only)
-            self.prefetch_role_values(members, context_role_names(roles), roles)
-            # the plain predicates of all roles (also noise) should be removed from 'other edges'
-            role_predicates = plain_predicates(
+        for roles, entities_in_group in self.roles_by_group_names(new_entities).values():
+            # main entities: retrieve all roles
+            # (also if retrieved before as a neighbour with names only)
+            self.prefetch_role_values(
+                entities_in_group, context_role_names(roles), roles
+                )
+            # the plain predicates of all roles (also noise)
+            # should be removed from 'other edges'
+            already_retrieved_predicates = plain_predicates(
                 roles, [*ROLE_FIELDS, *(relation.name for relation in roles.structure)]
             )
             removed_role_predicate = (
-                f"FILTER(?predicate_ref NOT IN ({', '.join(f'<{p}>' for p in sorted(role_predicates))}))"
-                if role_predicates else ""
+                f"FILTER(?predicate_ref NOT IN ({', '.join(f'<{p}>' for p in sorted(already_retrieved_predicates))}))"
+                if already_retrieved_predicates else ""
             )
-            noise_filter = "".join(
-                f" FILTER NOT EXISTS {{{values_clause('s', members)} {branch}}}"
-                for branch in roles.noise.patterns
-                ) if roles.noise is not None else ""
+            # the values of the noise patterns are left out of the other edges
+            # (its plain predicates are removed above)
+            noise_values = {
+                entity: set(values) for entity, values in retrieve_values(
+                    self.manager, entities_in_group,
+                    roles.noise.patterns, literals_only=False
+                    ).items()
+                } if roles.noise is not None and roles.noise.patterns else {}
             outgoing = retrieve_value_groups(
                 self.manager,
-                members,
-                [f"?s ?predicate_ref ?o {removed_role_predicate}{noise_filter}"],
-                MAX_VALUES_PER_GROUP
+                entities_in_group,
+                [f"?s ?predicate_ref ?o {removed_role_predicate}"],
+                MAX_VALUES_PER_GROUP,
+                noise_values
             )
             incoming = retrieve_value_groups(
                 self.manager,
-                members,
+                entities_in_group,
                 [f"?o ?predicate_ref ?s FILTER(isIRI(?o)) {removed_role_predicate}"],
                 MAX_VALUES_PER_GROUP,
             )
-            for entity in sorted(members):
+            for entity in sorted(entities_in_group):
                 self.contexts_by_entity[entity] = self.build_context(
                     entity, outgoing.get(entity, {}), incoming.get(entity, {}), roles
                 )
         # neighbours: names only, if not retrieved yet
         neighbours = {iri for entity in entities for iri in self.shown_iris(entity)}
-        for roles, members in self.roles_by_group_names(neighbours - self.values_by_entity_role.keys()).values():
-            self.prefetch_role_values(members, STANDARD_VIEW_ROLES, roles)
+        for roles, entities_in_group in self.roles_by_group_names(neighbours - self.values_by_entity_role.keys()).values():
+            self.prefetch_role_values(entities_in_group, STANDARD_VIEW_ROLES, roles)
 
     def roles_by_group_names(self, entities: set[IRI]) -> dict[frozenset[str], tuple[PredicateRoles, set[IRI]]]:
         """
@@ -447,14 +414,14 @@ class EntityDisplay:
         part can be retrieved in one batch.
         """
         divided: dict[frozenset[str], set[IRI]] = {}
-        for entity, group_names in groups_by_entity(
+        for entity, group_names in get_group_names_by_entity(
                 self.manager, self.kg_profile, entities
                 ).items():
             divided.setdefault(group_names, set()).add(entity)
         return {
             group_names: (
                 roles_of_entity(self.kg_profile.roles,
-                             map(self.kg_profile.get_group, group_names)),
+                                map(self.kg_profile.get_group, group_names)),
                 members,
             )
             for group_names, members in divided.items()
@@ -491,18 +458,13 @@ class EntityDisplay:
         has_blank_nodes = any(
             value.typ == BindingType.BNODE for group in groups for value in group.values
         )
-        # helper node candidates: IRI objects of the other edges (role values are entities)
-        candidates = {
-            IRI(value.value) for group in outgoing.values() for value in group.values
-            if value.typ == BindingType.URI
-        }
+
         return EntityContext(
             iri=entity,
             outgoing=outgoing,
             incoming=incoming,
             used_as_predicate=retrieve_predicate_usage(self.manager, entity, membership_predicates(roles)),
             blank_nodes=retrieve_blank_nodes(self.manager, entity, BLANK_NODE_MAX_DEPTH) if has_blank_nodes else {},
-            helper_nodes=find_helper_nodes(self.manager, candidates, roles),
         )
 
     def shown_iris(self, entity: IRI) -> set[IRI]:
@@ -531,7 +493,7 @@ class EntityDisplay:
 
     # ------------------------------------------------------------ showing
 
-    def values(self, entity: IRI, role_name: RoleName) -> list[Binding]:
+    def values_of_entity(self, entity: IRI, role_name: RoleName) -> list[Binding]:
         """
         The literal values of a role in name order (IRIs and blank nodes
         are shown in a context only).
@@ -542,7 +504,7 @@ class EntityDisplay:
         return sorted((value for value in group.values if value.typ == BindingType.LITERAL), key=name_order)
 
     def has_name(self, iri: str) -> bool:
-        return bool(self.values(IRI(iri), "names"))
+        return bool(self.values_of_entity(IRI(iri), "names"))
 
     def show(self, entity: IRI, view: EntityView = SHORT_VIEW) -> str:
         """
@@ -561,7 +523,7 @@ class EntityDisplay:
         vocabulary_name = shortened_vocabulary_name(entity)
         if vocabulary_name is not None:
             return vocabulary_name
-        names = self.values(IRI(entity), "names")
+        names = self.values_of_entity(IRI(entity), "names")
         label = names[0].value if names and view.num_names > 0 else None
         reference = self.manager.format_iri(
             entity
@@ -572,7 +534,7 @@ class EntityDisplay:
         details = [
             detail for detail in (
                 shown_values("names", names[1:], view.num_names - 1),
-                shown_values("synonyms", self.values(IRI(entity), "synonyms"), view.num_synonyms),
+                shown_values("synonyms", self.values_of_entity(IRI(entity), "synonyms"), view.num_synonyms),
             ) if detail
         ]
         return text + (f" ({'; '.join(details)})" if details else "")
@@ -583,12 +545,13 @@ class EntityDisplay:
         node, the line of an entity or a literal.
         """
         if value.typ == BindingType.BNODE:
-            return render_blank_node(value.value, context.blank_nodes, self.render_line)
+            return render_blank_node(
+                value.value, context.blank_nodes, self.render_line
+                )
+
         if value.typ == BindingType.URI:
-            names = self.values(IRI(value.value), "names")
-            if IRI(value.value) in context.helper_nodes and names:
-                return render_as_literal(names[0], view.max_chars_per_literal)
             return self.render_line(value.value)
+
         return render_as_literal(value, view.max_chars_per_literal)
 
     def render_value_group(
@@ -643,13 +606,13 @@ class EntityDisplay:
 
         # names (besides the label in the header), synonyms (not equal to a
         # name), definitions: from the roles of the profile
-        names = self.values(context.iri, "names")
+        names = self.values_of_entity(context.iri, "names")
         name_texts = {name.value for name in names}
         synonyms = [
-            synonym for synonym in self.values(context.iri, "synonyms")
+            synonym for synonym in self.values_of_entity(context.iri, "synonyms")
             if synonym.value not in name_texts
             ]
-        definitions = self.values(context.iri, "definitions")
+        definitions = self.values_of_entity(context.iri, "definitions")
         for line in (
             shown_values("further names", names[1:], len(names)),
             shown_values("synonyms", synonyms, view.num_synonyms),

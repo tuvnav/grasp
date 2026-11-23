@@ -102,7 +102,7 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, retrieve_counts_by_group, retrieve_group_sizes, profile_groups_to_grouping,
+    Grouping, retrieve_groups_by_entity, profile_groups_to_grouping,
 )
 from grasp.tasks.om.kg_operations.candidate_generation import (
     NeighbourIndex,
@@ -118,11 +118,9 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     get_normalization_examples,
     split_name_key_runs,
     vector_entity_pairs_to_candidates,
-    retrieve_entities,
     retrieve_partitions_by_entity,
     retrieve_value_rows,
 )
-from grasp.tasks.om.sparql_access import values_clause
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import (
     BLANK_NODE_RULE,
@@ -183,8 +181,6 @@ def generate_group_grouping(kg_profile: KgProfile, population: Population, side:
     return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
 
 
-# name of the whole population when its entities are counted once
-POPULATION = "_population"
 
 
 def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
@@ -201,13 +197,7 @@ def generate_population_groups_grouping(kg_profile: KgProfile, population: Popul
     )
 
 
-def generate_population_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """The groups of one side's population merged into one (POPULATION), so that
-    an entity in several of them counts once."""
-    return generate_population_groups_grouping(kg_profile, population, side).merged(POPULATION)
-
-
-def retrieve_population(
+def retrieve_side_population(
         manager: KgManager,
         kg_profile: KgProfile,
         population: Population,
@@ -219,12 +209,12 @@ def retrieve_population(
     value of the strategy: the denominator of the signals), without the
     leave_out_entities (those with an equivalence: they get no candidates).
     """
-    retrieved = retrieve_entities(
+    groups_by_entity = retrieve_groups_by_entity(
         manager,
-        generate_population_grouping(kg_profile, population, side),
+        generate_population_groups_grouping(kg_profile, population, side),
         kg_profile.entity_space
         )
-    return frozenset(retrieved) - frozenset(leave_out_entities)
+    return frozenset(groups_by_entity) - frozenset(leave_out_entities)
 
 
 # trial runs: the most entities of the larger population that are compared, per
@@ -386,7 +376,7 @@ def retrieve_partition_names(
 # ------------------------------------------------------------------
 
 
-CANDIDATE_BUDGET_PER_ENTITY = 8
+CANDIDATE_BUDGET_PER_ENTITY = 30
 MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER = 30
 
 
@@ -687,7 +677,7 @@ def run_strategy(
     # and in a trial run the sample of the larger one
     existing_equivalences_by_entity = alignment_state.existing_equivalences()
     population_by_side: dict[Side, frozenset[IRI]] = {
-        side: retrieve_population(
+        side: retrieve_side_population(
             managers[side],
             alignment_state.get_kg_profile(side),
             generator.population,
@@ -1589,26 +1579,27 @@ NUM_EXAMPLE_EQUIVALENCES = 5
 
 
 def count_group_entities(
-        manager: KgManager, kg_profile: KgProfile, matched_entities: Collection[IRI]
+        manager: KgManager,
+        kg_profile: KgProfile,
+        matched_entities: Collection[IRI]
         ) -> dict[str, tuple[int, int]]:
     """
     Per group of the profile: its entities and those already matched (an
     entity in several groups counts in each).
     """
-    grouping = profile_groups_to_grouping(kg_profile)
-    sizes = retrieve_group_sizes(manager, grouping, kg_profile.entity_space)
-    matched = (
-        retrieve_counts_by_group(
-            manager,
-            grouping,
-            kg_profile.entity_space,
-            values_clause("s", matched_entities)
-            )
-        if matched_entities else {}
+    groups_by_entity = retrieve_groups_by_entity(
+        manager, profile_groups_to_grouping(kg_profile), kg_profile.entity_space
         )
+    group_sizes = Counter(
+        name for group_names in groups_by_entity.values() for name in group_names
+        )
+    matched_entities_per_group = Counter(
+        group_name for entity in set(matched_entities) & groups_by_entity.keys()
+        for group_name in groups_by_entity[entity]
+    )
     return {
-        group_name: (size, matched.get(group_name, 0))
-        for group_name, size in sizes.items()
+        group_name: (group_size, matched_entities_per_group.get(group_name, 0))
+        for group_name, group_size in group_sizes.items()
         }
 
 
@@ -1840,7 +1831,8 @@ ENSEMBLE_RUNS_SCHEMA = {
             "role": {"type": "string", "enum": list(get_args(RunRole.__value__)),
                      "description": "generate (default) or corroborate."},
             "family": {"type": "string",
-                       "description": "Name of the kind of evidence of the run; default: the run id."},
+                       "description": "Name of the kind of evidence of the run; runs whose evidence is "
+                                      "alike (e.g. on the same names) share one family. Default: the run id."},
         },
         "required": ["run_id"],
     },

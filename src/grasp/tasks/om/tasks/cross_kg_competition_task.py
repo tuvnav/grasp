@@ -22,6 +22,7 @@ from grasp.tasks.om.data_models.alignment_state import (
 )
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.configuration import load_task_instructions
+from grasp.tasks.om.foundation.rendering import Section, format_display_content
 from grasp.tasks.om.foundation.types import Side
 from grasp.tasks.om.tasks.profile_stage import PartitionEditor
 from grasp.tasks.om.tasks.prompting import load_prompt
@@ -96,12 +97,16 @@ class CrossKgCompetitionTask(GraspTask):
             profile = self.alignment_state.get_kg_profile(side)
             editor = self.partition_editors[side]
             manager, _ = find_manager(self.managers, profile.kg_name)
-            parts = [f"Knowledge graph: {profile.kg_name}"
-                     + (f" ({manager.description})" if manager.description else ""),
-                     editor.input_for_llm()]
-            parts += [editor.describe_member(name, f"Partition {name}")
-                      for name in editor.member_names() if editor.group_sizes.get(name)]
-            sections.append(format_section(f"Partitions of the {side.value} knowledge graph", "\n\n".join(parts)))
+            sections.append(format_display_content(Section(
+                f"Partitions of the {side.value} knowledge graph",
+                [f"Knowledge graph: {profile.kg_name}"
+                 + (f" ({manager.description})" if manager.description else "")],
+                subsections=[
+                    *editor.input_for_llm(),
+                    *(editor.describe_member(name, f"Partition {name}")
+                      for name in editor.member_names() if editor.group_sizes.get(name)),
+                    ],
+                )))
         sections.append(format_section("Partitions of the two knowledge graphs that do not compete",
                                        self.format_cross_kg_pairs()))
         return "\n\n".join(sections)
