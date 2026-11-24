@@ -1,19 +1,14 @@
 ## Unbedingt notwendig
-- Ablation: DEFAULTS ein- und ausschaltbar
-- partition_names_by_entity zentralisieren (nur einmal abrufen?)
-- Pushdown nur von Suchraumbegrenzung statt aller Group-Zweige
-- Formatierungsfunktionen zentralisieren (Zusätze zu describe_profile?)?
-- Zusammenlegung von Kandidaten auf beiden Seiten in `merge_candidates()` -> `build_venn_index`: Vereinigung oder Schnitt?
 - Ziele der Strukturrollen im Prompt erklären.
-- 'other'-Rollen irgendwie zwischen KGs ablgeichen. Oder besser: Source- und Targetgenerator eigene Relationen verwenden lassen!
 - Berechenbare Relationen berechnen statt setzen: Subsumption ↔ Membership: Aus den Partitionen ableitbar: ?s Instanz und ?o Klasse → Membership; beide in derselben Partition → Subsumption
-- Funde in Prompts als 'KG notes' integrieren
-- Transforms aus Ankerstufe entfernen...
-- 'x entities aus Strategie ausgelassen, weil sie schon gematcht sind' in Ergebnisübersicht pro Kandidatenstrategie
+- Ablation: DEFAULTS ein- und ausschaltbar
 - Familien wählen in den Prompt: unabhängige Informationsquellen = Fehler korrelieren nicht mit Beispielen: "Give runs the same family if they draw on the same information of the entities (the same values, or values derived from or containing one another), whatever their technique, population or selection; mutual runs take the family of the run they select from. Use a new family only for information whose errors are unlikely to coincide with those of the existing families."
 - Kandidatenstrata in Reihenfolge der Stratumstärke bewerten mit Abbruchkriterium bei abfallenden Matches, pro Gruppe/Partition je nach Gruppengröße -> Recallrunde gleich schneiden!
 
 ## Optimierungsideen
+- "Default canon checked: ..." in Profiling.roles: Als Liste statt Textblock 
+- partition_names_by_entity zentralisieren (nur einmal abrufen?)
+- 'other'-Rollen irgendwie zwischen KGs ablgeichen.
 - Rules oder in anderen Promptteil in CandidateTask: Ergänzende Strategien suchen mit unterschiedlichen Fehlerkorrelationen
 - CandidateTask für große KGs pro Gruppe?
 - run-0 und compare_to in anchors wieder aufnehmen

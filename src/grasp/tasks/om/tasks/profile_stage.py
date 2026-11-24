@@ -27,6 +27,7 @@ from grasp.sparql.types import Binding
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.profile import (
     PredicatePattern,
+    without_enclosing_braces,
     RoleElement,
     RoleElementKind,
     RoleElementUsage,
@@ -105,7 +106,9 @@ from grasp.tasks.om.sparql_access import (
     query_failure_message,
     retrieve_values,
 )
-from grasp.tasks.om.tasks.prompting import BLANK_NODE_RULE, format_validation_error, inline_schema, load_prompt
+from grasp.tasks.om.tasks.prompting import (
+    BLANK_NODE_RULE, fill_function_name_placeholders, format_validation_error, inline_schema, load_prompt,
+    )
 from grasp.utils import FunctionCallException, format_section
 
 
@@ -289,7 +292,8 @@ def validate_name(name: str, unit: str) -> str:
 MEMBERSHIP_ARG_DESCRIPTION = {
     "type": "string",
     "description": (
-        "SPARQL group pattern over ?s, e.g. ?s <http://example.org/p> ?o"
+        "SPARQL pattern over ?s (the inside of a group: no enclosing { }, braces only around the "
+        "alternatives of a UNION), e.g. ?s <http://example.org/p> ?o"
         )
     }
 
@@ -1617,13 +1621,15 @@ class RoleEditor(Editor):
         current: PredicatePattern | None = getattr(self.roles, role)
         predicates = list(current.predicates) if current else []
         patterns = list(current.patterns) if current else []
+        # in the stored form: a pattern given with enclosing braces is stored without them
+        remove_patterns = [without_enclosing_braces(p) for p in fn_args.get("remove_patterns") or []]
         missing = [p for p in fn_args.get("remove_predicates") or [] if p not in predicates]
-        missing += [p for p in fn_args.get("remove_patterns") or [] if p not in patterns]
+        missing += [p for p in remove_patterns if p not in patterns]
         if missing:
             raise FunctionCallException(
                 f"Not in role {role}: {missing}; it has: {describe_predicate_pattern(current) if current else 'nothing'}")
         predicates = [p for p in predicates if p not in (fn_args.get("remove_predicates") or [])]
-        patterns = [p for p in patterns if p not in (fn_args.get("remove_patterns") or [])]
+        patterns = [p for p in patterns if p not in remove_patterns]
         if fn_args.get("add"):
             try:
                 add = PredicatePattern.model_validate(fn_args["add"])
@@ -1658,7 +1664,7 @@ class RoleEditor(Editor):
             relation_item
             ]
         if problems:
-            content.append("To resolve before finish: " + "; ".join(problems))
+            content.append(f"To resolve before {ProfileFunctionName.FINISH}: " + "; ".join(problems))
         return format_display_content(
             Section(
                 f"Structure relation {relation.name} {'replaced' if replaced else 'added'}",
@@ -1720,13 +1726,16 @@ def get_required_argument(fn_args: dict, argument_name: str) -> Any:
 
 
 def remove_own_entry(entries: dict[str, Any], kind: str, entry_id: str) -> str:
-    """Removes a finding or flag of the current stage; those of earlier stages cannot be removed."""
+    """
+    Removes a finding or flag of the current stage; 
+    those of earlier stages cannot be removed.
+    """
     if entries.pop(entry_id, None) is None:
         raise FunctionCallException(
             f"No {kind} {entry_id} of this stage (only your own can be removed); "
-            f"yours: {', '.join(entries) or 'none'}"
+            f"You can remove: {', '.join(entries) or 'none'}"
             )
-    return f"{kind.capitalize()} {entry_id} removed. Yours: {', '.join(entries) or 'none'}"
+    return f"{kind.capitalize()} {entry_id} removed."
 
 
 EVIDENCE_QUERY_PARAMETER = {
@@ -1921,7 +1930,9 @@ class ProfileStageTask(GraspTask):
         return sections
 
     def system_information(self) -> str:
-        info = load_prompt("profile_common.txt") + "\n\n" + load_prompt(self.prompt_file)
+        info = fill_function_name_placeholders(
+            load_prompt("profile_common.txt") + "\n\n" + load_prompt(self.prompt_file), ProfileFunctionName
+            )
         task_instructions = load_task_instructions(self.config)
         if task_instructions:
             info += "\n\n" + format_section("Task-specific instructions", task_instructions)
@@ -1933,9 +1944,9 @@ class ProfileStageTask(GraspTask):
             "Inspect the knowledge graph with the SPARQL functions before you change anything.",
             "You can execute multiple tool calls in one step. Prefer several tool calls and "
             "SPARQL queries per step over single calls.",
-            "Call finish exactly once, at the end.",
+            f"Call {ProfileFunctionName.FINISH} exactly once, at the end.",
             f"You have at most {self.config.max_steps} steps; one step is one response of yours, "
-            "with all tool calls in it. If you run out of steps without calling finish, the "
+            f"with all tool calls in it. If you run out of steps without calling {ProfileFunctionName.FINISH}, the "
             "default of this stage is used.",
         ]
 

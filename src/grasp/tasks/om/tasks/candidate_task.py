@@ -125,6 +125,7 @@ from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import (
     BLANK_NODE_RULE,
     add_equivalence_condition,
+    fill_function_name_placeholders,
     format_validation_error,
     load_prompt,
 )
@@ -1703,7 +1704,7 @@ GROUP_REFS_SCHEMA = {
         {"type": "string"},
         {"type": "object", "properties": {
             "name": {"type": "string"},
-            "membership_sparql": {"type": "string", "description": "SPARQL group pattern over ?s"},
+            "membership_sparql": {"type": "string", "description": "SPARQL pattern over ?s (the inside of a group: no enclosing { }, braces only around the alternatives of a UNION)"},
         }, "required": ["name", "membership_sparql"]},
     ]},
     "description": (
@@ -1907,7 +1908,7 @@ def candidate_functions() -> list[dict]:
 
 def system_information(config: GraspConfig) -> str:
     info = load_prompt("candidate_task.txt")
-    info = add_equivalence_condition(info, config)
+    info = fill_function_name_placeholders(add_equivalence_condition(info, config), CandidateFunctionName)
     task_instructions = load_task_instructions(config)
     if task_instructions:
         info += "\n\n" + format_section("Task-specific instructions", task_instructions)
@@ -1948,12 +1949,12 @@ class OMCandidateTask(GraspTask):
     def rules(self) -> list[str]:
         return [
             BLANK_NODE_RULE,
-            "Try every strategy you want to select with try_strategy; you can only select tried runs.",
-            "Look at the examples and at more lists with show_candidates before you judge a strategy; "
-            "use reselect to change only the selection of a run.",
+            f"Try every strategy you want to select with {CandidateFunctionName.TRY_STRATEGY}; you can only select tried runs.",
+            f"Look at the examples and at more lists with {CandidateFunctionName.SHOW_CANDIDATES} before you judge a strategy; "
+            f"use {CandidateFunctionName.RESELECT} to change only the selection of a run.",
             "You can execute multiple tool calls in one step.",
             f"You have at most {self.config.max_steps} steps; one step is one response of yours, with "
-            "all tool calls in it. Call finish exactly once, well before the limit.",
+            f"all tool calls in it. Call {CandidateFunctionName.FINISH} exactly once, well before the limit.",
         ]
 
     def function_definitions(self) -> list[dict]:

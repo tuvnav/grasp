@@ -46,7 +46,7 @@ from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.tasks.prompting import add_equivalence_condition, load_prompt
+from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
 from grasp.tasks.om.tasks.task_input import managers_by_side
 from grasp.utils import FunctionCallException, format_section
 
@@ -54,7 +54,7 @@ SIDES = (Side.SOURCE, Side.TARGET)
 type EquivalencePair = tuple[IRI, IRI]  # (source entity, target entity)
 
 
-class SearchVerifyFunction(StrEnum):
+class SearchVerifyFunctionName(StrEnum):
     SET_EQUIVALENCE = "set_equivalence"
     DELETE_EQUIVALENCE = "delete_equivalence"
     FINISH = "finish"
@@ -307,9 +307,9 @@ def collision_warning(state: SearchVerifyState, pair: EquivalencePair) -> tuple[
         "- Do not set it: no further action needed.\n"
     )
     if own:
-        message += ("- Replace an equivalence you set in this task: delete it with delete_equivalence, then "
-                    "call set_equivalence again with the same arguments.\n")
-    message += "- Set it anyway: call set_equivalence again with the same arguments."
+        message += (f"- Replace an equivalence you set in this task: delete it with {SearchVerifyFunctionName.DELETE_EQUIVALENCE}, then "
+                    f"call {SearchVerifyFunctionName.SET_EQUIVALENCE} again with the same arguments.\n")
+    message += f"- Set it anyway: call {SearchVerifyFunctionName.SET_EQUIVALENCE} again with the same arguments."
     if earlier:
         message += (" Equivalences set earlier cannot be deleted here; if you set the new one in addition, "
                     "the conflict is checked later.")
@@ -339,7 +339,7 @@ def resolve_entity(state: SearchVerifyState, side: Side, iri: Any, known: set[st
     return full_iri
 
 
-@func_reg.register(SearchVerifyFunction.SET_EQUIVALENCE)
+@func_reg.register(SearchVerifyFunctionName.SET_EQUIVALENCE)
 def set_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     pair = (resolve_entity(state, Side.SOURCE, fn_args.get("source_entity"), known),
             resolve_entity(state, Side.TARGET, fn_args.get("target_entity"), known))
@@ -358,7 +358,7 @@ def set_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str]) ->
                                           if warning is not None else "")
 
 
-@func_reg.register(SearchVerifyFunction.DELETE_EQUIVALENCE)
+@func_reg.register(SearchVerifyFunctionName.DELETE_EQUIVALENCE)
 def delete_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     source_entity, target_entity = fn_args.get("source_entity"), fn_args.get("target_entity")
     pair = next((p for p in state.equivalences if p == (source_entity, target_entity)), None)
@@ -371,7 +371,7 @@ def delete_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str])
     return f"Deleted {format_pair(pair)}."
 
 
-@func_reg.register(SearchVerifyFunction.FINISH)
+@func_reg.register(SearchVerifyFunctionName.FINISH)
 def finish(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     rationale = fn_args.get("rationale")
     if not rationale:
@@ -398,28 +398,28 @@ def finish(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     return f"Finished with {len(state.equivalences)} equivalences."
 
 
-def function_definitions(function_names: list[SearchVerifyFunction]) -> list[dict]:
+def function_definitions(function_names: list[SearchVerifyFunctionName]) -> list[dict]:
     entity_properties = {
         "source_entity": {"type": "string", "description": "The exact IRI of the source entity."},
         "target_entity": {"type": "string", "description": "The exact IRI of the target entity."},
     }
     definitions = {
-        SearchVerifyFunction.SET_EQUIVALENCE: {
-            "name": SearchVerifyFunction.SET_EQUIVALENCE,
+        SearchVerifyFunctionName.SET_EQUIVALENCE: {
+            "name": SearchVerifyFunctionName.SET_EQUIVALENCE,
             "description": "Sets an equivalence between a source and a target entity.",
             "parameters": {"type": "object", "properties": entity_properties,
                            "required": list(entity_properties), "additionalProperties": False},
             "strict": True,
         },
-        SearchVerifyFunction.DELETE_EQUIVALENCE: {
-            "name": SearchVerifyFunction.DELETE_EQUIVALENCE,
+        SearchVerifyFunctionName.DELETE_EQUIVALENCE: {
+            "name": SearchVerifyFunctionName.DELETE_EQUIVALENCE,
             "description": "Deletes an equivalence you set in this task.",
             "parameters": {"type": "object", "properties": entity_properties,
                            "required": list(entity_properties), "additionalProperties": False},
             "strict": True,
         },
-        SearchVerifyFunction.FINISH: {
-            "name": SearchVerifyFunction.FINISH,
+        SearchVerifyFunctionName.FINISH: {
+            "name": SearchVerifyFunctionName.FINISH,
             "description": "Finishes the task after you have set all equivalences you found.",
             "parameters": {
                 "type": "object",
@@ -477,7 +477,9 @@ class SearchVerifyTask(GraspTask):
         return clusters_input(state)
 
     def system_information(self) -> str:
-        info = add_equivalence_condition(load_prompt("search_verify_task.txt"), self.config)
+        info = fill_function_name_placeholders(
+            add_equivalence_condition(load_prompt("search_verify_task.txt"), self.config), SearchVerifyFunctionName
+            )
         task_instructions = load_task_instructions(self.config)
         if task_instructions:
             info += "\n\n" + format_section("Task-specific instructions", task_instructions)
@@ -485,21 +487,21 @@ class SearchVerifyTask(GraspTask):
 
     def rules(self) -> list[str]:
         return [
-            "Use the exact IRIs of the entities, as shown, in set_equivalence.",
+            f"Use the exact IRIs of the entities, as shown, in {SearchVerifyFunctionName.SET_EQUIVALENCE}.",
             f"You have at most {self.config.max_steps} steps; one step is one response of yours, with all "
-            "tool calls in it. Call finish well before the limit.",
+            f"tool calls in it. Call {SearchVerifyFunctionName.FINISH} well before the limit.",
         ]
 
     def function_definitions(self) -> list[dict]:
-        return function_definitions(list(SearchVerifyFunction))
+        return function_definitions(list(SearchVerifyFunctionName))
 
     def final_step_functions(self) -> list[dict] | None:
         # the last step can still set a last equivalence, and must finish
-        return function_definitions([SearchVerifyFunction.SET_EQUIVALENCE, SearchVerifyFunction.FINISH])
+        return function_definitions([SearchVerifyFunctionName.SET_EQUIVALENCE, SearchVerifyFunctionName.FINISH])
 
     def budget_message(self, steps_left: int, final: bool) -> str:
         if final:
-            return ("This is your last step. Set the equivalences you are sure of now and call finish, with "
+            return (f"This is your last step. Set the equivalences you are sure of now and call {SearchVerifyFunctionName.FINISH}, with "
                     "the entities you could not decide on as unsure.")
         return f"You have {steps_left} steps left, including this one. Make sure to call finish before you run out."
 
@@ -507,11 +509,11 @@ class SearchVerifyTask(GraspTask):
         function: Callable | None = func_reg.handlers.get(fn_name)
         if function is None:
             raise FunctionCallException(
-                f"Unknown function {fn_name}, use one of {[name.value for name in SearchVerifyFunction]}")
+                f"Unknown function {fn_name}, use one of {[name.value for name in SearchVerifyFunctionName]}")
         return function(self.state, fn_args, known)
 
     def done(self, fn_name: str) -> bool:
-        return fn_name == SearchVerifyFunction.FINISH and self.state.finished
+        return fn_name == SearchVerifyFunctionName.FINISH and self.state.finished
 
     def output(self, messages: list[Message]) -> dict:
         state = self.state

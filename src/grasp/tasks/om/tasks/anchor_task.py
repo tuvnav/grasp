@@ -42,6 +42,8 @@ from grasp.tasks.om.data_models.candidates import (
     Stratum,
     TriedRun,
     Normalization,
+    GroupRef,
+    POPULATION_REST,
     Population,
     ValuePatternSource,
     ValuePatterns,
@@ -72,6 +74,7 @@ from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, f
 from grasp.tasks.om.tasks.prompting import (
     BLANK_NODE_RULE,
     add_equivalence_condition,
+    fill_function_name_placeholders,
     format_validation_error,
     inline_schema,
     load_prompt,
@@ -120,7 +123,10 @@ def anchor_generator(fn_args: dict) -> Generator:
             target=arguments.target_values
         )
         return Generator(
-            population=arguments.population,
+            population=Population(
+                source_group_refs=arguments.source_group_refs,
+                target_group_refs=arguments.target_group_refs,
+                ),
             strategy=KeyStrategy(
                 values=values,
                 normalization=Normalization(levels=arguments.normalization_levels),
@@ -427,15 +433,20 @@ def format_anchor_merge(
 
 class AnchorStrategyArguments(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    population: Annotated[Population, WithJsonSchema(
-        GENERATOR_SCHEMA["properties"]["population"])
+    # the population, flat: models put the group refs at the top level
+    source_group_refs: Annotated[list[GroupRef], WithJsonSchema(
+        GENERATOR_SCHEMA["properties"]["population"]["properties"]["source_group_refs"])
         ] = Field(
-        default_factory=Population,
-        description="The entities that get anchors. Entities that "
-        "already have an equivalence get none. "
-        "Uniqueness is checked against all competing entities "
-        "of both knowledge graphs, not only "
-        "the population. Default: rest on both sides.")
+        default=[POPULATION_REST], min_length=1,
+        description="The source entities that get anchors: groups of the profile by name, 'rest' for all "
+        "groups that are not excluded (default), or a group defined inline for this strategy (a new name "
+        "and a SPARQL pattern over ?s). Entities that already have an equivalence get none. Uniqueness is "
+        "checked against all competing entities of both knowledge graphs, not only these.")
+    target_group_refs: Annotated[list[GroupRef], WithJsonSchema(
+        GENERATOR_SCHEMA["properties"]["population"]["properties"]["target_group_refs"])
+        ] = Field(
+        default=[POPULATION_REST], min_length=1,
+        description="Like source_group_refs, for the target entities.")
     source_values: ValuePatternSource = Field(
         default="names",
         description="The values compared, as a key shared by two entities: role names of the profile (names, "
@@ -575,9 +586,7 @@ def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
         anchors = anchors_of_kind(run_anchors_of(state, run_id), kind)[:n]
         prefetch_anchors(anchors, state.entity_displays)
         lines = [format_anchor(anchor, state.entity_displays) for anchor in anchors]
-    return format_display_content(
-        [(f"{kind} of {run_id}", lines or ["none"])]
-        )
+    return format_display_content(Section(f"{kind} of {run_id}", lines or ["none"]))
 
 
 def evaluate_anchor_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
@@ -635,7 +644,9 @@ class OMAnchorTask(GraspTask):
         return format_start_message(self.state) + "\n\nNo anchor strategy has been tried yet."
 
     def system_information(self) -> str:
-        info = add_equivalence_condition(load_prompt("anchor_task.txt"), self.config)
+        info = fill_function_name_placeholders(
+            add_equivalence_condition(load_prompt("anchor_task.txt"), self.config), AnchorFunctionName
+            )
         task_instructions = load_task_instructions(self.config)
         if task_instructions:
             info += "\n\n" + format_section("Task-specific instructions", task_instructions)
@@ -644,12 +655,12 @@ class OMAnchorTask(GraspTask):
     def rules(self) -> list[str]:
         return [
             BLANK_NODE_RULE,
-            "Try every strategy you want to select with try_anchor_strategy; you can only select tried runs.",
-            "Look at the examples, head anchors and ambiguous entities with show_anchors before you judge "
+            f"Try every strategy you want to select with {AnchorFunctionName.TRY_ANCHOR_STRATEGY}; you can only select tried runs.",
+            f"Look at the examples, head anchors and ambiguous entities with {AnchorFunctionName.SHOW_ANCHORS} before you judge "
             "a strategy.",
             "You can execute multiple tool calls in one step.",
             f"You have at most {self.config.max_steps} steps; one step is one response of yours, with "
-            "all tool calls in it. Call finish exactly once, well before the limit.",
+            f"all tool calls in it. Call {AnchorFunctionName.FINISH} exactly once, well before the limit.",
         ]
 
     def function_definitions(self) -> list[dict]:

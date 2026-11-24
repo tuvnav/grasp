@@ -41,7 +41,7 @@ from enum import StrEnum, auto
 import re
 from typing import Any, Iterable, Literal, Self, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent
 from grasp.tasks.om.foundation.types import IRI, LocalNameType
@@ -69,11 +69,50 @@ class RelationAlgebra(BaseModel):
     inverse_of: str | None = None
 
 
+def without_enclosing_braces(pattern: str) -> str:
+    """
+    The pattern without braces that enclose all of it: a pattern is the
+    inside of a group, and in a group of its own ?s would be unbound
+    ({ BIND(STR(?s) AS ?o) } binds no ?o). Kept: { A } UNION { B } (two
+    groups) and a subquery ({ SELECT ... }). Braces in string literals
+    (e.g. a regex "\\d{4}") do not count.
+    """
+    stripped = pattern.strip()
+    while stripped.startswith("{") and stripped.endswith("}"):
+        depth, quote, escaped = 0, None, False
+        for index, character in enumerate(stripped):
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+            elif character in "\"'":
+                quote = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0 and index < len(stripped) - 1:
+                    return stripped  # the first group closes before the end
+        inside = stripped[1:-1].strip()
+        if inside.upper().startswith("SELECT"):
+            return stripped
+        stripped = inside
+    return stripped
+
+
 class PredicatePattern(BaseModel):
     # unknown fields (e.g. a misspelled "pattern") are errors, not silently dropped
     model_config = ConfigDict(extra="forbid")
-    patterns: list[str] = []  # SPARQL patterns over ?s and ?o
-    predicates: list[IRI] = []
+    patterns: list[str] = Field(default=[], description="SPARQL patterns over ?s (the entity) and ?o (its value or a related entity), each an alternative; a pattern may compute ?o, e.g. BIND(REPLACE(STR(?s), \".*#\", \"\") AS ?o). Write a pattern as the inside of a group, without enclosing { } (they are removed): inside a group of its own, ?s is unbound.")
+    predicates: list[IRI] = Field(default=[], description="Predicate IRIs: ?s <predicate> ?o, each an alternative.")
+
+    @field_validator("patterns")
+    @classmethod
+    def patterns_without_enclosing_braces(cls, patterns: list[str]) -> list[str]:
+        return [without_enclosing_braces(pattern) for pattern in patterns]
 
     @model_validator(mode='after')
     def not_empty(self) -> "PredicatePattern":
@@ -604,7 +643,7 @@ class Partition(BaseModel):
     entity belongs to the first whose membership matches."""
     model_config = ConfigDict(extra="forbid")
     name: str
-    membership_sparql: str  # SPARQL group pattern over ?s
+    membership_sparql: str  # SPARQL pattern over ?s, the inside of a group
     features: str = ""      # what distinguishes its entities from the rest
 
 
@@ -634,7 +673,7 @@ class GroupDefinition(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
     name: str
-    membership_sparql: str  # SPARQL group pattern over ?s
+    membership_sparql: str  # SPARQL pattern over ?s, the inside of a group
     origin: GroupOrigin = GroupOrigin.FORMED
     parent: str | None = None  # a group it is part of (for reading; membership is its own)
     features: str = ""         # what distinguishes its entities, to recognize them

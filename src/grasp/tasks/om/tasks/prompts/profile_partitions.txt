@@ -11,10 +11,10 @@ Check whether the kinds fit this knowledge graph, in this order:
 4. Competition: entities of partitions that compete may be candidates or rivals for each other in matching. Decide which partitions do not compete. Properties are usually not equivalent to classes, concepts or individuals; in OWL, classes, properties and individuals do not compete with each other. Where kinds are only a modelling choice of a knowledge graph, they may compete (e.g. a concept of a thesaurus and a class of an ontology, an item that is both class and instance). By default, only properties do not compete with the other partitions.
 Only define a partition if its entities are clearly of another kind; leave the default as it is when it fits.
 
-Membership patterns are SPARQL group patterns over ?s; write alternatives as { A } UNION { B }. Partitions are checked in order; place a partition before the ones whose patterns would also match its entities.
+Membership patterns are SPARQL patterns over ?s, the inside of a group without enclosing { }; write alternatives as { A } UNION { B }. Partitions are checked in order; place a partition before the ones whose patterns would also match its entities.
 
 Steps:
 1. Read the partitions and their distinguishing features. Inspect examples of each partition with the SPARQL functions, including uncategorized entities and entities without names.
-2. Test candidate patterns with test_partition; it shows how many entities match, where they are now, and what distinguishes them.
-3. Set or remove partitions; each change shows the new sizes. Set the competition with set_competition.
-4. Call finish.
+2. Test candidate patterns with __TEST_PARTITION__; it shows how many entities match, where they are now, and what distinguishes them.
+3. Set or remove partitions; each change shows the new sizes. Set the competition with __SET_COMPETITION__.
+4. Call __FINISH__.

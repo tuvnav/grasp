@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,24 @@ BLANK_NODE_RULE = (
 
 def load_prompt(filename: str) -> str:
     return (PROMPT_DIR / filename).read_text(encoding="utf-8").strip()
+
+
+# a placeholder in a prompt file, e.g. __TRY_PATTERN__
+PLACEHOLDER = re.compile(r"__[A-Z][A-Z0-9_]*__")
+
+
+def fill_function_name_placeholders(text: str, function_names: type[StrEnum]) -> str:
+    """
+    Puts the function names at their placeholders: __MEMBER__ becomes the
+    value of function_names.MEMBER (e.g. __TRY_PATTERN__ -> try_pattern).
+    Fails if a placeholder is left (a typo, or a renamed or removed
+    function), so call it after the other placeholders are filled.
+    """
+    for member in function_names:
+        text = text.replace(f"__{member.name}__", member.value)
+    if unfilled := sorted(set(PLACEHOLDER.findall(text))):
+        raise ValueError(f"Prompt placeholders without a function name: {unfilled}")
+    return text
 
 
 EQUIVALENCE_PLACEHOLDER = "__EQUIVALENCE_CONDITION__"
@@ -71,7 +91,9 @@ def inline_schema(
     def resolve(node: Any) -> Any:
         if isinstance(node, dict):
             if "$ref" in node:
-                return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
+                # keep what stands beside the $ref (description, default)
+                siblings = {k: resolve(v) for k, v in node.items() if k not in ("$ref", "title", "discriminator")}
+                return {**resolve(defs[node["$ref"].rsplit("/", 1)[-1]]), **siblings}
             node = {k: resolve(v) for k, v in node.items() if k not in ("title", "discriminator")}
             if "properties" in node:
                 node["properties"] = {k: v for k, v in node["properties"].items() if k not in drop}

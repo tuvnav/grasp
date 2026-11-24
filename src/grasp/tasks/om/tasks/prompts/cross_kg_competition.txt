@@ -12,5 +12,5 @@ The first message shows, for each knowledge graph, its partitions with sizes, me
 
 Steps:
 1. Read the partitions of both knowledge graphs. Where it is unclear what a partition holds, inspect examples with the SPARQL functions.
-2. For each pair that should not compete, call set_competition with compete false and the reason. For a pair that does not compete so far but should, call it with compete true.
-3. Call finish with your rationale.
+2. For each pair that should not compete, call __SET_COMPETITION__ with compete false and the reason. For a pair that does not compete so far but should, call it with compete true.
+3. Call __FINISH__ with your rationale.

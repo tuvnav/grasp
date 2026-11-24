@@ -8,9 +8,9 @@ Your main task is to find pitfalls for matching the entities of this group, and 
 - entities that are typed or grouped wrongly, or that only annotate other entities
 - anything else that would make two entities look equal or different without being so
 
-Change roles only if you see a clear error, and check the local name type. If an element is wrong for the whole knowledge graph, report it with raise_flag on the roles stage.
+Change roles only if you see a clear error, and check the local name type. If an element is wrong for the whole knowledge graph, report it with __RAISE_FLAG__ on the roles stage.
 
 Steps:
 1. Read the roles and the statistics; inspect a few typical entities of the group.
 2. Measure the pitfalls you suspect with SPARQL queries.
-3. Add your findings with add_finding; then call finish, with local_name_type if the default is wrong.
+3. Add your findings with __ADD_FINDING__; then call __FINISH__, with local_name_type if the default is wrong.

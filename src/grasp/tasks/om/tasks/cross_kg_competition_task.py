@@ -10,6 +10,7 @@ other partitions, but only if both KGs have one. KGs whose partitions are cut
 otherwise (e.g. items and properties of a generic KG under names of its own)
 get no default: there the names say nothing about where the properties are.
 """
+from enum import StrEnum
 from typing import Any, Callable
 
 from grasp.functions import find_manager
@@ -25,10 +26,15 @@ from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.rendering import Section, format_display_content
 from grasp.tasks.om.foundation.types import Side
 from grasp.tasks.om.tasks.profile_stage import PartitionEditor
-from grasp.tasks.om.tasks.prompting import load_prompt
+from grasp.tasks.om.tasks.prompting import fill_function_name_placeholders, load_prompt
 from grasp.utils import FunctionCallException, format_section
 
-FINISH = "finish"
+
+class CrossKgCompetitionFunctionName(StrEnum):
+    SET_COMPETITION = "set_competition"
+    FINISH = "finish"
+
+
 PROPERTY_PARTITION = "property"
 # set_by of the pairs
 DEFAULT_SET_BY = "default"
@@ -128,7 +134,7 @@ class CrossKgCompetitionTask(GraspTask):
     def set_competition_definition(self) -> dict:
         partition_names = {side: self.alignment_state.get_kg_profile(side).partition_names() for side in SIDES}
         return {
-            "name": "set_competition",
+            "name": CrossKgCompetitionFunctionName.SET_COMPETITION,
             "description": (
                 "Sets whether the entities of a partition of the source knowledge graph and of a partition of "
                 "the target knowledge graph compete with each other: if not, an entity of one is never a "
@@ -149,7 +155,7 @@ class CrossKgCompetitionTask(GraspTask):
 
     def finish_definition(self) -> dict:
         return {
-            "name": FINISH,
+            "name": CrossKgCompetitionFunctionName.FINISH,
             "description": "Submits the pairs of partitions that do not compete.",
             "parameters": {
                 "type": "object",
@@ -186,7 +192,7 @@ class CrossKgCompetitionTask(GraspTask):
     # --- GraspTask ---
 
     def system_information(self) -> str:
-        info = load_prompt(self.prompt_file)
+        info = fill_function_name_placeholders(load_prompt(self.prompt_file), CrossKgCompetitionFunctionName)
         task_instructions = load_task_instructions(self.config)
         if task_instructions:
             info += "\n\n" + format_section("Task-specific instructions", task_instructions)
@@ -196,7 +202,7 @@ class CrossKgCompetitionTask(GraspTask):
         return [
             "Inspect the knowledge graphs with the SPARQL functions where it is unclear what a partition holds.",
             "You can execute multiple tool calls in one step.",
-            "Call finish exactly once, at the end.",
+            f"Call {CrossKgCompetitionFunctionName.FINISH} exactly once, at the end.",
             f"You have at most {self.config.max_steps} steps; one step is one response of yours, with all "
             "tool calls in it.",
         ]
@@ -214,7 +220,7 @@ class CrossKgCompetitionTask(GraspTask):
         return handlers[fn_name](fn_args)
 
     def done(self, fn_name: str) -> bool:
-        return fn_name == FINISH and self.finished
+        return fn_name == CrossKgCompetitionFunctionName.FINISH and self.finished
 
     def output(self, messages: list[Message]) -> dict[str, Any]:
         return CrossKgCompetitionOutput(

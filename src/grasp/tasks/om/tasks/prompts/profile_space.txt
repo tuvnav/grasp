@@ -4,5 +4,5 @@ The entity space is the set of IRI prefixes of the entities to align. Entities o
 
 Steps:
 1. Read the namespace counts. Which namespaces hold the entities the knowledge graph is about, and which hold imports, helper nodes, files or external references?
-2. Inspect unclear namespaces with inspect_namespace and the SPARQL functions. Several prefixes are possible (e.g. classes and properties in different namespaces); a prefix may be longer than the namespace shown (e.g. a path below a host).
-3. Set the entity space with set_entity_space (without it, the default stays), then call finish.
+2. Inspect unclear namespaces with __INSPECT_NAMESPACE__ and the SPARQL functions. Several prefixes are possible (e.g. classes and properties in different namespaces); a prefix may be longer than the namespace shown (e.g. a path below a host).
+3. Set the entity space with __SET_ENTITY_SPACE__ (without it, the default stays), then call __FINISH__.
