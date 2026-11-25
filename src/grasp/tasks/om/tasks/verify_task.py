@@ -7,6 +7,7 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
+from grasp.tasks.om.data_models.profile import describe_profile
 from grasp.tasks.om.data_models.verification import Verdict, VerdictOption, VerifyInput
 from grasp.tasks.om.foundation.configuration import (
     load_task_instructions,
@@ -14,7 +15,8 @@ from grasp.tasks.om.foundation.configuration import (
 from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
-from grasp.tasks.om.tasks.prompting import add_equivalence_condition
+from grasp.tasks.om.foundation.rendering import Section, format_display_content
+from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
 from grasp.tasks.om.tasks.task_input import managers_by_side
 from grasp.utils import FunctionCallException, format_section
 
@@ -29,11 +31,14 @@ class VerifyState:
     entity_displays: dict[Side, EntityDisplay]
     agentic: bool
     competitors_by_side: dict[Side, list[IRI]]
+    profiles: bool = False  # show the profiles of both knowledge graphs
     verdict: Optional[Verdict] = None
 
     @property
     def competitors(self) -> bool:
-        """Competitors on at least one side: the judge sees a group, not a pair."""
+        """
+        Competitors on at least one side: the judge sees a group, not a pair.
+        """
         return any(self.competitors_by_side.get(side) for side in (Side.SOURCE, Side.TARGET))
 
     @property
@@ -268,17 +273,19 @@ def function_definitions(function_names: list[VerifyFunction]) -> list[dict]:
     return res
 
 
-def system_prompt_completion(competitors: bool, agentic: bool, config: GraspConfig) -> tuple[str, str, str]:
-    """Returns an 'task outline', 'steps to follow' and 'special notes' text"""
-    steps = (
-        "Follow these steps:\n"
-        "- Consider the given context for each entity "
-        "and think about how these entities are going "
-        "to be used in real world applications of the "
-        "ontologies.\n"
-        )
+# the parts of verify_task.txt that depend on the variant: with competitors
+# (a group of entities, one set_verdict) or not (a pair: accept, reject,
+# unsure), agentic (with SPARQL functions and several steps) or one-shot
+TASK_OUTLINE_PLACEHOLDER = "__TASK_OUTLINE__"
+FURTHER_STEPS_PLACEHOLDER = "__FURTHER_STEPS__"
+STEP_NOTES_PLACEHOLDER = "__STEP_NOTES__"
+
+
+def verify_prompt(competitors: bool, agentic: bool, config: GraspConfig) -> str:
+    """verify_task.txt with the parts of the variant filled in."""
+    further_steps = ""
     if agentic:
-        steps += (
+        further_steps += (
             "- Use the built in functions to explore "
             "the involved ontologies if you regard the "
             "provided context as insufficient.\n"
@@ -308,8 +315,7 @@ def system_prompt_completion(competitors: bool, agentic: bool, config: GraspConf
             "its ontology. Decide which pairs of a source and "
             "a target entity are equivalent, if any."
         )
-        steps += "- Call 'set_verdict' to establish your decision."
-
+        further_steps += f"- Call '{VerifyFunction.SET_VERDICT}' to establish your decision."
     else:
         outline = (
             "You are presented a pair of entities from "
@@ -317,11 +323,17 @@ def system_prompt_completion(competitors: bool, agentic: bool, config: GraspConf
             "within their ontologies. Your task is to verify whether "
             "they constitute a true equivalence."
         )
-        steps += (
-            "- establish your decision by calling 'accept', "
-            "'reject' or 'unsure'."
+        further_steps += (
+            f"- establish your decision by calling '{VerifyFunction.ACCEPT}', "
+            f"'{VerifyFunction.REJECT}' or '{VerifyFunction.UNSURE}'."
         )
-    return outline, steps, notes
+    prompt = (
+        load_prompt("verify_task.txt")
+        .replace(TASK_OUTLINE_PLACEHOLDER, outline)
+        .replace(FURTHER_STEPS_PLACEHOLDER, further_steps)
+        .replace(STEP_NOTES_PLACEHOLDER, notes)
+        )
+    return fill_function_name_placeholders(prompt, VerifyFunction)
 
 
 def input_instructions(
@@ -329,31 +341,47 @@ def input_instructions(
         source_entities: list[IRI],
         target_entities: list[IRI]
         ) -> str:
-    input = "Consider the following entities:\n\n"
     if not source_entities or not target_entities:
         raise FunctionCallException(
             "OMVerifyTask needs at least one source entity and at least one target entity."
         )
+    for side, entities_text in ((Side.SOURCE, source_entities), (Side.TARGET, target_entities)):
+        state.entity_displays[side].prefetch(entities_text)
+    sections = [
+        Section(
+            f"{label} entity" if len(entities) == 1 else f"{label} entities",
+            subsections=[state.entity_displays[side].show_section(entity, LONG_VIEW) for entity in entities],
+            )
+        for side, label, entities in (
+            (Side.SOURCE, "Source", source_entities),
+            (Side.TARGET, "Target", target_entities),
+            )
+        ]
+    entities_text = "Consider the following entities:\n\n" + "\n\n".join(
+        format_display_content(section) for section in sections
+        )
+    if not state.profiles:
+        return entities_text
+    return format_display_content(
+        Section(
+            "Knowledge graphs",
+            subsections=[
+                describe_knowledge_graph(state, side)
+                for side in (Side.SOURCE, Side.TARGET)
+                ]
+        )
+        ) + "\n\n" + entities_text
 
-    if len(source_entities) == 1:
-        input += "**Source entity**: "
-    else:
-        input += "**Source entities:**\n"
 
-    for side, entities in ((Side.SOURCE, source_entities), (Side.TARGET, target_entities)):
-        state.entity_displays[side].prefetch(entities)
-    for src_ent in source_entities:
-        input += state.entity_displays[Side.SOURCE].show(src_ent, LONG_VIEW) + "\n\n"
-
-    if len(target_entities) == 1:
-        input += "**Target entity**: "
-    else:
-        input += "**Target entities:**\n"
-
-    for tgt_ent in target_entities:
-        input += state.entity_displays[Side.TARGET].show(tgt_ent, LONG_VIEW) + "\n\n"
-
-    return input
+def describe_knowledge_graph(state: VerifyState, side: Side) -> Section:
+    """The knowledge graph of a side with its description and profile (with findings)."""
+    display = state.entity_displays[side]
+    profile = describe_profile(display.kg_profile, findings=True)
+    return Section(
+        f"{display.manager.kg} ({side})",
+        [display.manager.description or "", *profile.content],
+        profile.subsections,
+        )
 
 
 class OMVerifyTask(GraspTask):
@@ -361,18 +389,9 @@ class OMVerifyTask(GraspTask):
     state: VerifyState
 
     def system_information(self) -> str:
-        prompt = (
-            "You are an ontology matching assistant. "
-            "The goal is 1:1 equivalences between the entities of "
-            "a source and a target ontology."
-        )
-        prompt += "\n\n" + "\n\n".join(
-            system_prompt_completion(
-                self.state.competitors, self.state.agentic, self.config
-                )
+        prompt = add_equivalence_condition(
+            verify_prompt(self.state.competitors, self.state.agentic, self.config), self.config
             )
-
-        prompt = add_equivalence_condition(prompt, self.config)
 
         task_instructions = load_task_instructions(self.config)
         if task_instructions:
@@ -405,7 +424,8 @@ class OMVerifyTask(GraspTask):
                 Side.TARGET: EntityDisplay(managers[Side.TARGET], verify_input.target_profile),
             },
             agentic=verify_input.agentic,
-            competitors_by_side=verify_input.competitors
+            competitors_by_side=verify_input.competitors,
+            profiles=verify_input.profiles,
             )
 
         src_iris = list(self.state.presented_source)

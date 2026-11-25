@@ -851,7 +851,7 @@ def describe_predicate_pattern(pattern: PredicatePattern) -> str:
         ) + ".")
     if pattern.patterns:
         parts.append("sparql patterns: " + ", ".join(
-            f"{{{sparql}}}" for sparql in pattern.patterns
+            f"`{sparql}`" for sparql in pattern.patterns
             ) + ".")
     return " ".join(parts)
 
@@ -862,7 +862,7 @@ def describe_predicate_pattern_items(pattern: PredicatePattern) -> list[Item]:
     if pattern.predicates:
         items.append(Item("predicates:", [Item(short_iri(predicate)) for predicate in pattern.predicates]))
     if pattern.patterns:
-        items.append(Item("sparql patterns:", [Item(f"{{{sparql}}}") for sparql in pattern.patterns]))
+        items.append(Item("sparql patterns:", [Item(f"`{sparql}`") for sparql in pattern.patterns]))
     return items
 
 

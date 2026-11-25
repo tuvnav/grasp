@@ -182,8 +182,8 @@ def format_anchor(
         entity_displays: dict[Side, EntityDisplay]
         ) -> str:
     text = (
-        f"{entity_displays[Side.SOURCE].show(anchor.source_entity)} = "
-        f"{entity_displays[Side.TARGET].show(anchor.target_entity)} "
+        f"{entity_displays[Side.SOURCE].show_line(anchor.source_entity)} = "
+        f"{entity_displays[Side.TARGET].show_line(anchor.target_entity)} "
         f"[on normalization level '{anchor.normalization_level}'"
         )
     if (anchor.specificity == AnchorSpecificity.HEAD
@@ -271,12 +271,12 @@ def format_ambiguous_entity(
     candidate_items = []
 
     for candidate, rivals in rivals_by_candidate.items():
-        candidate_text = entity_displays[Side.TARGET].show(candidate)
+        candidate_text = entity_displays[Side.TARGET].show_line(candidate)
         if rivals:
             num_cut_off_rivals = len(rivals) - NUM_SHOWN_RIVALS
             candidate_text += (
                 ", rivals on its best rank: "
-                + ", ".join(entity_displays[Side.SOURCE].show(rival)
+                + ", ".join(entity_displays[Side.SOURCE].show_line(rival)
                             for rival in rivals[:NUM_SHOWN_RIVALS])
                 + (f", +{num_cut_off_rivals} more" if num_cut_off_rivals > 0 else "")
                 )
@@ -295,7 +295,7 @@ def format_ambiguous_entity(
             Item(f"; {counterparts_outside} competing entities "
                  "outside the population share the key")
             )
-    return Item(entity_displays[Side.SOURCE].show(entity), children)
+    return Item(entity_displays[Side.SOURCE].show_line(entity), children)
 
 
 def prefetch_ambiguous(
@@ -417,8 +417,8 @@ def format_anchor_merge(
             "(left out of the anchors)",
             [
                 Item(
-                    f"{entity_displays[Side.SOURCE].show(source)} = "
-                    f"{entity_displays[Side.TARGET].show(target)} "
+                    f"{entity_displays[Side.SOURCE].show_line(source)} = "
+                    f"{entity_displays[Side.TARGET].show_line(target)} "
                     f"({'+'.join(sorted(families))})"
                     )
                 for source, target, families in conflict_examples
@@ -691,7 +691,7 @@ class OMAnchorTask(GraspTask):
                     generator=generator,
                     signals=result.signals,
                     confirmed_equivalences=len(result.confirmed_equivalences),
-                    existing_equivalences=result.existing_equivalences,
+                    existing_equivalences=result.num_existing_equivalences_in_population,
                     num_hubs=len(result.hubs),
                 )
                 for run_id, (generator, result) in state.runs.items()

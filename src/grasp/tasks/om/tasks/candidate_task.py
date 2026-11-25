@@ -182,8 +182,6 @@ def generate_group_grouping(kg_profile: KgProfile, population: Population, side:
     return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
 
 
-
-
 def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
     """
     The groups of one side's population only 
@@ -196,6 +194,11 @@ def generate_population_groups_grouping(kg_profile: KgProfile, population: Popul
         tuple(member for member in all_groups.members if member[0] in group_names),
         exclusive=False, minus=all_groups.minus,
     )
+
+
+def in_population(pair: tuple[IRI, IRI], population_by_side: dict[Side, frozenset[IRI]]) -> bool:
+    """Both entities of a (source, target) pair are in their side's population."""
+    return pair[0] in population_by_side[Side.SOURCE] and pair[1] in population_by_side[Side.TARGET]
 
 
 def retrieve_side_population(
@@ -677,19 +680,30 @@ def run_strategy(
     # 0. the populations without the entities that already have an equivalence,
     # and in a trial run the sample of the larger one
     existing_equivalences_by_entity = alignment_state.existing_equivalences()
+
     population_by_side: dict[Side, frozenset[IRI]] = {
         side: retrieve_side_population(
             managers[side],
             alignment_state.get_kg_profile(side),
             generator.population,
             side,
-            existing_equivalences_by_entity[side].keys()
             )
         for side in SIDES
         }
-    population_sizes = {side: len(entities) for side, entities in population_by_side.items()}
-    entity_sample = draw_trial_sample(generator, population_by_side, sample_seed) if trial else None
-    compared_entities = compared_entities_by_side(population_by_side, entity_sample)
+    population_minus_existing_equivs_by_side: dict[Side, frozenset[IRI]] = {
+        side: entities - frozenset(existing_equivalences_by_entity[side])
+        for side, entities in population_by_side.items()
+        }
+    population_sizes = {
+        side: len(entities) for side, entities
+        in population_minus_existing_equivs_by_side.items()
+        }
+    entity_sample = draw_trial_sample(
+        generator, population_minus_existing_equivs_by_side, sample_seed
+        ) if trial else None
+    compared_entities = compared_entities_by_side(
+        population_minus_existing_equivs_by_side, entity_sample
+        )
 
     # 1. collect
     value_wordsets = None
@@ -721,20 +735,31 @@ def run_strategy(
     # 2. select
     selected = select_candidates(collected, generator.selection)
 
-    # 3. summarize over the whole population of each side (on a sampled side: the sample)
+    # 3. summarize over the whole population of each side
+    # (on a sampled side: over the sample)
     sampled_side = entity_sample.side if entity_sample is not None else None
     if entity_sample is not None:
         population_sizes[entity_sample.side] = len(entity_sample.entities)
     signals = summarize_candidate_selection(selected, population_sizes, sampled_side)
 
     return StrategyResult(
-        population=population_by_side,
+        population_minus_existing_equivs=population_minus_existing_equivs_by_side,
         compared_entities=compared_entities,
         collected=collected,
         selected=selected,
         signals=signals,
-        confirmed_equivalences=confirmed_equivalences,
-        existing_equivalences=sum(len(witnesses) for witnesses in existing_equivalences_by_entity[Side.SOURCE].values()),
+        # the collection compares against all groups (rivals)
+        # but summary for llm should only take into account
+        # only existing equivalences inside the specified population
+        confirmed_equivalences=[
+            pair for pair in confirmed_equivalences
+            if in_population(pair, population_by_side)
+            ],
+        num_existing_equivalences_in_population=sum(
+            in_population(pair, population_by_side)
+            for equivalences in existing_equivalences_by_entity[Side.SOURCE].values()
+            for pair in equivalences
+            ),
         hubs=hubs,
         value_wordsets=value_wordsets,
         normalization_examples=normalization_examples
@@ -1060,7 +1085,7 @@ NUM_NORMALIZATION_EXAMPLES = 3  # values shown per side after the transforms and
 def display_entity(entity_displays: dict[Side, EntityDisplay], side: Side, entity: IRI) -> str:
     """An entity of the side as one line (its names must have been prefetched,
     prefetch_shown_entities)."""
-    return entity_displays[side].show(entity)
+    return entity_displays[side].show_line(entity)
 
 
 def format_share(share: float) -> str:
@@ -1072,11 +1097,11 @@ def format_found_again(result: StrategyResult) -> str | None:
     The existing equivalences the run finds again. Their entities are not in
     the population: the coverage and the other signals leave them out.
     """
-    if not result.existing_equivalences:
+    if not result.num_existing_equivalences_in_population:
         return None
     line = (
         f"Existing equivalences found again: {len(result.confirmed_equivalences)} of "
-        f"{result.existing_equivalences}. They are left out of the result: entities that already have an "
+        f"{result.num_existing_equivalences_in_population}. They are left out of the result: entities that already have an "
         "equivalence get no candidate list and are not counted in the coverage or any other signal, "
         "so a strategy can find many known equivalences and still show a low coverage."
         )
@@ -1491,7 +1516,7 @@ def format_merged_list(
                     for run_id, rank in sorted(ranks_by_candidate[candidate].items())
                     )
                 items.append(Item(
-                    f"{list_rank}. {entity_displays[other_side].show(candidate, SHORT_VIEW)} "
+                    f"{list_rank}. {entity_displays[other_side].show_line(candidate, SHORT_VIEW)} "
                     f"(ranks: {run_ranks})"
                     ))
     return items
@@ -1548,7 +1573,7 @@ def format_ensemble_evaluation_of_side(
             "examples, a random pair of each of the largest cells",
             [
                 Item(
-                    f"{format_venn_cell(cell)}: {entity_displays[side].show(entity, SHORT_VIEW)}",
+                    f"{format_venn_cell(cell)}: {entity_displays[side].show_line(entity, SHORT_VIEW)}",
                     format_merged_list(side, entity, merged, entity_displays)
                     )
                 for cell, entity, candidate in evaluation.cell_examples
@@ -1560,8 +1585,8 @@ def format_ensemble_evaluation_of_side(
             "too ambiguous, e.g.",
             [
                 Item(
-                    f"{entity_displays[side].show(entity, SHORT_VIEW)}: {num_tied} candidates tied on the first "
-                    f"rank, e.g. " + ", ".join(entity_displays[other_side].show(candidate, SHORT_VIEW)
+                    f"{entity_displays[side].show_line(entity, SHORT_VIEW)}: {num_tied} candidates tied on the first "
+                    f"rank, e.g. " + ", ".join(entity_displays[other_side].show_line(candidate, SHORT_VIEW)
                                                for candidate in tied_candidates)
                     )
                 for entity, num_tied, tied_candidates in evaluation.too_ambiguous_examples
@@ -1676,8 +1701,8 @@ def format_alignment_status(state: CandidateTaskState) -> Section:
             "examples",
             [
                 Item(
-                    f"{state.entity_displays[Side.SOURCE].show(equivalence.entity_source)} = "
-                    f"{state.entity_displays[Side.TARGET].show(equivalence.entity_target)}"
+                    f"{state.entity_displays[Side.SOURCE].show_line(equivalence.entity_source)} = "
+                    f"{state.entity_displays[Side.TARGET].show_line(equivalence.entity_target)}"
                     )
                 for equivalence in examples
                 ]
@@ -1989,7 +2014,7 @@ class OMCandidateTask(GraspTask):
                     generator=generator,
                     signals=result.signals,
                     confirmed_equivalences=len(result.confirmed_equivalences),
-                    existing_equivalences=result.existing_equivalences,
+                    existing_equivalences=result.num_existing_equivalences_in_population,
                     num_hubs=len(result.hubs),
                 )
                 for run_id, (generator, result) in state.runs.items()

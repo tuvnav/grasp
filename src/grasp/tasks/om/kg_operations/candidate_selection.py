@@ -426,7 +426,7 @@ def evaluable_entities(
         return None
     populations_and_compared: list[tuple[frozenset[IRI], frozenset[IRI]]] = []
     for result in results:
-        populations_and_compared.append((result.population[side], result.compared_entities[side]))
+        populations_and_compared.append((result.population_minus_existing_equivs[side], result.compared_entities[side]))
     union_of_populations = frozenset().union(*(population for population, _ in populations_and_compared))
     return frozenset(
         entity for entity in union_of_populations

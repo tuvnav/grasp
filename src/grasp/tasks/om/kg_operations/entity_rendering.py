@@ -30,6 +30,7 @@ from grasp.tasks.om.data_models.profile import (
     StructureRelationKind,
     roles_of_entity,
 )
+from grasp.tasks.om.foundation.rendering import Item, Section
 from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     OWL_ON_PROPERTY,
@@ -243,7 +244,7 @@ def membership_predicates(roles: PredicateRoles) -> list[IRI]:
 def context_role_names(roles: PredicateRoles) -> list[str]:
     """
     The roles shown in a context: all but noise, the structure relations in
-    both directions.
+    both directions (a symmetric one under its name only, see role_branches).
     """
     structural_relation_names = [relation.name for relation in roles.structure]
     return [
@@ -258,10 +259,19 @@ def role_branches(
         ) -> list[str]:
     """
     SPARQL alternatives over ?s (entity), ?predicate_ref (role name) and ?o (value),
-    for retrieve_value_groups; roles that are not set are left out.
+    for retrieve_value_groups; roles that are not set are left out. The other
+    direction of a symmetric relation is shown under the name of the relation,
+    so its values form one group: a symmetric link is often stated on one of
+    the two entities only (A disjointWith B, but not B disjointWith A).
     """
+    symmetric_relation_names = {relation.name for relation in roles.structure if relation.symmetric}
+
+    def shown_name(name: str) -> str:
+        relation_name = name.removeprefix(INVERSE_PREFIX)
+        return relation_name if relation_name in symmetric_relation_names else name
+
     return [
-        f"{branch} BIND({sparql_literal(name)} AS ?predicate_ref)"
+        f"{branch} BIND({sparql_literal(shown_name(name))} AS ?predicate_ref)"
         for role_name in role_names
         for name, pattern in named_value_patterns(role_name, roles)
         for branch in pattern.sparql_branches()
@@ -506,16 +516,14 @@ class EntityDisplay:
     def has_name(self, iri: str) -> bool:
         return bool(self.values_of_entity(IRI(iri), "names"))
 
-    def show(self, entity: IRI, view: EntityView = SHORT_VIEW) -> str:
-        """
-        The entity by the view (None: the display's own view): a line, or
-        the line with the context (if prefetched with a context view).
-        """
+    def show_section(self, entity: IRI, view: EntityView = SHORT_VIEW) -> Section:
+        """Like show, as a section: the line of the entity as its title, its context lines as items."""
         if view.context and entity in self.contexts_by_entity:
-            return self.render_context(self.contexts_by_entity[entity], view)
-        return self.render_line(entity, view)
+            header, lines = self.render_context(self.contexts_by_entity[entity], view)
+            return Section(header, [Item(line) for line in lines])
+        return Section(self.show_line(entity, view))
 
-    def render_line(self, entity: str, view: EntityView = SHORT_VIEW) -> str:
+    def show_line(self, entity: str, view: EntityView = SHORT_VIEW) -> str:
         """
         e.g. 'large intestine <mouse:MA_1> 
         (names: "Dickdarm"@de; synonyms: "colon", +1 more)';
@@ -546,11 +554,11 @@ class EntityDisplay:
         """
         if value.typ == BindingType.BNODE:
             return render_blank_node(
-                value.value, context.blank_nodes, self.render_line
+                value.value, context.blank_nodes, self.show_line
                 )
 
         if value.typ == BindingType.URI:
-            return self.render_line(value.value)
+            return self.show_line(value.value)
 
         return render_as_literal(value, view.max_chars_per_literal)
 
@@ -597,10 +605,10 @@ class EntityDisplay:
     # TODO: return Section or Item, must only change last
     # line for this. Render with format_display_content
     # in callers or directly here.
-    def render_context(self, context: EntityContext, view: EntityView) -> str:
+    def render_context(self, context: EntityContext, view: EntityView) -> tuple[str, list[str]]:
         """
-        The line of the entity, then its context in a fixed order of
-        importance, cut at view.max_chars. Pure: no SPARQL.
+        (the line of the entity, its context lines in a fixed order of
+        importance, cut at view.max_chars). Pure: no SPARQL.
         """
         lines: list[str] = []
 
@@ -645,11 +653,11 @@ class EntityDisplay:
             usage = context.used_as_predicate
 
             def type_counts(types: list[tuple[IRI, int]]) -> str:
-                return ", ".join(f"{self.render_line(t)} {n}" for t, n in types) or "untyped"
+                return ", ".join(f"{self.show_line(t)} {n}" for t, n in types) or "untyped"
 
             def example(binding: Binding) -> str:
                 if binding.typ == BindingType.URI:
-                    return self.render_line(binding.value)
+                    return self.show_line(binding.value)
                 if binding.typ == BindingType.BNODE:
                     return "_"
                 return f'"{clip(binding.value, view.max_chars_per_literal)[:60]}"'
@@ -662,13 +670,13 @@ class EntityDisplay:
             )
 
         # budget: sections are ordered by importance, so the least important are cut
-        header = "Entity " + self.render_line(context.iri, EntityView(num_names=1))
-        output = [header]
+        header = "Entity " + self.show_line(context.iri, EntityView(num_names=1))
+        shown: list[str] = []
         used_chars = len(header)
         for index, line in enumerate(lines):
             if used_chars + len(line) + 3 > view.max_chars:
-                output.append(f"  … ({len(lines) - index} more lines omitted)")
+                shown.append(f"… ({len(lines) - index} more lines omitted)")
                 break
-            output.append(f"  {line}")
+            shown.append(line)
             used_chars += len(line) + 3
-        return "\n".join(output)
+        return header, shown

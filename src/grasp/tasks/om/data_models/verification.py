@@ -40,6 +40,8 @@ class VerifyInput(BaseModel):
     target_iri: IRI
     agentic: bool = False
     competitors: dict[Side, list[IRI]] = {}
+    # show the profiles of both knowledge graphs before the entities
+    profiles: bool = False
 
 
 class JudgeMode(StrEnum):
@@ -53,12 +55,15 @@ class JudgeVariant(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: JudgeMode = JudgeMode.ONE_SHOT
     competitors: bool = False
+    # the judge sees the profiles of both knowledge graphs
+    profiles: bool = False
     # step budget of the agentic mode
     max_steps: int = 8
 
     @property
     def name(self) -> str:
-        return self.mode.value + ("+competitors" if self.competitors else "")
+        return (self.mode.value + ("+competitors" if self.competitors else "")
+                + ("+profiles" if self.profiles else ""))
 
 
 class Judgment(Verdict):

@@ -22,7 +22,7 @@ this run can be deleted; one kept against an earlier equivalence becomes a
 conflict in the ledger, checked later.
 """
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Callable
 
@@ -43,6 +43,7 @@ from grasp.tasks.om.data_models.verification import (
 )
 from grasp.tasks.om.foundation.configuration import know_before_use, load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
+from grasp.tasks.om.foundation.rendering import Section, format_display_content
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
@@ -125,6 +126,11 @@ def format_signals(candidate: ListedCandidate) -> str:
     return f"Pareto layer {candidate.pareto_layer}" + (f"; {ranks}" if ranks else "")
 
 
+def numbered(section: Section, number: int) -> Section:
+    """The section of an entity with its number in front of the title."""
+    return replace(section, title=f"{number}. {section.title}")
+
+
 def focused_input(state: SearchVerifyState) -> str:
     """
     Each focus entity with its candidates.
@@ -134,18 +140,23 @@ def focused_input(state: SearchVerifyState) -> str:
     with_candidates = any(focus.candidates for focus in state.unit.focus)
     for number, focus in enumerate(state.unit.focus, start=1):
         side, other_side = Side(focus.side), Side.other_side(Side(focus.side))
-        body = state.entity_displays[side].show(focus.entity, LONG_VIEW)
+        subsections = [state.entity_displays[side].show_section(focus.entity, LONG_VIEW)]
         candidates = ordered_candidates(focus, state.variant, state.unit.key)
         if candidates:
-            lines = []
+            candidate_sections = []
             for candidate_number, candidate in enumerate(candidates, start=1):
-                line = f"{candidate_number}. {state.entity_displays[other_side].show(candidate.entity, LONG_VIEW)}"
+                section = numbered(
+                    state.entity_displays[other_side].show_section(candidate.entity, LONG_VIEW), candidate_number
+                    )
                 if state.variant.show_signals:
-                    line += f"\n   ({format_signals(candidate)})"
-                lines.append(line)
-            body += f"\n\nCandidates in the {other_side.value} ontology {kg_names[other_side]}:\n" + "\n\n".join(lines)
-        sections.append(format_section(
-            f"Focus entity {number}, from the {side.value} ontology {kg_names[side]}", body, level=3))
+                    section = replace(section, content=[f"({format_signals(candidate)})", *section.content])
+                candidate_sections.append(section)
+            subsections.append(Section(
+                f"Candidates in the {other_side.value} ontology {kg_names[other_side]}",
+                subsections=candidate_sections,
+                ))
+        sections.append(Section(
+            f"Focus entity {number}, from the {side.value} ontology {kg_names[side]}", subsections=subsections))
     if with_candidates:
         instruction = (
             "Find the equivalent of each focus entity in the other ontology, or verify that it has none. "
@@ -154,7 +165,7 @@ def focused_input(state: SearchVerifyState) -> str:
             )
     else:
         instruction = "Find the equivalent of each focus entity in the other ontology, or verify that it has none."
-    return instruction + "\n\n" + "\n\n".join(sections)
+    return instruction + "\n\n" + "\n\n".join(format_display_content(section, level=3) for section in sections)
 
 
 def clusters_input(state: SearchVerifyState) -> str:
@@ -163,16 +174,18 @@ def clusters_input(state: SearchVerifyState) -> str:
     sections = []
     for side in SIDES:
         entities = state.presented[side]
-        body = "\n\n".join(f"{number}. {state.entity_displays[side].show(entity, LONG_VIEW)}"
-                           for number, entity in enumerate(entities, start=1))
-        sections.append(format_section(
-            f"Entities of the {side.value} ontology {kg_names[side]}", body or "none", level=3))
+        sections.append(Section(
+            f"Entities of the {side.value} ontology {kg_names[side]}",
+            [] if entities else ["none"],
+            [numbered(state.entity_displays[side].show_section(entity, LONG_VIEW), number)
+             for number, entity in enumerate(entities, start=1)],
+            ))
     instruction = (
         "Find the equivalences between the listed entities of the two ontologies. Examine the listed "
         "entities closely against each other first; search the ontologies beyond the lists only if a "
         "listed entity has no fitting counterpart among them or doubts remain."
         )
-    return instruction + "\n\n" + "\n\n".join(sections)
+    return instruction + "\n\n" + "\n\n".join(format_display_content(section, level=3) for section in sections)
 
 
 # ---------------------------------------------------------------- checks of set_equivalence

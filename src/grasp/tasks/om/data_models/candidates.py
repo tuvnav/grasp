@@ -784,7 +784,7 @@ class StrategyResult[H: Hub]:
     """
     # per side the entities of the run's population (generator.population),
     # without those that already have an equivalence
-    population: dict[Side, frozenset[IRI]]
+    population_minus_existing_equivs: dict[Side, frozenset[IRI]]
     # per side the entities the run compared: the population, or on the side
     # sampled in a trial run the sample
     compared_entities: dict[Side, frozenset[IRI]]
@@ -795,7 +795,7 @@ class StrategyResult[H: Hub]:
     # pairs, before the selection), of existing_equivalences in all: an estimate
     # of its recall on them
     confirmed_equivalences: list[tuple[IRI, IRI]]
-    existing_equivalences: int
+    num_existing_equivalences_in_population: int
     # keys/texts with too many entity pairs to pair them
     # (a list of KeyHub, VectorHub or NeighbourHub)
     hubs: Sequence[H]  # make Pyright happy: list not covariant
