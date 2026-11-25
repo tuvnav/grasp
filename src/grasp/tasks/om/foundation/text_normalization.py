@@ -53,6 +53,18 @@ NORMALIZATION_LEVELS: dict[NormalizationLevel, Callable[[str], str]] = {
 assert list(NORMALIZATION_LEVELS) == list(get_args(NormalizationLevel.__value__)), \
     "NormalizationLevel and NORMALIZATION_LEVELS differ"
 
+# what each level does, for the LLM (each level adds to the one before it)
+NORMALIZATION_LEVELS_DESCRIPTION = (
+    "raw: the value as stored. "
+    "case: casefolded ('Some Phrase' -> 'some phrase'). "
+    "words: also split into words at camelCase and at '_', '-' and other separators "
+    "('CamelCasedPhrase' -> 'camel cased phrase', 'separated_by-dashes' -> 'separated by dashes'). "
+    "spaceless: the words joined ('separatedbydashes'). "
+    "wordset: the words in any order ('Second First' = 'first second'). "
+    "plural: also English plural undone ('Red Apples' -> 'apple red'). "
+    "inflection: also English verb and noun forms undone ('Writes Papers' -> 'paper write')."
+    )
+
 
 def words(key: str) -> list[str]:
     """

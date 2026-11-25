@@ -17,7 +17,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-type Vectorizer = Literal["idf_tokens", "char_3grams", "embedding"]
+type Vectorizer = Literal["idf_char_3grams", "embedding"]
 # a matrix with one row per text: sparse (TF-IDF) or dense (embedding). The
 # type checker cannot tell the two apart on its own (scipy and scikit-learn have
 # no type hints), so the functions below separate them with isinstance and cast
@@ -32,22 +32,19 @@ EMBEDDING_TEXT_PREFIXES: dict[str, str] = {
 
 TEXT_BATCH_SIZE = 1000
 
+
 def vectorize_texts_tf_idf(
         source_texts: list[str],
         target_texts: list[str],
-        vectorizer: Literal["idf_tokens", "char_3grams"],
         ) -> tuple[csr_matrix, csr_matrix]:
     """
-    TF-IDF vectors of the texts of both sides, on words (idf_tokens) or on
-    character 3-grams within words (char_3grams). Vocabulary and IDF are learned
-    from the texts of both sides together, so that a column means the same word
-    (or 3-gram) on both sides.
+    TF-IDF vectors of the texts of both sides on character 3-grams within
+    words (idf_char_3grams): word forms and spelling variants share most of
+    their 3-grams. Vocabulary and IDF are learned from the texts of both sides
+    together, so that a column means the same 3-gram on both sides, and rare
+    3-grams count more.
     """
-    if vectorizer == "idf_tokens":
-        # the "words" level has split the words already; \S+ also keeps one-letter words
-        tf_idf = TfidfVectorizer(analyzer="word", token_pattern=r"\S+")
-    else:
-        tf_idf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3))
+    tf_idf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3))
     tf_idf.fit(source_texts + target_texts)
     # scikit-learn has no type hints: transform returns a csr_matrix
     return cast(csr_matrix, tf_idf.transform(source_texts)), cast(csr_matrix, tf_idf.transform(target_texts))
@@ -136,7 +133,7 @@ def vectorize_texts(
     if vectorizer == "embedding":
         model_name = model_name or DEFAULT_EMBEDDING_MODEL
         return embed_texts(source_texts, model_name), embed_texts(target_texts, model_name)
-    return vectorize_texts_tf_idf(source_texts, target_texts, vectorizer)
+    return vectorize_texts_tf_idf(source_texts, target_texts)
 
 
 def count_text_vectors(vectors: TextVectors) -> int:

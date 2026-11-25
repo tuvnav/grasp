@@ -44,7 +44,9 @@ from grasp.tasks.om.data_models.candidates import (
     CandidateStrategyType,
     Generator,
     KeyStrategy,
+    NormalizationExample,
     NeighbourStrategy,
+    StringNormalization,
     Selection,
     VectorStrategy,
     CandidateStageResult,
@@ -89,6 +91,7 @@ from grasp.tasks.om.foundation.rendering import (
 )
 from grasp.tasks.om.foundation.text_normalization import (
     NORMALIZATION_LEVELS,
+    NORMALIZATION_LEVELS_DESCRIPTION,
     REGEX_REPLACE,
     TRANSFORM_OPERATIONS,
     NormalizationLevel,
@@ -223,9 +226,8 @@ def retrieve_side_population(
 
 # trial runs: the most entities of the larger population that are compared, per
 # vectorizer (in a small KG the key strategy is cheap and runs on the whole population)
-TRIAL_ENTITY_LIMITS: dict[str, int] = {
-    "idf_tokens": 5000,
-    "char_3grams": 5000,
+TRIAL_ENTITY_LIMITS: dict[Vectorizer, int] = {
+    "idf_char_3grams": 5000,
     "embedding": 5_000,
 }
 
@@ -448,14 +450,16 @@ def get_key_candidates(
         if not any(indices_by_side[side].values()):
             raise no_values_error(side)
 
-    # examples for raw value -> transform -> string normalization for LLM
+    # a few values through the transforms and the levels, for the LLM (each
+    # level's index holds all values)
     normalization_examples = {
         side: get_normalization_examples(
             indices_by_side[side][strategy.normalization.levels[0]],
             strategy.normalization,
-            NUM_NORMALIZATION_EXAMPLES
+            NUM_NORMALIZATION_EXAMPLES,
+            group_names_by_side[side],
             ) for side in SIDES
-        } if strategy.normalization.transforms else None
+        }
 
     # 2. intersect the two sides: entity pairs with their shared keys
     entity_pairs, overfull_keys = intersect_level_indices(
@@ -466,7 +470,7 @@ def get_key_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    existing_equivalences = alignment_state.existing_equivalences()
+    existing_equivalences = alignment_state.existing_equivalences_by_entity()
 
     rival_keys: set[tuple[IRI, IRI]] = set()
     if retrieve_all_name_roles:
@@ -515,15 +519,16 @@ def get_vector_candidates(
         neighbours_per_text: int = 50,
         entity_sample: EntitySample | None = None,
         ) -> tuple[
-            dict[tuple[Side, IRI], EntityCandidates], list[VectorHub], list[tuple[IRI, IRI]],
-            dict[Side, list[tuple[str, str, str]]] | None
+            dict[tuple[Side, IRI], EntityCandidates],
+            list[VectorHub],
+            list[tuple[IRI, IRI]],
         ]:
     """
     The candidates of a vector strategy for every entity in its population, on
     both sides, the text pairs whose entities would give too many entity
     pairs (above max_entity_pairs_per_bucket), the existing equivalences found
-    again, and with transforms per side a few normalization examples. The strategy compares the texts
-    of one normalization level. neighbours_per_text: how many nearest texts of
+    again. The strategy compares the texts on the level words (vector strategies
+    have no transforms). neighbours_per_text: how many nearest texts of
     the other side each text keeps (a pre-cut before the selection, larger than
     any top_k). entity_sample: a trial run compares only these entities on their
     side. Not yet ranked or cut by generator.selection.
@@ -534,25 +539,23 @@ def get_vector_candidates(
             f"get_vector_candidates needs a vector strategy, not {strategy.kind!r}"
             )
 
-    # 1. per side: the values of the entities in the groups -> index of the one level
+    # 1. per side: the values of the entities in the groups -> index of the level words
     index_by_side: dict[Side, ValueIndex] = {}
     group_names_by_side = {}
+    string_normalization = StringNormalization(
+        levels=["words"]
+        )
+
     for side in SIDES:
         kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(kg_profile, generator.population, side)
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
-        # exactly one level (VectorStrategy checks it)
-        (index_by_side[side],) = build_side_indices(value_rows, strategy.normalization).values()
+        # exactly one level: words (string_normalization above)
+        (index_by_side[side],) = build_side_indices(
+            value_rows, string_normalization
+            ).values()
         if not any(index_by_side[side].values()):
             raise no_values_error(side)
-
-    normalization_examples = {
-        side: get_normalization_examples(
-            index_by_side[side],
-            strategy.normalization,
-            NUM_NORMALIZATION_EXAMPLES
-            ) for side in SIDES
-        } if strategy.normalization.transforms else None
 
     # 2. vectorize, build similarity matrix, determine a preliminary
     # number of best neighbours per text on both sides (not top-k yet,
@@ -569,12 +572,15 @@ def get_vector_candidates(
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
-    witnesses_by_entity = alignment_state.existing_equivalences()
+    existing_equivs_by_entity = alignment_state.existing_equivalences_by_entity()
     candidates_by_entity = vector_entity_pairs_to_candidates(
-        alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, witnesses_by_entity
+        alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, existing_equivs_by_entity
         )
-    return (candidates_by_entity, vector_hubs, find_confirmed_equivalences(entity_pairs, witnesses_by_entity),
-            normalization_examples)
+    return (
+        candidates_by_entity,
+        vector_hubs,
+        find_confirmed_equivalences(entity_pairs, existing_equivs_by_entity)
+        )
 
 
 def get_neighbour_candidates(
@@ -601,7 +607,7 @@ def get_neighbour_candidates(
             )
 
     # 0. the witnesses: the equivalences found so far
-    witnesses_by_entity = alignment_state.existing_equivalences()
+    witnesses_by_entity = alignment_state.existing_equivalences_by_entity()
     if not witnesses_by_entity[Side.SOURCE]:
         raise FunctionCallException(
             "A neighbour strategy needs equivalences found before (its witnesses), "
@@ -679,7 +685,7 @@ def run_strategy(
     """
     # 0. the populations without the entities that already have an equivalence,
     # and in a trial run the sample of the larger one
-    existing_equivalences_by_entity = alignment_state.existing_equivalences()
+    existing_equivalences_by_entity = alignment_state.existing_equivalences_by_entity()
 
     population_by_side: dict[Side, frozenset[IRI]] = {
         side: retrieve_side_population(
@@ -716,7 +722,7 @@ def run_strategy(
                 entity_sample=entity_sample,
             )
         case CandidateStrategyType.VECTOR:
-            collected, hubs, confirmed_equivalences, normalization_examples = get_vector_candidates(
+            collected, hubs, confirmed_equivalences = get_vector_candidates(
                 managers, alignment_state, generator,
                 partition_names_by_entity, max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
@@ -1070,8 +1076,11 @@ def show_candidates(state: CandidateTaskState, fn_args: dict) -> str:
             title += " (trial run on a sample)"
 
     prefetch_shown_entities(shown, [], state.entity_displays)
-    content.extend(format_selected_candidates(selected, state.entity_displays) for selected in shown)
-    return format_display_content(Section(title, content or ["no such entity"]))
+    return format_display_content(Section(
+        title,
+        content if shown else [*content, "no such entity"],
+        [format_selected_candidates(selected, state.entity_displays) for selected in shown],
+        ))
 
 
 # ---------------------------------------------------------------- formatting for the LLM
@@ -1307,7 +1316,7 @@ def filter_informative_matches(matches: Sequence[Match]) -> list[Match]:
 
 def format_selected_candidates(
     selected: SelectedCandidates, entity_displays: dict[Side, EntityDisplay]
-        ) -> Item:
+        ) -> Section:
     """
     The selection of one entity: its tie groups in rank order (rank 1 = best),
     each with its candidates, then the counterparts that are not listed.
@@ -1347,7 +1356,7 @@ def format_selected_candidates(
         items.append(Item(f"next tie group dropped: its {dropped} entities do not fit into top_k"))
     items.extend(format_rivals(collected))
     side = collected.side
-    return Item(f"{side} {display_entity(entity_displays, side, collected.entity)}", items)
+    return Section(f"{side} {display_entity(entity_displays, side, collected.entity)}", items)
 
 
 def shown_entities(
@@ -1422,28 +1431,38 @@ def format_strategy_result(
         if hubs_content:
             subsections.append(Section("Hubs", hubs_content))
 
-    if result.normalization_examples:
-        subsections.append(
-            Section(
-                "Values after the transforms and the normalization "
-                "(raw value → transformed → key on the finest level)",
-                [
-                    Item(
-                        f"{side}: " + "; ".join(
-                            f"{value!r} → {transformed!r} → {key!r}"
-                            for value, transformed, key in side_examples)
-                        )
-                    for side, side_examples in result.normalization_examples.items()
-                    ]
-            )
-        )
+    normalization_section = format_normalization_examples(result)
+    if normalization_section:
+        subsections.append(normalization_section)
 
     subsections.append(Section(
         "Example entities",
-        [format_selected_candidates(selected, entity_displays) for selected in examples]
-        or ["no entity has a candidate"]
+        [] if examples else ["no entity has a candidate"],
+        [format_selected_candidates(selected, entity_displays) for selected in examples],
         ))
     return Section(title, subsections=subsections)
+
+
+def format_normalization_example(example: NormalizationExample) -> str:
+    """The value, then each step that changes it: 'Fore-Brain' → words: 'fore brain' → …"""
+    steps = [repr(example.value)]
+    if example.transformed != example.value:
+        steps.append(f"transforms: {example.transformed!r}")
+    steps += [f"{level}: {key!r}" for level, key in example.keys_by_level]
+    return " → ".join(steps) if len(steps) > 1 else f"{steps[0]} (unchanged on every level)"
+
+
+def format_normalization_examples(result: StrategyResult) -> Section | None:
+    """A few values per side through the transforms and the levels of a key run; None: another strategy."""
+    if not result.normalization_examples:
+        return None
+    return Section(
+        "Values through the transforms and the normalization levels (a step only where the value changes)",
+        [
+            Item(f"{side}:", [Item(format_normalization_example(example)) for example in side_examples])
+            for side, side_examples in result.normalization_examples.items()
+            ],
+        )
 
 
 # ---------------------------------------------------------------- ensemble evaluation
@@ -1766,6 +1785,23 @@ SELECTION_SCHEMA = {
     },
 }
 
+STRING_TRANSFORMS_SCHEMA = {
+    "type": "array",
+    "description": "String transforms applied to every value before the levels. Use them only for what "
+                   "the levels cannot do: case, word splitting (camelCase, '-', '_'), word order, plural and "
+                   "inflection are done by the levels.",
+    "items": {
+        "type": "object", "properties": {
+            "operation": {"type": "string", "enum": [*TRANSFORM_OPERATIONS, REGEX_REPLACE]},
+            "pattern": {"type": "string", "description": "regex_replace only: a Python re pattern"},
+            "replacement": {
+                "type": "string",
+                "description": "regex_replace only: Python re syntax; groups as \\1, not $1."
+                },
+            }, "required": ["operation"]
+        }
+    }
+
 GENERATOR_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1797,37 +1833,21 @@ GENERATOR_SCHEMA = {
                 },
                 "normalization": {
                     "type": "object",
-                    "description": "key and vector: how values are normalized before they are compared.",
+                    "description": "key: how values are normalized before they are compared.",
                     "properties": {
-                        "transforms": {
-                            "type": "array",
-                            "description": "String transforms applied to every value before the levels. Use them only for what the "
-                            "standard normalization levels cannot do: case, word splitting (camelCase, '-', '_'), word order, plural and "
-                            "inflection are all done by 'levels'.",
-                            "items": {
-                                "type": "object", "properties": {
-                                    "operation": {"type": "string", "enum": [*TRANSFORM_OPERATIONS, REGEX_REPLACE]},
-                                    "pattern": {"type": "string", "description": "regex_replace only: a Python re pattern"},
-                                    "replacement": {
-                                        "type": "string",
-                                        "description": "regex_replace only: Python re syntax; groups as \\1, not $1."
-                                        },
-                                    }, "required": ["operation"]
-                            }
-                        },
+                        "transforms": STRING_TRANSFORMS_SCHEMA,
                         "levels": {
                             "type": "array", "items": {"type": "string", "enum": list(NORMALIZATION_LEVELS)},
                             "description": "Levels from fine to coarse, in this order; a key pair ranks by "
-                                           "its finest shared level. vector: one level, words (default), or "
-                                           "plural or inflection for idf_tokens when the KGs inflect names "
-                                           "differently.",
+                                           "its finest shared level. " + NORMALIZATION_LEVELS_DESCRIPTION,
                         },
                     },
                 },
                 "vectorizer": {
                     "type": "string", "enum": list(get_args(Vectorizer.__value__)),
-                    "description": "vector: idf_tokens (rare words count more), char_3grams (spelling "
-                                   "variants), embedding (meaning, multilingual). Default idf_tokens.",
+                    "description": "vector: idf_char_3grams (IDF-weighted character 3-grams: word forms and "
+                                   "spelling variants meet, rare parts of words count more), embedding "
+                                   "(meaning: synonyms and translations). Default idf_char_3grams.",
                 },
                 "min_witnesses": {"type": "integer", "minimum": 1,
                                   "description": "neighbours: equivalences a pair needs at least. Default 1."},

@@ -127,7 +127,7 @@ def apply_string_transforms(transforms: list[StringTransform], text: str) -> str
     return text
 
 
-class Normalization(BaseModel):
+class StringNormalization(BaseModel):
     model_config = ConfigDict(extra="forbid")
     transforms: list[StringTransform] = []
     # levels tried from fine to coarse (the anchor rule records the finest level
@@ -156,7 +156,7 @@ class KeyStrategy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.KEY] = CandidateStrategyType.KEY
     values: ValuePatterns = ValuePatterns()
-    normalization: Normalization = Normalization()
+    normalization: StringNormalization = StringNormalization()
 
     def value_pattern_source(
             self, side: Side
@@ -165,18 +165,17 @@ class KeyStrategy(BaseModel):
         return self.values.by_side(side)
 
 
-VECTOR_NORMALIZATION_LEVELS: frozenset[NormalizationLevel] = frozenset({"words", "plural", "inflection"})
-
-
 class VectorStrategy(BaseModel):
-    """Candidates are the most similar targets: values are turned into vectors
-    (IDF-weighted word tokens, character 3-grams or an embedding model) and
-    compared by cosine; the best score over the value pairs counts."""
+    """
+    Candidates are the most similar targets: values are turned into vectors
+    (IDF-weighted character 3-grams or an embedding model) and compared by
+    cosine; the best score over the value pairs counts. The values are compared
+    on the normalization level words.
+    """
     model_config = ConfigDict(extra="forbid")
     kind: Literal[CandidateStrategyType.VECTOR] = CandidateStrategyType.VECTOR
     values: ValuePatterns = ValuePatterns()
-    normalization: Normalization = Normalization(levels=["words"])
-    vectorizer: Vectorizer = "idf_tokens"
+    vectorizer: Vectorizer = "idf_char_3grams"
     model_name: str | None = None  # embedding model; None: foundation.text_vectors.DEFAULT_EMBEDDING_MODEL
 
     @model_validator(mode="after")
@@ -185,18 +184,11 @@ class VectorStrategy(BaseModel):
             raise ValueError("model is only used with the embedding vectorizer")
         return self
 
-    @model_validator(mode="after")
-    def check_normalization_levels(self) -> Self:
-        levels = self.normalization.levels
-        if len(levels) != 1 or levels[0] not in VECTOR_NORMALIZATION_LEVELS:
-            raise ValueError(
-                "a vector strategy compares on exactly one level: "
-                "words (default), or plural or inflection to let "
-                "inflected forms meet (mainly for idf_tokens)")
-        return self
-
     def value_pattern_source(self, side: Side) -> ValuePatternSource:
-        """The values compared on one side: one name (role, relation, kind or path) or one own pattern."""
+        """
+        The values compared on one side: one name
+        (role, relation, kind or path) or one own pattern.
+        """
         return self.values.by_side(side)
 
 
@@ -775,6 +767,18 @@ class StrategySignals:
 
 
 @dataclass(frozen=True)
+class NormalizationExample:
+    """
+    What the transforms and the normalization levels of a key strategy make of
+    one value: the value as retrieved, after the transforms, and the key of
+    each level where it differs from the step before (in ladder order).
+    """
+    value: str
+    transformed: str
+    keys_by_level: tuple[tuple[NormalizationLevel, str], ...]
+
+
+@dataclass(frozen=True)
 class StrategyResult[H: Hub]:
     """
     One run of a candidate strategy. The collection is kept with the selection,
@@ -803,9 +807,9 @@ class StrategyResult[H: Hub]:
     # competition set, not only the population), to tell head anchors from
     # specific ones; None: another strategy
     value_wordsets: dict[Side, frozenset[frozenset[str]]] | None = None
-    # key and vector strategies with transforms: per side a few (value, after the
-    # transforms, key on the finest level); None: no transforms or another strategy
-    normalization_examples: dict[Side, list[tuple[str, str, str]]] | None = None
+    # key strategy: per side a few values through its transforms and levels;
+    # None: another strategy
+    normalization_examples: dict[Side, list[NormalizationExample]] | None = None
 
 
 class TriedRun(BaseModel):

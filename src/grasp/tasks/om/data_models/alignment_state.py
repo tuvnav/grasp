@@ -168,7 +168,7 @@ class AlignmentState(BaseModel):
             aligned[side].add(entity)
         return aligned
 
-    def existing_equivalences(self) -> ExistingEquivalences:
+    def existing_equivalences_by_entity(self) -> ExistingEquivalences:
         """
         The accepted equivalences per side by the entity of that side (the
         witnesses of a neighbour strategy); built once with the state.

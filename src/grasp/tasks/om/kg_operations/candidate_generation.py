@@ -18,7 +18,7 @@ from grasp.tasks.om.data_models.candidates import (
     NeighbourEntityPair, NeighbourHub,
     NeighbourMatch, VectorCandidate,
     VectorEntityPair, VectorHub, VectorMatch,
-    Normalization, StringTransform, ValuePatternSource,
+    NormalizationExample, StringNormalization, StringTransform, ValuePatternSource,
     apply_string_transforms, ValueRow
 )
 from grasp.tasks.om.data_models.profile import (
@@ -184,38 +184,52 @@ def build_transformed_value_index(
 
 def build_side_indices(
     group_value_rows: Iterable[ValueRow],
-    normalization: Normalization
+    normalization: StringNormalization
 ) -> dict[NormalizationLevel, ValueIndex]:
     """
     Returns: {normalization_level: {normalized_key: [ValueRow, ...]}}
     """
-    transformed_index = build_transformed_value_index(group_value_rows, normalization.transforms)
+    transformed_index = build_transformed_value_index(
+        group_value_rows, normalization.transforms
+        )
     indices_by_level: dict[NormalizationLevel, ValueIndex] = {}
     for level in normalization.levels:
-        indices_by_level[level] = string_normalize_index_keys(transformed_index, NORMALIZATION_LEVELS[level])
+        indices_by_level[level] = string_normalize_index_keys(
+            transformed_index, NORMALIZATION_LEVELS[level]
+            )
     return indices_by_level
 
 
 def get_normalization_examples(
-        index: ValueIndex, normalization: Normalization, number: int
-        ) -> list[tuple[str, str, str]]:
+        index: ValueIndex, normalization: StringNormalization, number: int,
+        population_group_names: Collection[str]
+        ) -> list[NormalizationExample]:
     """
-    (value as retrieved, after the transforms, key on the finest level) of a few
-    values of an index, those the transforms change first: what the transforms
-    and the normalization make of the values.
+    A few values of the population (its groups; the index also holds the
+    rivals) through the transforms and the levels of the normalization: what
+    they make of the values. A level is shown only if it gives a key not shown
+    before. Values the transforms change come first, then those the levels
+    change most (e.g. split into words), then the others.
     """
-    finest_level = NORMALIZATION_LEVELS[normalization.levels[0]]
-
-    def example(rows: list[ValueRow]) -> tuple[str, str, str]:
-        value = rows[0].raw_projection_value
+    def example(value: str) -> NormalizationExample:
         transformed = apply_string_transforms(normalization.transforms, value)
-        return value, transformed, finest_level(transformed)
+        keys_by_level: list[tuple[NormalizationLevel, str]] = []
+        shown = {value, transformed}
+        for level in normalization.levels:
+            key = NORMALIZATION_LEVELS[level](transformed)
+            if key not in shown:
+                keys_by_level.append((level, key))
+                shown.add(key)
+        return NormalizationExample(value, transformed, tuple(keys_by_level))
 
-    examples = [example(rows) for rows in index.values()]
-    changed_by_transform = [entry for entry in examples if entry[0] != entry[1]]
-    unchanged = [entry for entry in examples if entry[0] == entry[1]]
-    # show changed examples first
-    return (changed_by_transform + unchanged)[:number]
+    examples = [
+        example(row.raw_projection_value)
+        for rows in index.values()
+        if (row := next((row for row in rows if row.group_name in population_group_names), None))
+        ]
+    # changed by the transforms first, then by the most levels; unchanged last
+    examples.sort(key=lambda example: (example.transformed == example.value, -len(example.keys_by_level)))
+    return examples[:number]
 
 
 def find_confirmed_equivalences(

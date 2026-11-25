@@ -41,7 +41,7 @@ from grasp.tasks.om.data_models.candidates import (
     StrategyResult,
     Stratum,
     TriedRun,
-    Normalization,
+    StringNormalization,
     GroupRef,
     POPULATION_REST,
     Population,
@@ -49,7 +49,7 @@ from grasp.tasks.om.data_models.candidates import (
     ValuePatterns,
 )
 from grasp.tasks.om.foundation.configuration import load_task_instructions
-from grasp.tasks.om.foundation.text_normalization import STANDARD_LEVELS, NormalizationLevel
+from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS_DESCRIPTION, STANDARD_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
     build_candidate_rank_index,
@@ -62,6 +62,7 @@ from grasp.tasks.om.tasks.candidate_task import (
     MAX_ENTITY_PAIRS_PER_BUCKET,
     CandidateTaskState,
     format_found_again,
+    format_normalization_examples,
     format_hubs,
     format_share,
     format_start_message,
@@ -129,7 +130,7 @@ def anchor_generator(fn_args: dict) -> Generator:
                 ),
             strategy=KeyStrategy(
                 values=values,
-                normalization=Normalization(levels=arguments.normalization_levels),
+                normalization=StringNormalization(levels=arguments.normalization_levels),
                 ),
             selection=ANCHOR_SELECTION,
             )
@@ -374,6 +375,9 @@ def format_anchor_result(
     statistics_subsection = Section("Statistics", statistics_content)
 
     subsections = [statistics_subsection]
+    normalization_section = format_normalization_examples(result)
+    if normalization_section:
+        subsections.append(normalization_section)
     if result.hubs:
         hubs_content = format_hubs(result.hubs, entity_displays)
         if hubs_content:
@@ -461,7 +465,8 @@ class AnchorStrategyArguments(BaseModel):
         default=list(STANDARD_LEVELS), min_length=1,
         description="Levels from fine to coarse, in ladder order, on "
         "which values are compared; an anchor "
-        "records the finest level on which it is unique."
+        "records the finest level on which it is unique. "
+        + NORMALIZATION_LEVELS_DESCRIPTION
         )
 
 
