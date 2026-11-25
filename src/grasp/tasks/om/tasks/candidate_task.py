@@ -95,13 +95,13 @@ from grasp.tasks.om.foundation.text_normalization import (
     REGEX_REPLACE,
     TRANSFORM_OPERATIONS,
     NormalizationLevel,
-    normalization_level_order,
     words,
 )
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    NAME_ROLES, compares_names, evaluate_merged_candidates, flatten_layers, merge_candidate_runs, select_candidates, summarize_candidate_selection,
+    NAME_ROLES, compares_names, evaluate_merged_candidates, filter_informative_matches, flatten_layers, merge_candidate_runs,
+    select_candidates, summarize_candidate_selection,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
@@ -387,12 +387,40 @@ MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER = 30
 
 
 def no_values_error(side: Side) -> ValueError:
-    """A key or vector run without any value on one side: why, for the LLM."""
+    """
+    A key or vector run without any value on one side: why, for the LLM.
+    """
     return ValueError(
         f"No values on the {side} side for the compared entities: the role is not set, has no values "
         "in these groups (or in the trial sample), or your pattern binds no ?o (inside a nested { } "
         "group of its own, ?s is unbound)."
         )
+
+
+def iris_as_key_error() -> ValueError:
+    return ValueError(
+        "No key is shared: the values are IRIs, and IRIs of "
+        "different knowledge graphs are almost never equal. "
+        "To compare related entities, compare their "
+        "names with a path or use a neighbour strategy, "
+        "which compares them by their existing equivalences."
+        )
+
+
+def mostly_iris(index_by_level: dict[NormalizationLevel, ValueIndex]) -> bool:
+    """
+    More than half of the values of one side are IRIs 
+    (each level's index holds all values).
+    """
+    rows = [
+        row for rows in next(iter(index_by_level.values()), {}).values()
+        for row in rows
+        ]
+    return bool(rows) and sum(
+        "://" in row.raw_projection_value or
+        row.raw_projection_value.startswith("urn:")
+        for row in rows
+        ) > len(rows) / 2
 
 
 def get_key_candidates(
@@ -467,6 +495,11 @@ def get_key_candidates(
         indices_by_side[Side.TARGET],
         max_entity_pairs_per_bucket
         )
+
+    if not entity_pairs and not overfull_keys and any(
+            mostly_iris(indices_by_side[side]) for side in SIDES
+            ):
+        raise iris_as_key_error()
 
     # 3. per entity in its population without an equivalence: candidates, rivals,
     # non-competing counterparts; and the equivalences found again
@@ -1288,30 +1321,6 @@ def format_rivals(entity_candidates: EntityCandidates) -> list[Item]:
                                          for name, count in counts.most_common())
                 ))
     return items
-
-
-def filter_informative_matches(matches: Sequence[Match]) -> list[Match]:
-    """
-    The matches without those implied by a finer one: a key match whose value
-    pairs all matched already on a finer normalization level says nothing new
-    (what matches on 'case' also matches on 'words').
-    """
-    seen_value_pairs: set[tuple[str, str]] = set()
-    informative: list[Match] = []
-    for match in sorted(
-            matches,
-            key=lambda match: normalization_level_order(match.level)
-            if isinstance(match, KeyMatch) else -1
-            ):
-        contained_value_pairs = {
-            (source_row.raw_projection_value, target_row.raw_projection_value)
-            for source_row in match.source_rows for target_row in match.target_rows
-            }
-        if isinstance(match, KeyMatch) and contained_value_pairs <= seen_value_pairs:
-            continue
-        seen_value_pairs |= contained_value_pairs
-        informative.append(match)
-    return informative
 
 
 def format_selected_candidates(

@@ -855,6 +855,7 @@ class MergedCandidates:
     # per side the entities on which the merge equals a merge of full runs
     # (evaluable_entities); None: the side is not measurable
     evaluable_entities: dict[Side, frozenset[IRI] | None]
+    pair_signal_index: PairSignalIndex
 
 
 @dataclass(frozen=True)
@@ -920,41 +921,59 @@ class AnchorMerge:
     conflicts: list[tuple[IRI, IRI, frozenset[str]]]  # (source, target, families)
 
 
-
-# ----------------------------------------------- Signals for Judges
-# class KeyMatchSignal(BaseModel):
-#     kind: Literal["key"] = "key"
-#     key: str
-#     level: NormalizationLevel
-#     transforms: list[StringTransform]
-#     projection: tuple[str, str]  # role or sparql pattern
-#     values: tuple[list[str], list[str]]
+# (source IRI, target IRI) -> run id -> match signals
+type PairSignalIndex = dict[tuple[IRI, IRI], dict[str, list[MatchSignal]]]
 
 
-# class VectorMatchSignal(BaseModel):
-#     kind: Literal["vector"] = "vector"
-#     vectorizer: Vectorizer
-#     texts: tuple[str, str]
-#     level: NormalizationLevel
-#     transforms: list[StringTransform]
-#     cosine: float
-#     projection: tuple[str, str]  # role or sparql pattern
+class RunSignalInfos(BaseModel):
+    """
+    How a run compared: shown once per run with the signals it gave.
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    stage: Literal["anchors", "candidates"]
+    round: int
+    run_id: str
+    kind: CandidateStrategyType
+    values_projection: ValuePatterns
+    normalization: StringNormalization | None = None  # key only
+    vectorizer: Vectorizer | None = None  # vector only
+    witness_weighting: WitnessWeighting | None = None  # neighbours only
 
 
-# class NeighboursMatchSignal(BaseModel):
-#     kind: Literal["neighbours"] = "neighbours"
-#     witness: tuple[IRI, IRI]
-#     relations: tuple[str, str]  # structure relation/kind or sparql
-#     bucket_size: tuple[int, int]  # entities sharing the witness, per side
+class KeyMatchSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["key"] = "key"
+    key: str
+    level: NormalizationLevel
+    values: tuple[list[str], list[str]]   # the raw values per side that gave the key
 
 
-# type MatchSignal = Annotated[
-#     KeyMatchSignal | VectorMatchSignal | NeighboursMatchSignal,
-#     Field(discriminator="kind")
-#     ]
+class VectorMatchSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["vector"] = "vector"
+    texts: tuple[str, str]
+    cosine: float
 
 
-# class PairEvidence(BaseModel):
-#     source_entity: IRI
-#     target_entity: IRI
-#     matches: list[MatchSignal]
+class NeighboursMatchSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["neighbours"] = "neighbours"
+    witness: tuple[IRI, IRI]
+    relations: tuple[str, str]  # the relations actually used (a kind covers several)
+    bucket_size: tuple[int, int]  # entities sharing the witness, per side
+
+
+type MatchSignal = Annotated[
+    KeyMatchSignal | VectorMatchSignal | NeighboursMatchSignal,
+    Field(discriminator="kind")
+    ]
+
+
+class RunEvidence(BaseModel):
+    """
+    For presentation for the LLM:
+    What one run found for a pair: how it compared, and its matches.
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    run: RunSignalInfos
+    matches: list[MatchSignal]

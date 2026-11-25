@@ -7,19 +7,17 @@ equivalences and finishes.
 
 The variant (CandidateJudgeVariant) decides how the unit is shown: focused
 (the focus entities are named, each with its list) or clusters (two lists of
-entities, the focus not named), with or without the signals that ranked the
-candidates, in rank order or shuffled.
+entities, the focus not named), with or without the signals of the candidates
+(what each strategy found for the pair, bundled by strategy, strongest first),
+in rank order or shuffled. The judge sees the evidence of the strategies, never the
+decisions of other judges.
 
 set_equivalence checks that both entities exist (know_before_use), lie in the
-entity space and in no excluded group, and warns, without setting it, if
-- an entity is matched already (by the alignment state, or in this run),
-  with the equivalences the new one would imply within each ontology,
-- the pair was rejected before,
-- the partitions of the two entities do not compete.
-Calling it again with the same arguments after a warning sets it anyway (a
-warning left unanswered at finish means: not set). Only equivalences set in
-this run can be deleted; one kept against an earlier equivalence becomes a
-conflict in the ledger, checked later.
+entity space and in no excluded group, and that their partitions compete;
+otherwise it is an error and nothing is set. Entities that are matched
+already may get another equivalence: the judge decides with the evidence. Only
+equivalences set in this run can be deleted; one set against an earlier
+equivalence becomes a conflict in the ledger, checked later.
 """
 import random
 from dataclasses import dataclass, field, replace
@@ -33,6 +31,16 @@ from grasp.sparql.utils import prepare_identifier_for_sparql
 from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import prepare_entity
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.data_models.candidates import (
+    CandidateStrategyType,
+    KeyMatchSignal,
+    MatchSignal,
+    NeighboursMatchSignal,
+    RunSignalInfos,
+    ValuePatternSource,
+    VectorMatchSignal,
+)
+from grasp.tasks.om.data_models.profile import describe_predicate_pattern
 from grasp.tasks.om.data_models.verification import (
     CandidateJudgeVariant,
     FocusEntity,
@@ -43,7 +51,8 @@ from grasp.tasks.om.data_models.verification import (
 )
 from grasp.tasks.om.foundation.configuration import know_before_use, load_task_instructions
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
-from grasp.tasks.om.foundation.rendering import Section, format_display_content
+from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content
+from grasp.tasks.om.foundation.text_normalization import normalization_level_order
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
@@ -53,6 +62,8 @@ from grasp.utils import FunctionCallException, format_section
 
 SIDES = (Side.SOURCE, Side.TARGET)
 type EquivalencePair = tuple[IRI, IRI]  # (source entity, target entity)
+NUM_SHOWN_MATCHES_PER_STRATEGY = 3  # matches of one strategy shown per candidate
+STRATEGY_ORDER = ["key", "embedding", "idf_char_3grams", "neighbours"]  # strongest evidence first
 
 
 class SearchVerifyFunctionName(StrEnum):
@@ -72,9 +83,6 @@ class SearchVerifyState:
     # the entities shown, per side, in the order shown
     presented: dict[Side, list[IRI]] = field(default_factory=dict)
     equivalences: list[EquivalencePair] = field(default_factory=list)  # set in this run
-    # pair -> what its last warning was about; a repeated call sets the pair if
-    # nothing new turned up since
-    pending_warnings: dict[EquivalencePair, frozenset[str]] = field(default_factory=dict)
     # (side, entity) -> its partition (None: in none), the excluded group it is in (None: in none)
     partition_cache: dict[EntityKey, str | None] = field(default_factory=dict)
     excluded_group_cache: dict[EntityKey, str | None] = field(default_factory=dict)
@@ -115,15 +123,124 @@ def presented_entities(unit: JudgingUnit, variant: CandidateJudgeVariant) -> dic
     return {side: list(dict.fromkeys(entities)) for side, entities in presented.items()}
 
 
-def format_signals(candidate: ListedCandidate) -> str:
+def strategy_name(run: RunSignalInfos) -> str:
     """
-    e.g. 'Pareto layer 1; key: rank 1, vector: rank 3'; for a candidate
-    outside the round's list: 'found by a strategy, not in this round's ranked list'.
+    'key', 'neighbours' or, for a vector run, its vectorizer.
     """
-    if candidate.pareto_layer is None:
-        return "found by a strategy, not in this round's ranked list"
-    ranks = ", ".join(f"{signal.family}: rank {signal.rank}" for signal in candidate.signals)
-    return f"Pareto layer {candidate.pareto_layer}" + (f"; {ranks}" if ranks else "")
+    return (
+        run.vectorizer if run.kind == CandidateStrategyType.VECTOR
+        and run.vectorizer is not None
+        else run.kind
+    )
+
+
+def format_value_source(source: ValuePatternSource) -> str:
+    """
+    A value source as named in the profile, or its own pattern.
+    """
+    return f"role '{source}'" if isinstance(source, str) else f"({describe_predicate_pattern(source)})"
+
+
+def format_strategy(run: RunSignalInfos) -> str:
+    """
+    What a run compared, without the run itself (several runs of one strategy
+    share it), e.g. "key matches on role 'names' on both sides" or
+    "embedding matches on role 'names' ~ role 'synonyms'".
+    """
+    source_projection, target_projection = (
+        format_value_source(
+            run.values_projection.by_side(side)
+            ) for side in (Side.SOURCE, Side.TARGET)
+        )
+    projection = (
+        f"{source_projection} on both sides" if source_projection == target_projection
+        else f"{source_projection} ~ {target_projection}"
+    )
+    transforms = ", with transforms" if run.normalization is not None and run.normalization.transforms else ""
+    return f"{strategy_name(run)} matches on {projection}{transforms}"
+
+
+def signal_strength(signal: MatchSignal) -> float:
+    """
+    Sort key within a strategy, strongest match first: the finer normalization
+    level, the higher cosine, the rarer witness.
+    """
+    match signal:
+        case KeyMatchSignal():
+            return normalization_level_order(signal.level)
+        case VectorMatchSignal():
+            return -signal.cosine
+        case NeighboursMatchSignal():
+            return signal.bucket_size[0] * signal.bucket_size[1]
+
+
+def format_match_signal(signal: MatchSignal, entity_displays: dict[Side, EntityDisplay]) -> str:
+    """One match for a pair, source side first; the cosine of a vector match only orders."""
+    match signal:
+        case KeyMatchSignal():
+            source_values, target_values = signal.values
+            return (f'key "{signal.key}" on level "{signal.level}" from '
+                    f"{', '.join(map(repr, source_values))} ~ {', '.join(map(repr, target_values))}")
+        case VectorMatchSignal():
+            return f'"{signal.texts[0]}" ~ "{signal.texts[1]}"'
+        case NeighboursMatchSignal():
+            source_witness, target_witness = signal.witness
+            # own patterns: strategy names them; structure relation kinds:
+            # the concrete relation used here
+            relations = ("" if "own" in signal.relations
+                         else f" over {signal.relations[0]} ~ {signal.relations[1]}")
+            shared = (f", shared by {signal.bucket_size[0]} source x {signal.bucket_size[1]} target entities"
+                      if signal.bucket_size != (1, 1) else "")
+            return (f"witness {entity_displays[Side.SOURCE].show_line(source_witness)} = "
+                    f"{entity_displays[Side.TARGET].show_line(target_witness)}{relations}{shared}")
+
+
+def format_candidate_signals(
+        candidate: ListedCandidate, entity_displays: dict[Side, EntityDisplay]
+        ) -> list[SectionContent]:
+    """
+    The matches of a candidate bundled by strategy: the strongest strategy first,
+    within it the strongest match first; a line found by several runs once.
+    """
+    # (strategy name, formatted strategy header) -> match signals
+    signals_by_strategy: dict[tuple[str, str], list[MatchSignal]] = {}
+    for evidence in candidate.signals:
+        strategy_key = (strategy_name(evidence.run), format_strategy(evidence.run))
+        signals_by_strategy.setdefault(strategy_key, []).extend(evidence.matches)
+
+    ordered_strategies = sorted(
+        signals_by_strategy.items(),
+        key=lambda strategy_signals: (
+            STRATEGY_ORDER.index(strategy_signals[0][0]),
+            min(map(signal_strength, strategy_signals[1])),
+            ),
+        )
+    strategy_items: list[Item] = []
+    for (_, strategy_header), signals in ordered_strategies:
+        lines = list(dict.fromkeys(
+            format_match_signal(signal, entity_displays)
+            for signal in sorted(signals, key=signal_strength)
+            ))
+        matches = [Item(line) for line in lines[:NUM_SHOWN_MATCHES_PER_STRATEGY]]
+        if len(lines) > NUM_SHOWN_MATCHES_PER_STRATEGY:
+            matches.append(Item(f"+{len(lines) - NUM_SHOWN_MATCHES_PER_STRATEGY} more"))
+        strategy_items.append(Item(strategy_header, matches))
+    return ["Signals:", *strategy_items, "Context in its ontology:"]
+
+
+def witnesses_of(unit: JudgingUnit) -> dict[Side, list[IRI]]:
+    """
+    The witness pairs of the neighbour matches shown, per side (to name them).
+    """
+    witnesses: dict[Side, list[IRI]] = {side: [] for side in SIDES}
+    for focus in unit.focus:
+        for candidate in focus.candidates:
+            for evidence in candidate.signals:
+                for signal in evidence.matches:
+                    if isinstance(signal, NeighboursMatchSignal):
+                        witnesses[Side.SOURCE].append(signal.witness[0])
+                        witnesses[Side.TARGET].append(signal.witness[1])
+    return witnesses
 
 
 def numbered(section: Section, number: int) -> Section:
@@ -149,7 +266,9 @@ def focused_input(state: SearchVerifyState) -> str:
                     state.entity_displays[other_side].show_section(candidate.entity, LONG_VIEW), candidate_number
                     )
                 if state.variant.show_signals:
-                    section = replace(section, content=[f"({format_signals(candidate)})", *section.content])
+                    section = replace(
+                        section, content=[*format_candidate_signals(candidate, state.entity_displays), *section.content]
+                        )
                 candidate_sections.append(section)
             subsections.append(Section(
                 f"Candidates in the {other_side.value} ontology {kg_names[other_side]}",
@@ -196,8 +315,15 @@ def ask(manager: KgManager, sparql: str) -> bool:
     return result.boolean
 
 
-def matches_membership(manager: KgManager, entity: IRI, membership_sparql: str) -> bool:
-    return ask(manager, f"ASK {{ VALUES ?s {{ {prepare_identifier_for_sparql(entity, manager.iri_literal_parser)} }} {membership_sparql} }}")
+def matches_membership(
+        manager: KgManager, entity: IRI, membership_sparql: str
+        ) -> bool:
+    return ask(
+        manager,
+        "ASK { VALUES ?s {"
+        + f"{prepare_identifier_for_sparql(entity, manager.iri_literal_parser)}"
+        + f" }} {membership_sparql} }}"
+        )
 
 
 def check_entity_space(state: SearchVerifyState, side: Side, entity: IRI) -> None:
@@ -210,7 +336,9 @@ def check_entity_space(state: SearchVerifyState, side: Side, entity: IRI) -> Non
 
 
 def excluded_group_of(state: SearchVerifyState, side: Side, entity: IRI) -> str | None:
-    """The first excluded group the entity is in (None: in none); cached."""
+    """
+    The first excluded group the entity is in (None: in none); cached.
+    """
     key = (side, entity)
     if key not in state.excluded_group_cache:
         profile = state.alignment_state.get_kg_profile(side)
@@ -247,97 +375,46 @@ def partition_of(state: SearchVerifyState, side: Side, entity: IRI) -> str | Non
     return state.partition_cache[key]
 
 
-def non_competing_reason(state: SearchVerifyState, source_entity: IRI, target_entity: IRI) -> str | None:
-    """Why the partitions of the two entities do not compete; None: they compete (or one has none)."""
-    source_partition = partition_of(state, Side.SOURCE, source_entity)
-    target_partition = partition_of(state, Side.TARGET, target_entity)
+def non_competing_reason(
+        state: SearchVerifyState, entity_pair: tuple[IRI, IRI]
+        ) -> str | None:
+    """
+    Why the partitions of the two entities do not compete;
+    None: they compete (or one has none).
+    """
+    source_partition = partition_of(state, Side.SOURCE, entity_pair[0])
+    target_partition = partition_of(state, Side.TARGET, entity_pair[1])
     if source_partition is None or target_partition is None:
         return None
     if state.alignment_state.competes(Side.SOURCE, source_partition, Side.TARGET, target_partition):
         return None
-    reason = next((other.reason for other in state.alignment_state.non_competing_partitions(Side.SOURCE, source_partition)
-                   if Side(other.side) == Side.TARGET and other.partition == target_partition), "")
-    return (f"The source entity is in the partition {source_partition} and the target entity in the partition "
-            f"{target_partition}, which do not compete with each other" + (f": {reason}." if reason else "."))
-
-
-# ---------------------------------------------------------------- collisions
-
-def partners_in_state(state: SearchVerifyState, side: Side, entity: IRI) -> list[IRI]:
-    partners = (equivalence.partner_of(side, entity) for equivalence in state.alignment_state.equivalences_of((side, entity)))
-    return [partner for partner in partners if partner is not None]
-
-
-def partners_in_run(state: SearchVerifyState, side: Side, entity: IRI) -> list[IRI]:
-    return [target if side == Side.SOURCE else source
-            for source, target in state.equivalences
-            if (source if side == Side.SOURCE else target) == entity]
+    reason = next(
+        (other.reason for other
+         in state.alignment_state.non_competing_partitions(Side.SOURCE, source_partition)
+         if Side(other.side) == Side.TARGET and other.partition == target_partition
+         ),
+        "")
+    return (
+        f"The source entity is in the partition {source_partition} "
+        "and the target entity in the partition "
+        f"{target_partition}, which do not compete with each other"
+        + (f": {reason}." if reason else ".")
+        )
 
 
 def format_pair(pair: EquivalencePair) -> str:
     return f"'{pair[0]}' = '{pair[1]}'"
 
 
-def collision_warning(state: SearchVerifyState, pair: EquivalencePair) -> tuple[str, frozenset[str]] | None:
-    """The warning for a new pair (None: nothing to warn about), and what it is
-    about, to recognize a repeated call."""
-    source_entity, target_entity = pair
-    kg_names = state.kg_names
-    earlier: list[EquivalencePair] = []
-    own: list[EquivalencePair] = []
-    for partner in partners_in_state(state, Side.SOURCE, source_entity):
-        earlier.append((source_entity, partner))
-    for partner in partners_in_state(state, Side.TARGET, target_entity):
-        earlier.append((partner, target_entity))
-    for partner in partners_in_run(state, Side.SOURCE, source_entity):
-        own.append((source_entity, partner))
-    for partner in partners_in_run(state, Side.TARGET, target_entity):
-        own.append((partner, target_entity))
-    rejected = target_entity in state.alignment_state.rejected_partners((Side.SOURCE, source_entity))
-    non_competing = non_competing_reason(state, source_entity, target_entity)
-    if not (earlier or own or rejected or non_competing):
-        return None
+# ---------------------------------------------------------------- LLM functions
 
-    message = f"Warning for {format_pair(pair)}:\n"
-    if rejected:
-        message += "\nThis pair was rejected by an earlier judgment.\n"
-    if non_competing:
-        message += f"\n{non_competing}\n"
-    if earlier or own:
-        message += "\nThe entities are already matched:\n"
-        message += "".join(f"- {format_pair(p)} (set earlier, not by you)\n" for p in earlier)
-        message += "".join(f"- {format_pair(p)} (set by you in this task)\n" for p in own)
-        implied = []
-        for other_source, other_target in earlier + own:
-            if other_target != target_entity:
-                implied.append(f"- '{target_entity}' = '{other_target}' (within the target ontology {kg_names[Side.TARGET]})\n")
-            if other_source != source_entity:
-                implied.append(f"- '{source_entity}' = '{other_source}' (within the source ontology {kg_names[Side.SOURCE]})\n")
-        message += "Together with them, the new equivalence would imply:\n" + "".join(dict.fromkeys(implied))
-    message += (
-        "\nThe new equivalence has NOT been set yet. Compare all involved entities closely and choose "
-        "deliberately:\n"
-        "- Do not set it: no further action needed.\n"
-    )
-    if own:
-        message += (f"- Replace an equivalence you set in this task: delete it with {SearchVerifyFunctionName.DELETE_EQUIVALENCE}, then "
-                    f"call {SearchVerifyFunctionName.SET_EQUIVALENCE} again with the same arguments.\n")
-    message += f"- Set it anyway: call {SearchVerifyFunctionName.SET_EQUIVALENCE} again with the same arguments."
-    if earlier:
-        message += (" Equivalences set earlier cannot be deleted here; if you set the new one in addition, "
-                    "the conflict is checked later.")
-    about = frozenset(
-        [f"earlier:{p}" for p in earlier] + [f"own:{p}" for p in own]
-        + (["rejected"] if rejected else []) + (["non_competing"] if non_competing else [])
-        )
-    return message, about
-
-
-# ---------------------------------------------------------------- functions
-
-def resolve_entity(state: SearchVerifyState, side: Side, iri: Any, known: set[str]) -> IRI:
-    """The full IRI of an entity of the side, checked: it exists (know_before_use),
-    is in the entity space and in no excluded group."""
+def resolve_entity(
+        state: SearchVerifyState, side: Side, iri: Any, known: set[str]
+        ) -> IRI:
+    """
+    The full IRI of an entity of the side, checked: it exists (know_before_use),
+    is in the entity space and in no excluded group.
+    """
     if not isinstance(iri, str) or not iri:
         raise FunctionCallException(f"The {side.value} entity is missing")
     manager = state.kg_managers[side]
@@ -358,17 +435,11 @@ def set_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str]) ->
             resolve_entity(state, Side.TARGET, fn_args.get("target_entity"), known))
     if pair in state.equivalences:
         return f"{format_pair(pair)} is set already."
-    warning = collision_warning(state, pair)
-    if warning is not None:
-        message, about = warning
-        warned = state.pending_warnings.get(pair)
-        if warned is None or not about <= warned:
-            state.pending_warnings[pair] = about
-            return message
-    state.pending_warnings.pop(pair, None)
+    entities_do_not_compete = non_competing_reason(state, pair)
+    if entities_do_not_compete is not None:
+        raise FunctionCallException(entities_do_not_compete + " The equivalence is not set.")
     state.equivalences.append(pair)
-    return f"Set {format_pair(pair)}." + (" It is set in addition to the equivalences from the warning."
-                                          if warning is not None else "")
+    return f"Set {format_pair(pair)}."
 
 
 @func_reg.register(SearchVerifyFunctionName.DELETE_EQUIVALENCE)
@@ -403,7 +474,7 @@ def finish(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
         if not keys:
             raise FunctionCallException(
                 f"{iri} cannot be marked unsure: only " + ("the focus entities" if state.variant.presentation == "focused"
-                                                            else "the listed entities") + " can.")
+                                                           else "the listed entities") + " can.")
         unsure += keys
     state.unsure = sorted(set(unsure))
     state.rationale = rationale
@@ -477,9 +548,11 @@ class SearchVerifyTask(GraspTask):
         )
         state = self.state
         state.presented = presented_entities(state.unit, state.variant)
+        witnesses = witnesses_of(state.unit) if state.variant.show_signals else {side: [] for side in SIDES}
         for side in SIDES:
             display = state.entity_displays[side]
-            display.prefetch(state.presented[side])
+            display.prefetch(state.presented[side] + witnesses[side])
+            self.known.update(witnesses[side])
             # what the model sees is known: the entities and the IRIs in their contexts
             for entity in state.presented[side]:
                 self.known.add(entity)

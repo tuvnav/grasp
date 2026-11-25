@@ -7,12 +7,17 @@ from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict
 
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.data_models.candidates import RunEvidence
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
 # all candidates the strategies found so far for an entity (side, IRI), best first
 type CandidatesOf = Callable[[Side, IRI], list[IRI]]
+# the same, in their global Pareto layers over the ranks in all runs, best first
+type GetCandidateLayersOf = Callable[[Side, IRI], list[list[IRI]]]
+# per candidate of an entity (side, IRI): what every run found for the pair
+type GetCandidateSignalsOf = Callable[[Side, IRI], dict[IRI, list[RunEvidence]]]
 
 
 class VerdictOption(StrEnum):
@@ -153,22 +158,15 @@ class CertificationResult(BaseModel):
 # acceptance sampling); its stratum is only kept for the evaluation.
 
 
-class CandidateSignal(BaseModel):
-    """The evidence of one run family for a candidate: its best rank among the
-    family's runs (1 = the first tie group)."""
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    family: str
-    rank: int
-
-
 class ListedCandidate(BaseModel):
-    """A candidate of a focus entity's list, with the signals that ranked it."""
+    """
+    A candidate of a focus entity's list, 
+    with the evidence of every run that found it.
+    """
     model_config = ConfigDict(extra="forbid", frozen=True)
     entity: IRI
-    # 1: no other candidate ranks better in every run of this round; None:
-    # found by a strategy (this or an earlier stage), but not in this round's list
-    pareto_layer: int | None
-    signals: list[CandidateSignal] = []
+    pareto_layer: int  # global pareto rank over all runs of all rounds
+    signals: list[RunEvidence] = []
 
 
 class FocusEntity(BaseModel):

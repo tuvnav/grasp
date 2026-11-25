@@ -15,14 +15,15 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 import math
 import random
+from typing import Literal
 
 from grasp.tasks.om.data_models.candidates import (
-    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyStrategy, MergedCandidates, ParetoIndex, RunEnsemble, SelectedCandidates, Selection,
+    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
     EntityCandidates,
-    Candidate, StrategyResult, StrategySignals, Stratum, VennIndex,
+    Candidate, StrategyResult, StrategySignals, Stratum, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
 
     )
-from grasp.tasks.om.data_models.verification import CandidateSignal, CandidatesOf, FocusEntity, JudgingUnit, ListedCandidate
+from grasp.tasks.om.data_models.verification import GetCandidateLayersOf, GetCandidateSignalsOf, FocusEntity, JudgingUnit, ListedCandidate
 from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
@@ -461,6 +462,7 @@ def merge_candidate_runs(
         evaluable_entities={
             side: evaluable_entities(run_ensemble, strategy_results_by_run, side) for side in SIDES
             },
+        pair_signal_index=build_pair_signal_index(run_ensemble, strategy_results_by_run)
         )
 
 
@@ -497,7 +499,9 @@ def only_best_candidate(layers: list[list[list[IRI]]]) -> IRI | None:
     return None
 
 
-def to_entity_pair(side: Side, entity: IRI, candidate: IRI) -> tuple[IRI, IRI]:
+def to_source_target_pair(
+        side: Side, entity: IRI, candidate: IRI
+        ) -> tuple[IRI, IRI]:
     """
     (source IRI, target IRI) of an entity of the side and its candidate.
     """
@@ -542,7 +546,7 @@ def evaluate_merged_candidates(
         if len(candidates) < len(flatten_layers(merged.uncut_pareto_layers_by_entity[entity_key])):
             num_cut_by_budget += 1
         for candidate in candidates:
-            cell = cell_by_pair[to_entity_pair(side, entity, candidate)]
+            cell = cell_by_pair[to_source_target_pair(side, entity, candidate)]
             pairs_by_cell.setdefault(cell, []).append((entity, candidate))
 
     cells_largest_first = sorted(pairs_by_cell, key=lambda cell: (-len(pairs_by_cell[cell]), sorted(cell)))
@@ -596,88 +600,107 @@ def families_by_pair(venn_index: VennIndex) -> dict[tuple[IRI, IRI], frozenset[s
     return {pair: families for families, pairs in venn_index.items() for pair in pairs}
 
 
+def layers_within_budget(layers: list[list[IRI]], budget: int) -> list[list[IRI]]:
+    """
+    Whole layers in rank order while they fit into the budget; no worse layer
+    follows one that did not fit. The first layer is always taken, cut to the
+    budget if it is larger (its candidates are sorted by IRI).
+    """
+    taken: list[list[IRI]] = []
+    size = 0
+    for layer in layers:
+        if taken and size + len(layer) > budget:
+            break
+        taken.append(layer[:budget - size])
+        size += len(taken[-1])
+    return taken
+
+
 def build_judging_units(
         merged_candidates: MergedCandidates,
-        candidates_of: CandidatesOf,
+        get_candidate_layers_of: GetCandidateLayersOf,
+        get_candidate_signals_of: GetCandidateSignalsOf,
         max_listed_candidates: int
         ) -> list[tuple[JudgingUnit, str]]:
     """
     The units of the candidate judging, each with its stratum (for the
     evaluation only): every mutual pair (each entity the other's only best
-    candidate) with both cut lists, and every entity with a cut list, on
-    both sides, alone (so an entity of a mutual pair is judged three times:
-    conflicts between the judgments are information). After the cut list
-    of the round, every further candidate the strategies found so far
-    (candidates_of: this and earlier stages, best first), without layer and
-    signals, up to max_listed_candidates in all. Stratum: kind/cell of the
-    best pair/length class of the cut list,
-    e.g. "source/key+vector/2-3".
+    candidate) with both lists, and every entity with a cut list of this
+    round, on both sides, alone (so an entity of a mutual pair is judged three
+    times: conflicts between the judgments are information). The list of a
+    focus entity holds every candidate the strategies found so far, this and
+    earlier stages (candidate_layers_of: the global Pareto layers over all
+    runs), whole layers up to max_listed_candidates, each candidate with its
+    layer and the evidence of every run that found it (evidence_of). The
+    units and their strata come from this round's cut lists: stratum = kind/
+    cell of the best pair/length class of the cut list, e.g.
+    "source/key+vector/2-3".
     """
     layers_by_entity = merged_candidates.pareto_layers_by_entity
-    cell_of = families_by_pair(merged_candidates.venn_index)
+    venn_cell_by_pair = families_by_pair(merged_candidates.venn_index)
 
-    family_by_run = {run.run_id: run.family or run.run_id for run in merged_candidates.run_ensemble.runs}
-
-    def listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
+    def get_listed_candidates(side: Side, entity: IRI) -> list[ListedCandidate]:
         """
-        The candidates in list order, with their Pareto layer and the best
-        rank per family; then the further candidates found so far; at most
-        max_listed_candidates.
+        The global layers within the budget, each candidate with its evidence.
         """
-        ranks_by_candidate = merged_candidates.candidate_rank_index.get((side, entity), {})
-        listed = []
-        for layer_number, layer in enumerate(layers_by_entity[(side, entity)], start=1):
-            for candidate in flatten_layers([layer]):
-                best_rank_by_family: dict[str, int] = {}
-                for run_id, rank in ranks_by_candidate.get(candidate, {}).items():
-                    family = family_by_run.get(run_id, run_id)
-                    best_rank_by_family[family] = min(rank, best_rank_by_family.get(family, rank))
-                listed.append(ListedCandidate(
-                    entity=candidate, pareto_layer=layer_number,
-                    signals=[CandidateSignal(family=family, rank=rank)
-                             for family, rank in sorted(best_rank_by_family.items())],
-                    ))
-        listed_entities = {listed_candidate.entity for listed_candidate in listed}
-        listed.extend(
-            ListedCandidate(entity=candidate, pareto_layer=None, signals=[])
-            for candidate in candidates_of(side, entity)
-            if candidate not in listed_entities
+        signales_by_candidate = get_candidate_signals_of(side, entity)
+        return [
+            ListedCandidate(
+                entity=candidate,
+                pareto_layer=layer_number,
+                signals=signales_by_candidate.get(candidate, [])
             )
-        return listed[:max_listed_candidates]
+            for layer_number, layer in enumerate(
+                layers_within_budget(
+                    get_candidate_layers_of(side, entity),
+                    max_listed_candidates
+                    ),
+                start=1
+                )
+            for candidate in layer
+            ]
 
     def focus_entity(side: Side, entity: IRI) -> FocusEntity:
         return FocusEntity(
-            side=side, entity=entity, candidates=listed_candidates(side, entity)
+            side=side,
+            entity=entity,
+            candidates=get_listed_candidates(side, entity)
             )
 
     def venn_cell_name(side: Side, entity: IRI, candidate: IRI) -> str:
-        return "+".join(sorted(cell_of.get(
-            to_entity_pair(side, entity, candidate), frozenset()
+        return "+".join(sorted(venn_cell_by_pair.get(
+            to_source_target_pair(side, entity, candidate), frozenset()
             )))
 
-    units: list[tuple[JudgingUnit, str]] = []
+    judging_units: list[tuple[JudgingUnit, str]] = []
+
     for (side, entity), layers in sorted(layers_by_entity.items()):
         candidates = flatten_layers(layers)
 
         if not candidates:
             continue
 
-        units.append((
-            JudgingUnit(focus=[focus_entity(side, entity)]),
+        judging_units.append((
+            JudgingUnit(
+                focus=[focus_entity(side, entity)]),
             f"{Side(side).value}/{venn_cell_name(side, entity, candidates[0])}/{list_length_class(len(candidates))}"
             ))
 
-        best = only_best_candidate(layers)
+        best_candidate = only_best_candidate(layers)
 
-        if Side(side) == Side.SOURCE and best is not None:
+        if Side(side) == Side.SOURCE and best_candidate is not None:
 
-            partner_layers = layers_by_entity.get((Side.TARGET, best), [])
+            partner_layers = layers_by_entity.get((Side.TARGET, best_candidate), [])
             if only_best_candidate(partner_layers) == entity:
-                units.append((
-                    JudgingUnit(focus=[focus_entity(Side.SOURCE, entity), focus_entity(Side.TARGET, best)]),
-                    f"mutual/{venn_cell_name(side, entity, best)}"
+                judging_units.append((
+                    JudgingUnit(
+                        focus=[
+                            focus_entity(Side.SOURCE, entity),
+                            focus_entity(Side.TARGET, best_candidate)
+                            ]),
+                    f"mutual/{venn_cell_name(side, entity, best_candidate)}"
                     ))
-    return units
+    return judging_units
 
 
 # --- anchors: the unique pairs of key runs ------------------------------------------
@@ -851,3 +874,90 @@ def get_anchor_strata(anchor_merge: AnchorMerge) -> list[Stratum]:
         Stratum(families=families, pairs=sorted(pairs), label=label)
         for (families, label), pairs in sorted(pairs_by_stratum.items(), key=lambda item: (sorted(item[0][0]), item[0][1]))
         ]
+
+
+def match_signal(match: Match) -> MatchSignal:
+    """
+    The raw evidence of one match, without what its run says for every pair.
+    """
+    match match:
+        case KeyMatch():
+            return KeyMatchSignal(
+                key=match.key,
+                level=match.level,
+                # each value once (an entity may hold the same value under several roles)
+                values=(list(dict.fromkeys(row.raw_projection_value for row in match.source_rows)),
+                        list(dict.fromkeys(row.raw_projection_value for row in match.target_rows)))
+                )
+        case VectorMatch():
+            return VectorMatchSignal(
+                texts=(match.source_text, match.target_text), cosine=round(match.cosine, 3)
+                )
+        case NeighbourMatch():
+            return NeighboursMatchSignal(
+                witness=match.witness,
+                relations=match.relations,
+                bucket_size=(match.num_source_entities, match.num_target_entities))
+        case _:
+            raise NotImplementedError(
+                f"match_signal does not support {type(match).__name__}"
+                )
+
+
+def build_pair_signal_index(
+        ensemble: RunEnsemble, strategy_results_by_run: dict[str, StrategyResult]
+        ) -> PairSignalIndex:
+    """
+    The matches of every pair the 'generate' runs of the ensemble selected, per
+    run; a pair selected from both sides is collected once.
+    """
+    index: PairSignalIndex = {}
+    for run_id in ensemble.run_ids("generate"):
+        for (side, entity), selected_candidates in strategy_results_by_run[run_id].selected.items():
+            for candidate in selected_candidates.selected_candidates:
+                pair = to_source_target_pair(side, entity, candidate.candidate_entity)
+                if run_id not in index.setdefault(pair, {}):
+                    index[pair][run_id] = [
+                        match_signal(match)
+                        for match in filter_informative_matches(candidate.entity_pair.matches)
+                        ]
+    return index
+
+
+def filter_informative_matches(matches: Sequence[Match]) -> list[Match]:
+    """
+    The matches without those implied by a finer one: a key match whose value
+    pairs all matched already on a finer normalization level says nothing new
+    (what matches on 'case' also matches on 'words').
+    """
+    seen_value_pairs: set[tuple[str, str]] = set()
+    informative: list[Match] = []
+    for match in sorted(
+            matches,
+            key=lambda match: normalization_level_order(match.level)
+            if isinstance(match, KeyMatch) else -1
+            ):
+        contained_value_pairs = {
+            (source_row.raw_projection_value, target_row.raw_projection_value)
+            for source_row in match.source_rows for target_row in match.target_rows
+            }
+        if isinstance(match, KeyMatch) and contained_value_pairs <= seen_value_pairs:
+            continue
+        seen_value_pairs |= contained_value_pairs
+        informative.append(match)
+    return informative
+
+
+def run_signal_infos(
+        stage: Literal["anchors", "candidates"],
+        round_number: int,
+        run_id: str,
+        generator: Generator
+        ) -> RunSignalInfos:
+    strategy = generator.strategy
+    return RunSignalInfos(
+        stage=stage, round=round_number, run_id=run_id, kind=strategy.kind,
+        values_projection=strategy.values,
+        normalization=strategy.normalization if isinstance(strategy, KeyStrategy) else None,
+        vectorizer=strategy.vectorizer if isinstance(strategy, VectorStrategy) else None,
+        witness_weighting=strategy.witness_weighting if isinstance(strategy, NeighbourStrategy) else None)

@@ -10,6 +10,6 @@ b. Check logical signals for support or contradiction: the hierarchies of both o
 c. Decide from the functional point of view whether an entity of the other ontology is equivalent to it, and set the equivalence. If none is, leave it unmatched.
 3. Once all entities have been processed, call __FINISH__ with a short rationale. Mark the entities you could not decide on as unsure.
 
-Equivalence is symmetric and transitive: if several source entities are equivalent to the same target entity (or one source entity to several target entities), they are implied to be equivalent to each other within their own ontology. In most cases, only one of them is correct. When you set an equivalence that involves an entity that is already matched, you are shown the existing equivalences and what they would imply; then compare all involved entities closely before you decide.
+Equivalence is symmetric and transitive: if several source entities are equivalent to the same target entity (or one source entity to several target entities), these entities are implied to be equivalent to each other within their own ontology. Usually only one of them is correct. Set several equivalences only if the implied equivalences within the ontology hold as well, e.g. if the ontology has two entities for the same thing.
 
 __EQUIVALENCE_CONDITION__

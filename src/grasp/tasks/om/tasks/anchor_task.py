@@ -36,6 +36,7 @@ from grasp.tasks.om.data_models.candidates import (
     CandidateStrategyType,
     Generator,
     KeyStrategy,
+    PairSignalIndex,
     Selection,
     RunEnsemble,
     StrategyResult,
@@ -53,6 +54,7 @@ from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS_DE
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
     build_candidate_rank_index,
+    build_pair_signal_index,
     get_anchor_strata,
     merge_anchors,
 )
@@ -154,7 +156,7 @@ def run_full_anchor_ensemble(
         alignment_state: AlignmentState,
         run_ensemble: RunEnsemble,
         generators_by_run: dict[str, Generator],
-        ) -> tuple[AnchorMerge, list[Stratum], CandidateRankIndex]:
+        ) -> tuple[AnchorMerge, list[Stratum], CandidateRankIndex, PairSignalIndex]:
     """
     The full runs of the selected ensemble: the merged anchors, their
     certification strata, and the candidate rank index of the runs with a
@@ -169,11 +171,21 @@ def run_full_anchor_ensemble(
         for run_id in run_ensemble.run_ids()
         }
     anchor_merge = merge_anchors(run_ensemble, runs)
+    strategy_result_by_run = {
+        run_id: reselect_result(
+            result, COMPETITOR_SELECTION
+            ) for run_id, (_, result) in runs.items()
+        }
     competitor_rank_index = build_candidate_rank_index(
         run_ensemble,
-        {run_id: reselect_result(result, COMPETITOR_SELECTION) for run_id, (_, result) in runs.items()},
+        strategy_result_by_run
         )
-    return anchor_merge, get_anchor_strata(anchor_merge), competitor_rank_index
+    return (
+        anchor_merge,
+        get_anchor_strata(anchor_merge),
+        competitor_rank_index,
+        build_pair_signal_index(run_ensemble, strategy_result_by_run)
+        )
 
 
 # ---------------------------------------------------------------- formatting
