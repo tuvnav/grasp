@@ -1,15 +1,16 @@
 """
 Groupings: named membership patterns over ?s, as exclusive partitions or
 overlapping groups, and their entities with the names of their groups
-(retrieve_groups_by_entity), which every statistic and value retrieval
+(retrieve_grouping_by_entity), which every statistic and value retrieval
 builds on. One query per membership: the groups are combined (priority of
 partitions, excluded groups, entity space) in Python, not in SPARQL.
 """
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Collection, Iterable, Sequence
+from typing import Iterable, Sequence
 
 from grasp.manager import KgManager
+from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import POPULATION_REST, GroupRef, Population
 from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
@@ -30,7 +31,7 @@ from grasp.tasks.om.sparql_access import (
     union_of,
     as_batched_values_blocks,
 )
-from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.utils import FunctionCallException
 
 # kinds of the default partitions (stage b1), in order: the first match wins
@@ -138,7 +139,7 @@ def groups_to_grouping(
 def single_group_grouping(profile: KgProfile, group: str) -> Grouping:
     """
     The grouping of one group only, without the entities of excluded groups
-    (they are not aligned): stage e looks at no other group.
+    (they are not aligned): stage e) looks at no other group.
     """
     excluded = tuple(
         profile.get_group(name).definition.membership_sparql
@@ -225,7 +226,10 @@ def default_non_competing_pairs(
 def retrieve_members(
         manager: KgManager, membership_sparql: str, entity_space: Iterable[str] = ()
         ) -> set[IRI]:
-    """The IRIs that match a membership pattern (?s), in the entity space if one is given."""
+    """
+    The IRIs that match a membership pattern (?s),
+    in the entity space if one is given.
+    """
     query = f"SELECT DISTINCT ?s WHERE {{ {membership_sparql} FILTER(isIRI(?s)) }}"
     space = tuple(entity_space)
     return {
@@ -234,7 +238,7 @@ def retrieve_members(
         }
 
 
-def retrieve_groups_by_entity(
+def retrieve_grouping_by_entity(
         manager: KgManager, grouping: Grouping | None, entity_space: Iterable[str]
         ) -> dict[IRI, set[str]]:
     """
@@ -259,7 +263,9 @@ def retrieve_groups_by_entity(
 
 
 def members_by_group(groups_by_entity: dict[IRI, set[str]]) -> dict[str, set[IRI]]:
-    """The entities of each group, from the groups of each entity."""
+    """
+    The entities of each group, from the groups of each entity.
+    """
     members: dict[str, set[IRI]] = defaultdict(set)
     for entity, group_names in groups_by_entity.items():
         for group_name in group_names:
@@ -277,7 +283,7 @@ def retrieve_counts_by_group(
     Per group: its entities with at least one value
     of the pattern (over ?s and ?o).
     """
-    groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+    groups_by_entity = retrieve_grouping_by_entity(manager, grouping, space)
     entities_with_value = retrieve_values(
         manager,
         groups_by_entity,
@@ -300,7 +306,7 @@ def retrieve_group_sizes(
     """
     return dict(Counter(
         group_name
-        for group_names in retrieve_groups_by_entity(manager, grouping, space).values()
+        for group_names in retrieve_grouping_by_entity(manager, grouping, space).values()
         for group_name in group_names
         ))
 
@@ -355,49 +361,85 @@ def population_group_names(kg_profile: KgProfile, population: Population, side: 
     return names
 
 
-def generate_group_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """
-    The groups whose values are retrieved for one side: in a small KG all groups of
-    the profile and the inline groups (all are needed to count rivals outside the
-    population by group), without the entities of excluded groups.
-    """
-    return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
-
-
-def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """
-    The groups of one side's population only 
-    (no rivals), without the entities
-    of excluded groups.
-    """
-    all_groups = profile_groups_to_grouping(kg_profile, inline_groups(population, side))
-    group_names = population_group_names(kg_profile, population, side)
-    return Grouping(
-        tuple(member for member in all_groups.members if member[0] in group_names),
-        exclusive=False, minus=all_groups.minus,
-    )
-
-
-def in_population(pair: tuple[IRI, IRI], population_by_side: dict[Side, frozenset[IRI]]) -> bool:
+def in_population(
+        pair: tuple[IRI, IRI], population_by_side: dict[Side, frozenset[IRI]]
+        ) -> bool:
     """Both entities of a (source, target) pair are in their side's population."""
     return pair[0] in population_by_side[Side.SOURCE] and pair[1] in population_by_side[Side.TARGET]
 
 
-def retrieve_side_population(
+@dataclass(frozen=True)
+class EntityMemberships:
+    """
+    The partition and the profile groups of every entity of the entity space,
+    per side. They depend only on the profiles, so they are retrieved once per
+    task (retrieve_entity_memberships) and shared by every strategy run.
+    Entities of excluded groups have no groups.
+    """
+    partition_names_by_entity: dict[Side, dict[IRI, str]]
+    group_names_by_entity: dict[Side, dict[IRI, set[str]]]
+
+
+def retrieve_entity_memberships(
+        managers: dict[Side, KgManager], alignment_state: AlignmentState
+        ) -> EntityMemberships:
+    partition_names_by_entity: dict[Side, dict[IRI, str]] = {}
+    group_names_by_entity: dict[Side, dict[IRI, set[str]]] = {}
+    for side in SIDES:
+        kg_profile = alignment_state.get_kg_profile(side)
+        side_partition_names_by_entity = retrieve_grouping_by_entity(
+            managers[side],
+            profile_partitions_to_grouping(kg_profile),
+            kg_profile.entity_space
+            )
+        partition_names_by_entity[side] = {
+            entity: next(iter(names))
+            for entity, names in side_partition_names_by_entity.items()
+            }
+        group_names_by_entity[side] = retrieve_grouping_by_entity(
+            managers[side],
+            profile_groups_to_grouping(kg_profile),
+            kg_profile.entity_space
+            )
+
+    return EntityMemberships(partition_names_by_entity, group_names_by_entity)
+
+
+def strategy_group_names_by_entity(
         manager: KgManager,
         kg_profile: KgProfile,
+        profile_group_names_by_entity: dict[IRI, set[str]],
         population: Population,
-        side: Side,
-        leave_out_entities: Collection[IRI] = ()
-) -> frozenset[IRI]:
+        side: Side
+        ) -> dict[IRI, set[str]]:
     """
-    The entities of one side's population, each once (also those without any
-    value of the strategy: the denominator of the signals), without the
-    leave_out_entities (those with an equivalence: they get no candidates).
+    The groups of every entity for a strategy run on one side: the profile
+    groups (retrieved once per task) and the groups the population defines
+    inline (retrieved here, without the entities of excluded groups). Without
+    inline groups the profile groups themselves (not to be changed).
     """
-    groups_by_entity = retrieve_groups_by_entity(
+    groups_defined_inline = inline_groups(population, side)
+    if not groups_defined_inline:
+        return profile_group_names_by_entity
+    inline_group_names_by_entity = retrieve_grouping_by_entity(
         manager,
-        generate_population_groups_grouping(kg_profile, population, side),
-        kg_profile.entity_space
+        groups_to_grouping(groups_defined_inline).extended_by(
+            additional_minus=kg_profile.excluded_group_membership_sparqls()),
+        kg_profile.entity_space,
         )
-    return frozenset(groups_by_entity) - frozenset(leave_out_entities)
+    merged = {
+        entity: set(names) for entity, names in profile_group_names_by_entity.items()
+        }
+    for entity, names in inline_group_names_by_entity.items():
+        merged.setdefault(entity, set()).update(names)
+    return merged
+
+
+def get_entities_of_population_side(
+        group_names_by_entity: dict[IRI, set[str]], population_group_names: set[str]
+        ) -> frozenset[IRI]:
+    """The entities of one side's population: those in one of its groups."""
+    return frozenset(
+        entity for entity, names in group_names_by_entity.items()
+        if names & population_group_names
+        )

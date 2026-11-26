@@ -5,7 +5,7 @@ restricted to what the KG uses, and local names. Every statistic is computed per
 member of a grouping (grouping.py), partitions and groups alike.
 
 Generic, flat SPARQL: the entities of the groups are retrieved once per
-statistic (grouping.retrieve_groups_by_entity, one query per membership), then
+statistic (grouping.retrieve_grouping_by_entity, one query per membership), then
 each group is counted over its entities in VALUES blocks (GROUP BY on the
 server, so only aggregates are transferred); the groups are combined in Python.
 """
@@ -50,7 +50,7 @@ from grasp.tasks.om.kg_operations.grouping import (
     Grouping,
     members_by_group,
     retrieve_counts_by_group,
-    retrieve_groups_by_entity,
+    retrieve_grouping_by_entity,
     retrieve_members,
     single_group_grouping,
 )
@@ -158,7 +158,7 @@ def default_entity_space(manager: KgManager, config: GraspConfig) -> tuple[list[
     if configured:
         return list(configured), "configured"
     # the entities of the default partitions (kinds), with the rest
-    entities = set(retrieve_groups_by_entity(manager, None, ()))
+    entities = set(retrieve_grouping_by_entity(manager, None, ()))
     named_entities = retrieve_named_entities(manager) & entities
     for counted, source in ((named_entities, "prefix with the most named entities"),
                             (entities, "prefix with the most entities")):
@@ -199,7 +199,7 @@ def predicate_coverage(
     -> coverage, with the kinds of its values (objects).
     """
     sums: dict[str, dict[IRI, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
-    for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items():
+    for group_name, members in members_by_group(retrieve_grouping_by_entity(manager, grouping, space)).items():
         for block in as_batched_values_blocks(members):
             sparql = (
                 "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) (COUNT(?o) AS ?m) "
@@ -229,7 +229,7 @@ def type_coverage(
     """group -> rdf:type value -> entities."""
     return {
         group_name: dict(count_entities_by_key(manager, members, f"?s <{RDF_TYPE}> ?t . FILTER(isIRI(?t))", "t"))
-        for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items()
+        for group_name, members in members_by_group(retrieve_grouping_by_entity(manager, grouping, space)).items()
         }
 
 
@@ -315,7 +315,7 @@ def membership_overlap(
     partition, UNCATEGORIZED for matches in none).
     """
     matches = retrieve_members(manager, membership, space)
-    groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+    groups_by_entity = retrieve_grouping_by_entity(manager, grouping, space)
     overlap = Counter(
         group_name for entity in matches
         for group_name in groups_by_entity.get(entity) or {UNCATEGORIZED}
@@ -364,7 +364,7 @@ def count_entities_by_predicate(
     if not predicates:
         return counts
     values = " ".join(f"<{p}>" for p in predicates)
-    for group_name, members in members_by_group(retrieve_groups_by_entity(manager, grouping, space)).items():
+    for group_name, members in members_by_group(retrieve_grouping_by_entity(manager, grouping, space)).items():
         for predicate, n in count_entities_by_key(manager, members, f"VALUES ?p {{ {values} }} {triple}", "p").items():
             counts[predicate][group_name] = n
     return counts
@@ -504,7 +504,7 @@ def sample_entities_for_local_name_type(
     the same for the same seed.
     """
     rng = random.Random(seed)
-    members = members_by_group(retrieve_groups_by_entity(manager, grouping, space))
+    members = members_by_group(retrieve_grouping_by_entity(manager, grouping, space))
     samples: dict[str, list[IRI]] = {}
     for group_name in sorted(members):
         candidates = sorted(e for e in members[group_name] if not INVALID_IRI_CHARACTERS.search(e))

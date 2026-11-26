@@ -52,7 +52,6 @@ from grasp.tasks.om.data_models.candidates import (
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS_DESCRIPTION, STANDARD_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
-from grasp.tasks.om.kg_operations.candidate_generation import retrieve_partition_names
 from grasp.tasks.om.kg_operations.candidate_selection import (
     build_candidate_rank_index,
     build_pair_signal_index,
@@ -60,6 +59,7 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
     merge_anchors,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
+from grasp.tasks.om.kg_operations.grouping import retrieve_entity_memberships
 from grasp.tasks.om.tasks.candidate_task import (
     GENERATOR_SCHEMA,
     MAX_ENTITY_PAIRS_PER_BUCKET,
@@ -163,10 +163,13 @@ def run_full_anchor_ensemble(
     certification strata, and the candidate rank index of the runs with a
     wider selection (COMPETITOR_SELECTION), for the candidate store.
     """
-    partition_names_by_entity = retrieve_partition_names(managers, alignment_state)
+    entity_memberships = retrieve_entity_memberships(
+        managers, alignment_state
+    )
     runs = {
         run_id: (generators_by_run[run_id], run_strategy(
-            managers, alignment_state, generators_by_run[run_id], partition_names_by_entity,
+            managers, alignment_state, generators_by_run[run_id],
+            entity_memberships,
             MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY],
             ))
         for run_id in run_ensemble.run_ids()
@@ -566,7 +569,8 @@ def try_anchor_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     generator = anchor_generator(fn_args)
     try:
         result = run_strategy(
-            state.kg_managers, state.alignment_state, generator, state.partition_names_by_entity,
+            state.kg_managers, state.alignment_state, generator,
+            state.entity_memberships,
             MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY], trial=True,
             )
     except (ValueError, NotImplementedError) as error:
@@ -642,7 +646,9 @@ class OMAnchorTask(GraspTask):
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
-            partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
+            entity_memberships=retrieve_entity_memberships(
+                kg_managers, alignment_state
+            ),
             entity_displays={
                 side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES

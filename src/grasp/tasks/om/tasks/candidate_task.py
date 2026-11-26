@@ -12,8 +12,9 @@ Per strategy (run_strategy):
        top_k, mutual, the unique candidate, optional filters
     3. summarize: the four signals per side, over the whole population
        (count_population)
-Once per run (retrieve_partition_names): the partition of every entity, which
-does not depend on the strategy.
+Once per task (retrieve_entity_memberships): the partition and the profile
+groups of every entity, which do not depend on the strategy; a run only adds
+the groups its population defines inline (strategy_group_names_by_entity).
 
 Trial runs (run_strategy with trial=True), while the LLM tries strategies: if
 the larger population is above the limit of the vectorizer
@@ -101,11 +102,12 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
+    EntityMemberships,
+    get_entities_of_population_side,
     in_population,
     population_group_names,
-    profile_groups_to_grouping,
-    retrieve_groups_by_entity,
-    retrieve_side_population,
+    retrieve_entity_memberships,
+    strategy_group_names_by_entity,
 )
 from grasp.tasks.om.kg_operations.candidate_generation import (
     NeighbourIndex,
@@ -122,7 +124,6 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     split_name_key_runs,
     vector_entity_pairs_to_candidates,
     draw_trial_sample,
-    retrieve_partition_names,
     retrieve_strategy_value_rows,
 )
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
@@ -168,8 +169,6 @@ def check_value_pattern_source(
         raise FunctionCallException(
             f"{kg_profile.kg_name}: {value_pattern_source!r} gives no values: a role in it is set neither "
             "KG-wide nor in a group of the profile, or the profile has no structure relation of a kind in it")
-
-
 
 
 CANDIDATE_BUDGET_PER_ENTITY = 30
@@ -218,6 +217,7 @@ def get_key_candidates(
         alignment_state: AlignmentState,
         generator: Generator,
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        group_names_by_entity_by_side: dict[Side, dict[IRI, set[str]]],
         max_entity_pairs_per_bucket: int | None = None,
         entity_sample: EntitySample | None = None,
         ) -> tuple[
@@ -256,16 +256,27 @@ def get_key_candidates(
             # the rivals come from every name role that is set
             value_rows = chain.from_iterable(
                 retrieve_strategy_value_rows(
-                    managers[side], kg_profile, generator,
-                    side, entity_sample, alternative_value_pattern_source=role)
+                    managers[side],
+                    kg_profile,
+                    generator,
+                    side,
+                    group_names_by_entity_by_side[side],
+                    entity_sample,
+                    alternative_value_pattern_source=role
+                    )
                 for role in sorted(NAME_ROLES)
                 if any(roles.predicate_pattern_by_name(role) is not None
                        for roles in kg_profile.get_effective_roles_of_all_groups())
             )
         else:
             value_rows = retrieve_strategy_value_rows(
-                managers[side], kg_profile, generator, side, entity_sample
-            )
+                managers[side],
+                kg_profile,
+                generator,
+                side,
+                group_names_by_entity_by_side[side],
+                entity_sample,
+                )
         indices_by_side[side] = build_side_indices(value_rows, strategy.normalization)
         if not any(indices_by_side[side].values()):
             raise no_values_error(side)
@@ -326,7 +337,9 @@ def get_key_candidates(
         )
 
 
-def value_wordsets_of(indices_by_level: dict[NormalizationLevel, ValueIndex]) -> frozenset[frozenset[str]]:
+def value_wordsets_of(
+        indices_by_level: dict[NormalizationLevel, ValueIndex]
+        ) -> frozenset[frozenset[str]]:
     """The word sets of all values of one side (each level's index holds all rows)."""
     any_index = next(iter(indices_by_level.values()), {})
     return frozenset(
@@ -340,6 +353,7 @@ def get_vector_candidates(
         alignment_state: AlignmentState,
         generator: Generator,
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        group_names_by_entity_by_side: dict[Side, dict[IRI, set[str]]],
         max_entity_pairs_per_bucket: int | None = None,
         neighbours_per_text: int = 50,
         entity_sample: EntitySample | None = None,
@@ -373,9 +387,20 @@ def get_vector_candidates(
 
     for side in SIDES:
         kg_profile = alignment_state.get_kg_profile(side)
-        group_names_by_side[side] = population_group_names(kg_profile, generator.population, side)
-        check_value_pattern_source(generator.strategy.value_pattern_source(side), kg_profile)
-        value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
+        group_names_by_side[side] = population_group_names(
+            kg_profile, generator.population, side
+            )
+        check_value_pattern_source(
+            generator.strategy.value_pattern_source(side), kg_profile
+            )
+        value_rows = retrieve_strategy_value_rows(
+            managers[side],
+            kg_profile,
+            generator,
+            side,
+            group_names_by_entity_by_side[side],
+            entity_sample
+            )
         # exactly one level: words (string_normalization above)
         (index_by_side[side],) = build_side_indices(
             value_rows, string_normalization
@@ -414,6 +439,7 @@ def get_neighbour_candidates(
         alignment_state: AlignmentState,
         generator: Generator,
         partition_names_by_entity: dict[Side, dict[IRI, str]],
+        group_names_by_entity_by_side: dict[Side, dict[IRI, set[str]]],
         max_entity_pairs_per_bucket: int | None = None,
         entity_sample: EntitySample | None = None,
         ) -> tuple[dict[tuple[Side, IRI], EntityCandidates], list[NeighbourHub], list[tuple[IRI, IRI]]]:
@@ -450,8 +476,13 @@ def get_neighbour_candidates(
             )
         check_value_pattern_source(generator.strategy.value_pattern_source(side), kg_profile)
         value_rows = retrieve_strategy_value_rows(
-            managers[side], kg_profile, generator,
-            side, entity_sample, witnesses_by_entity[side].keys()
+            managers[side],
+            kg_profile,
+            generator,
+            side,
+            group_names_by_entity_by_side[side],
+            entity_sample,
+            witnesses_by_entity[side].keys()
             )
         index_by_side[side] = build_side_witness_index(
             witnesses_by_entity[side],
@@ -497,7 +528,7 @@ def run_strategy(
     managers: dict[Side, KgManager],
     alignment_state: AlignmentState,
     generator: Generator,
-    partition_names_by_entity: dict[Side, dict[IRI, str]],
+    entity_memberships: EntityMemberships,
     max_entity_pairs_per_bucket: int | None = None,
     trial: bool = False,
     sample_seed: int = 0,
@@ -510,30 +541,44 @@ def run_strategy(
     consistent across runs (draw_entity_sample), so that trials of different
     strategies see the same entities as far as their populations and shares allow.
     """
-    # 0. the populations without the entities that already have an equivalence,
-    # and in a trial run the sample of the larger one
-    existing_equivalences_by_entity = alignment_state.existing_equivalences_by_entity()
+
+    # 0. the groups of every entity for this run (profile groups and the inline
+    # groups of the population), the populations without the entities that
+    # already have an equivalence, and in a trial run the sample of the larger one
+
+    group_names_by_entity_by_side = {
+        side: strategy_group_names_by_entity(
+            managers[side], alignment_state.get_kg_profile(side),
+            entity_memberships.group_names_by_entity[side], generator.population, side)
+        for side in SIDES
+        }
 
     population_by_side: dict[Side, frozenset[IRI]] = {
-        side: retrieve_side_population(
-            managers[side],
-            alignment_state.get_kg_profile(side),
-            generator.population,
-            side,
+        side: get_entities_of_population_side(
+            group_names_by_entity_by_side[side],
+            population_group_names(
+                alignment_state.get_kg_profile(side), generator.population, side
+                )
             )
         for side in SIDES
         }
+
+    existing_equivalences_by_entity = alignment_state.existing_equivalences_by_entity()
+
     population_minus_existing_equivs_by_side: dict[Side, frozenset[IRI]] = {
         side: entities - frozenset(existing_equivalences_by_entity[side])
         for side, entities in population_by_side.items()
         }
+
     population_sizes = {
         side: len(entities) for side, entities
         in population_minus_existing_equivs_by_side.items()
         }
+
     entity_sample = draw_trial_sample(
         generator, population_minus_existing_equivs_by_side, sample_seed
         ) if trial else None
+
     compared_entities = compared_entities_by_side(
         population_minus_existing_equivs_by_side, entity_sample
         )
@@ -545,19 +590,25 @@ def run_strategy(
         case CandidateStrategyType.KEY:
             collected, hubs, confirmed_equivalences, value_wordsets, normalization_examples = get_key_candidates(
                 managers, alignment_state, generator,
-                partition_names_by_entity, max_entity_pairs_per_bucket,
+                entity_memberships.partition_names_by_entity,
+                group_names_by_entity_by_side,
+                max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
         case CandidateStrategyType.VECTOR:
             collected, hubs, confirmed_equivalences = get_vector_candidates(
                 managers, alignment_state, generator,
-                partition_names_by_entity, max_entity_pairs_per_bucket,
+                entity_memberships.partition_names_by_entity,
+                group_names_by_entity_by_side,
+                max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
         case CandidateStrategyType.NEIGHBOURS:
             collected, hubs, confirmed_equivalences = get_neighbour_candidates(
                 managers, alignment_state, generator,
-                partition_names_by_entity, max_entity_pairs_per_bucket,
+                entity_memberships.partition_names_by_entity,
+                group_names_by_entity_by_side,
+                max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
         case _:
@@ -605,15 +656,17 @@ def run_full_ensemble(
         run_ensemble: RunEnsemble,
         generators_by_run: dict[str, Generator]
         ) -> MergedCandidates:
-    partition_names_by_entity = retrieve_partition_names(
+
+    entity_memberships = retrieve_entity_memberships(
         managers, alignment_state
-        )
+    )
+
     strategy_results_by_run = {
         run_name: run_strategy(
             managers,
             alignment_state,
             generators_by_run[run_name],
-            partition_names_by_entity
+            entity_memberships
             )
         for run_name in run_ensemble.run_ids()
     }
@@ -631,7 +684,7 @@ def run_full_ensemble(
 class CandidateTaskState:
     kg_managers: dict[Side, KgManager]
     alignment_state: AlignmentState  # doesn't change over the task
-    partition_names_by_entity: dict[Side, dict[IRI, str]] = field(default_factory=dict)
+    entity_memberships: EntityMemberships  # retrieved once in the setup
     runs: dict[str, tuple[Generator, StrategyResult]] = field(default_factory=dict)
     # how entities are shown, per side; keeps the names retrieved so far
     entity_displays: dict[Side, EntityDisplay] = field(default_factory=dict)
@@ -683,7 +736,7 @@ def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
             state.kg_managers,
             state.alignment_state,
             generator,
-            state.partition_names_by_entity,
+            state.entity_memberships,
             MAX_ENTITY_PAIRS_PER_BUCKET[generator.strategy.kind],
             trial=True,
             )
@@ -1429,24 +1482,22 @@ NUM_EXAMPLE_EQUIVALENCES = 5
 
 
 def count_group_entities(
-        manager: KgManager,
-        kg_profile: KgProfile,
-        matched_entities: Collection[IRI]
+        group_names_by_entity: dict[IRI, set[str]], matched_entities: Collection[IRI]
         ) -> dict[str, tuple[int, int]]:
     """
     Per group of the profile: its entities and those already matched (an
     entity in several groups counts in each).
     """
-    groups_by_entity = retrieve_groups_by_entity(
-        manager, profile_groups_to_grouping(kg_profile), kg_profile.entity_space
-        )
     group_sizes = Counter(
-        name for group_names in groups_by_entity.values() for name in group_names
+        group_name for group_names in group_names_by_entity.values() 
+        for group_name in group_names
         )
+
     matched_entities_per_group = Counter(
-        group_name for entity in set(matched_entities) & groups_by_entity.keys()
-        for group_name in groups_by_entity[entity]
+        group_name for entity in set(matched_entities) & group_names_by_entity.keys()
+        for group_name in group_names_by_entity[entity]
     )
+
     return {
         group_name: (group_size, matched_entities_per_group.get(group_name, 0))
         for group_name, group_size in group_sizes.items()
@@ -1457,7 +1508,7 @@ def format_group_counts(state: CandidateTaskState, side: Side) -> list[SectionCo
     kg_profile = state.alignment_state.get_kg_profile(side)
     matched_entities = state.alignment_state.aligned_entities[side]
     counts = count_group_entities(
-        state.kg_managers[side], kg_profile, matched_entities
+        state.entity_memberships.group_names_by_entity[side], matched_entities
         )
     excluded = set(kg_profile.excluded_group_names())
     content: list[SectionContent] = []
@@ -1501,7 +1552,7 @@ def format_alignment_status(state: CandidateTaskState) -> Section:
     equivalences = state.alignment_state.equivalences
     if not equivalences:
         return Section("Equivalences found so far", ["none"])
-    partitions = state.partition_names_by_entity
+    partitions = state.entity_memberships.partition_names_by_entity
     by_partition_pair = Counter(
         (partitions[Side.SOURCE].get(equivalence.entity_source, "?"),
          partitions[Side.TARGET].get(equivalence.entity_target, "?"))
@@ -1788,9 +1839,11 @@ class OMCandidateTask(GraspTask):
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
-            partition_names_by_entity=retrieve_partition_names(kg_managers, alignment_state),
+            entity_memberships=retrieve_entity_memberships(kg_managers, alignment_state),
             entity_displays={
-                side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
+                side: EntityDisplay(
+                    kg_managers[side], alignment_state.get_kg_profile(side)
+                    )
                 for side in SIDES
             },
         )

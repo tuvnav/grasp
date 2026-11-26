@@ -28,7 +28,6 @@ from grasp.tasks.om.data_models.profile import (
     RoleName,
     PredicateRoles,
     StructureRelationKind,
-    effective_roles_of_entity,
     entities_by_effective_roles,
 )
 from grasp.tasks.om.foundation.rendering import Item, Section

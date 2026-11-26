@@ -37,7 +37,7 @@ from grasp.tasks.om.foundation.text_vectors import (
 )
 from grasp.tasks.om.foundation.types import IRI, SIDES, BindingType, Side
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, generate_group_grouping, profile_partitions_to_grouping, retrieve_groups_by_entity,
+    Grouping, retrieve_grouping_by_entity,
 )
 from grasp.tasks.om.sparql_access import retrieve_values, stream_rows, values_clause
 
@@ -52,8 +52,7 @@ type EntityPairIndex[P: EntityPair] = dict[tuple[IRI, IRI], P]
 def retrieve_value_rows(
         manager: KgManager,
         kg_profile: KgProfile,
-        grouping: Grouping,
-        entity_space: Iterable[str],
+        group_names_by_entity: dict[IRI, set[str]],
         value_source: ValuePatternSource,
         # restrict to already matched entities for
         # neighbour strategy
@@ -64,10 +63,10 @@ def retrieve_value_rows(
         return  # restricted to no values (e.g. no witnesses yet): no query
     restricted_to_values = set(object_iris) if object_iris is not None else None
 
-    groups_by_entity = retrieve_groups_by_entity(manager, grouping, entity_space)
-
     entities_by_pattern: dict[tuple[str, str], tuple[PredicatePattern, set[IRI]]] = {}
-    for effective_roles, entities in entities_by_effective_roles(kg_profile, groups_by_entity).values():
+    for effective_roles, entities in entities_by_effective_roles(
+            kg_profile, group_names_by_entity
+            ).values():
         for role_name, pattern in named_value_patterns(value_source, effective_roles):
             entities_by_pattern.setdefault(
                 (role_name, pattern.model_dump_json()),
@@ -85,7 +84,7 @@ def retrieve_value_rows(
                 if restricted_to_values is not None \
                         and IRI(value.value) not in restricted_to_values:
                     continue
-                for group_name in groups_by_entity[entity]:
+                for group_name in group_names_by_entity[entity]:
                     yield ValueRow(
                         entity=entity,
                         group_name=group_name,
@@ -123,7 +122,7 @@ def retrieve_linked_entities(
     The entities of a grouping linked by a triple, in either direction, to
     one of the given entities (e.g. the neighbours of matched entities).
     """
-    members = set(retrieve_groups_by_entity(manager, grouping, entity_space))
+    members = set(retrieve_grouping_by_entity(manager, grouping, entity_space))
     linked_entities: set[IRI] = set()
     for batch in batched(sorted(linked_to), batch_size):
         restriction = values_clause("linked", batch)
@@ -134,20 +133,6 @@ def retrieve_linked_entities(
                 for row in stream_rows(manager, query)
                 }
     return linked_entities & members
-
-
-def retrieve_partitions_by_entity(
-        manager: KgManager,
-        kg_profile: KgProfile,
-        entity_space: Iterable[str]
-        ) -> dict[IRI, str]:
-    partitions_by_entity = retrieve_groups_by_entity(
-        manager, profile_partitions_to_grouping(kg_profile), entity_space
-        )
-    return {
-        entity: next(iter(group_names))
-        for entity, group_names in partitions_by_entity.items()
-        }
 
 
 def distinct_entities(rows: list[ValueRow]) -> set[IRI]:
@@ -925,14 +910,15 @@ def retrieve_strategy_value_rows(
         kg_profile: KgProfile,
         generator: Generator,
         side: Side,
+        group_names_by_entity: dict[IRI, set[str]],
         entity_sample: EntitySample | None = None,
         object_iris: Collection[IRI] | None = None,
         alternative_value_pattern_source: ValuePatternSource | None = None
         ) -> Iterator[ValueRow]:
     """
     The values a strategy compares on one side (its value_pattern_source: roles,
-    or the structure relations of a neighbour strategy): of the entities of all
-    groups (rivals outside the population included); on a sampled side only
+    or the structure relations of a neighbour strategy): of the entities in
+    group_names_by_entity (all groups of the run: rivals outside the population included); on a sampled side only
     those of the sampled entities. object_iris: only values among these (a
     neighbour strategy: the entities of the witnesses).
     alternative_value_pattern_source: these values instead of the strategy's
@@ -948,25 +934,10 @@ def retrieve_strategy_value_rows(
     value_rows = retrieve_value_rows(
         manager,
         kg_profile,
-        generate_group_grouping(kg_profile, generator.population, side),
-        kg_profile.entity_space,
+        group_names_by_entity,
         value_pattern_source,
         object_iris,
     )
     if side_sample is None:
         return value_rows
     return (row for row in value_rows if row.entity in side_sample.entities)
-
-
-def retrieve_partition_names(
-        managers: dict[Side, KgManager],
-        alignment_state: AlignmentState,
-        ) -> dict[Side, dict[IRI, str]]:
-    """The partition of every entity, per side. Depends only on the profiles, so it
-    is retrieved once per run and reused by every strategy."""
-    partition_names_by_entity = {}
-    for side in SIDES:
-        kg_profile = alignment_state.get_kg_profile(side)
-        partition_names_by_entity[side] = retrieve_partitions_by_entity(
-            managers[side], kg_profile, kg_profile.entity_space)
-    return partition_names_by_entity

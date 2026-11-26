@@ -78,7 +78,7 @@ from grasp.tasks.om.kg_operations.grouping import (
     ensure_groups,
     ensure_partitions,
     retrieve_group_sizes,
-    retrieve_groups_by_entity,
+    retrieve_grouping_by_entity,
     retrieve_members,
     groups_to_grouping,
     get_default_partitions,
@@ -214,7 +214,7 @@ def get_entity_examples(
     with a name (see names_pattern) and their groups.
     """
     try:
-        groups_by_entity = retrieve_groups_by_entity(manager, grouping, space)
+        groups_by_entity = retrieve_grouping_by_entity(manager, grouping, space)
         entities = [
             entity for entity, group_names in groups_by_entity.items()
             if group_name is None or group_name in group_names
@@ -547,7 +547,7 @@ class EntitySpaceEditor(Editor):
                 )
         names = self.names_pattern()
         try:
-            entities = retrieve_groups_by_entity(self.kg_manager, self.partition_grouping, [prefix])
+            entities = retrieve_grouping_by_entity(self.kg_manager, self.partition_grouping, [prefix])
             named_count = len(retrieve_values(self.kg_manager, entities, names.sparql_branches(), literals_only=False))
             types = count_entities_by_key(self.kg_manager, entities, f"?s <{RDF_TYPE}> ?t", "t").most_common(8)
         except Exception as e:
@@ -1540,7 +1540,7 @@ class RoleEditor(Editor):
                 f"Unknown {self.unit} {member}; known: {', '.join(self.scope)}"
                 )
         try:
-            groups_by_entity = retrieve_groups_by_entity(self.kg_manager, self.grouping, self.entity_space)
+            groups_by_entity = retrieve_grouping_by_entity(self.kg_manager, self.grouping, self.entity_space)
             values_by_entity = retrieve_values(
                 self.kg_manager, groups_by_entity, predicate_pattern.sparql_branches(), literals_only=False
                 )

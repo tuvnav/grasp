@@ -28,7 +28,7 @@ from grasp.tasks.om.data_models.profile import (
     unknown_name_message,
 )
 from grasp.tasks.om.foundation.configuration import configured_namespaces
-from grasp.tasks.om.kg_operations.grouping import retrieve_groups_by_entity
+from grasp.tasks.om.kg_operations.grouping import retrieve_grouping_by_entity
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, Table, format_display_content
 from grasp.tasks.om.foundation.types import LocalNameType
 from grasp.tasks.om.foundation.rdf_vocabulary import (
@@ -91,7 +91,7 @@ class SpaceTask(ProfileStageTask):
                 "be counted) are not supported yet."
                 )
         # the entities of the default partitions (kinds), with the rest
-        kinds_by_entity = retrieve_groups_by_entity(self.kg_manager, None, ())
+        kinds_by_entity = retrieve_grouping_by_entity(self.kg_manager, None, ())
         kinds_by_prefix = count_kinds_by_prefix(kinds_by_entity)
         prefix_counts_all_entities = count_entities_by_prefix(kinds_by_entity)
         prefix_counts_named_entities = count_entities_by_prefix(

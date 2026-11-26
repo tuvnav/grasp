@@ -55,7 +55,7 @@ from grasp.tasks.om.kg_operations.candidate_generation import sample_position
 from grasp.tasks.om.kg_operations.grouping import (
     groups_to_grouping,
     profile_partitions_to_grouping,
-    retrieve_groups_by_entity,
+    retrieve_grouping_by_entity,
     )
 from grasp.tasks.om.kg_operations.candidate_generation import retrieve_linked_entities
 from grasp.utils import format_enumerate, format_section
@@ -504,13 +504,13 @@ def retrieve_recall_strata(
     neighbours of matched entities, members of excluded groups, the rest.
     """
     all_partitions = profile_partitions_to_grouping(kg_profile)
-    unmatched = set(retrieve_groups_by_entity(manager, all_partitions, kg_profile.entity_space)) - matched_entities
+    unmatched = set(retrieve_grouping_by_entity(manager, all_partitions, kg_profile.entity_space)) - matched_entities
     neighbours = retrieve_linked_entities(
         manager, all_partitions, kg_profile.entity_space, matched_entities
         ) & unmatched
     excluded_groups = [group for group in kg_profile.groups if group.excluded]
     excluded = (
-        set(retrieve_groups_by_entity(manager, groups_to_grouping(excluded_groups), kg_profile.entity_space))
+        set(retrieve_grouping_by_entity(manager, groups_to_grouping(excluded_groups), kg_profile.entity_space))
         if excluded_groups else set()
         ) & unmatched
     excluded -= neighbours
