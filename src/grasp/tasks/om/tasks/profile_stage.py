@@ -46,13 +46,13 @@ from grasp.tasks.om.data_models.profile import (
     PredicateRoles,
     Stage,
     WithinKgNonCompetingPartitionPair,
-    check_structure,
+    check_structure_relations,
     derived_group_roles,
     describe_predicate_pattern,
     describe_profile,
     describe_structure_relation_heading,
     diff_roles,
-    effective_roles,
+    used_group_roles,
     role_elements_of,
     role_element_order,
     role_elements_with_added,
@@ -398,7 +398,7 @@ def group_mode(
     grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)
     usage = element_usage_in_roles(manager, grouping, profile.entity_space, profile.roles).get(group, {})
-    effective = effective_roles(profile.roles, current, usage)
+    effective = used_group_roles(profile.roles, current, usage)
     coverage = predicate_coverage(manager, grouping, profile.entity_space).get(group, {})
     size = retrieve_group_sizes(manager, grouping, profile.entity_space).get(group, 0)
     counted = [p for p, c in unassigned_predicates(effective, coverage)
@@ -1334,7 +1334,7 @@ class RoleEditor(Editor):
             usage_by_direction,
             )
         group_role_element_usage = usage.get(group_name, {})
-        effective_predicate_roles = effective_roles(kg_profile.roles, group_profile, group_role_element_usage)
+        effective_predicate_roles = used_group_roles(kg_profile.roles, group_profile, group_role_element_usage)
         added_role_elements = set(group_profile.added)
 
         def origin(element: RoleElement) -> str:
@@ -1658,7 +1658,7 @@ class RoleEditor(Editor):
         self.roles = self.roles.model_copy(
             update={"structure": structure + [relation]}
             )
-        problems = check_structure(self.roles.structure)
+        problems = check_structure_relations(self.roles.structure)
         content: list[SectionContent] = [
             f"Coverage of each predicate or pattern as ?s and as ?o per {self.unit}.",
             relation_item
@@ -1683,7 +1683,7 @@ class RoleEditor(Editor):
 
     def check_roles(self) -> None:
         """Raises if the structure relations of the working roles are inconsistent."""
-        problems = check_structure(self.roles.structure)
+        problems = check_structure_relations(self.roles.structure)
         if problems:
             raise FunctionCallException("Structure relations: " + "; ".join(problems))
 

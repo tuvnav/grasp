@@ -7,9 +7,10 @@ partitions, excluded groups, entity space) in Python, not in SPARQL.
 """
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Collection, Iterable, Sequence
 
 from grasp.manager import KgManager
+from grasp.tasks.om.data_models.candidates import POPULATION_REST, GroupRef, Population
 from grasp.tasks.om.data_models.profile import (
     GroupDefinition,
     GroupOrigin,
@@ -29,7 +30,8 @@ from grasp.tasks.om.sparql_access import (
     union_of,
     as_batched_values_blocks,
 )
-from grasp.tasks.om.foundation.types import IRI
+from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.utils import FunctionCallException
 
 # kinds of the default partitions (stage b1), in order: the first match wins
 KINDS = tuple(KIND_ALTERNATIVES)
@@ -311,3 +313,91 @@ def profile_groups_to_grouping(
     ).extended_by(
         additional_members=tuple((g.name, g.membership_sparql) for g in additional_groups)
         )
+
+
+# --- populations of a strategy: their groups, grouping and entities ---
+
+def group_refs_of_side(population: Population, side: Side) -> list[GroupRef]:
+    return population.source_group_refs if side == Side.SOURCE else population.target_group_refs
+
+
+def inline_groups(population: Population, side: Side) -> list[GroupDefinition]:
+    """The groups a strategy defines inline for one side (not in the KgProfile)."""
+    return [group_ref for group_ref in group_refs_of_side(population, side) if isinstance(group_ref, GroupDefinition)]
+
+
+def population_group_names(kg_profile: KgProfile, population: Population, side: Side) -> set[str]:
+    """
+    The names of the groups of one side's population. REST stands for all groups
+    of the profile that are not excluded (for now; later: only the entities that
+    have no equivalence yet). Raises FunctionCallException for a name that is
+    neither a group of the profile nor defined inline, and for an inline group
+    named like a group of the profile.
+    """
+    clashing = sorted(group.name for group in inline_groups(population, side)
+                      if kg_profile.has_group(group.name))
+    if clashing:
+        raise FunctionCallException(
+            f"Groups defined inline must have new names; already groups of {kg_profile.kg_name}: {clashing}")
+
+    names: set[str] = set()
+    for group_ref in group_refs_of_side(population, side):
+        if isinstance(group_ref, GroupDefinition):
+            names.add(group_ref.name)
+        elif group_ref == POPULATION_REST:
+            names |= set(kg_profile.group_names()) - set(kg_profile.excluded_group_names())
+        elif kg_profile.has_group(group_ref):
+            names.add(group_ref)
+        else:
+            raise FunctionCallException(
+                f"{group_ref} is not a group of {kg_profile.kg_name}; groups: {kg_profile.group_names()}, "
+                f"or {POPULATION_REST!r} for all of them, or define a group inline")
+    return names
+
+
+def generate_group_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
+    """
+    The groups whose values are retrieved for one side: in a small KG all groups of
+    the profile and the inline groups (all are needed to count rivals outside the
+    population by group), without the entities of excluded groups.
+    """
+    return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
+
+
+def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
+    """
+    The groups of one side's population only 
+    (no rivals), without the entities
+    of excluded groups.
+    """
+    all_groups = profile_groups_to_grouping(kg_profile, inline_groups(population, side))
+    group_names = population_group_names(kg_profile, population, side)
+    return Grouping(
+        tuple(member for member in all_groups.members if member[0] in group_names),
+        exclusive=False, minus=all_groups.minus,
+    )
+
+
+def in_population(pair: tuple[IRI, IRI], population_by_side: dict[Side, frozenset[IRI]]) -> bool:
+    """Both entities of a (source, target) pair are in their side's population."""
+    return pair[0] in population_by_side[Side.SOURCE] and pair[1] in population_by_side[Side.TARGET]
+
+
+def retrieve_side_population(
+        manager: KgManager,
+        kg_profile: KgProfile,
+        population: Population,
+        side: Side,
+        leave_out_entities: Collection[IRI] = ()
+) -> frozenset[IRI]:
+    """
+    The entities of one side's population, each once (also those without any
+    value of the strategy: the denominator of the signals), without the
+    leave_out_entities (those with an equivalence: they get no candidates).
+    """
+    groups_by_entity = retrieve_groups_by_entity(
+        manager,
+        generate_population_groups_grouping(kg_profile, population, side),
+        kg_profile.entity_space
+        )
+    return frozenset(groups_by_entity) - frozenset(leave_out_entities)

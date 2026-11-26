@@ -28,7 +28,8 @@ from grasp.tasks.om.data_models.profile import (
     RoleName,
     PredicateRoles,
     StructureRelationKind,
-    roles_of_entity,
+    effective_roles_of_entity,
+    entities_by_effective_roles,
 )
 from grasp.tasks.om.foundation.rendering import Item, Section
 from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
@@ -372,7 +373,7 @@ class EntityDisplay:
         entities = set(entities)
         # only prefetch entities which are not in cache
         new_entities = entities - self.contexts_by_entity.keys()
-        for roles, entities_in_group in self.roles_by_group_names(new_entities).values():
+        for roles, entities_in_group in self.get_roles_by_group_names(new_entities).values():
             # main entities: retrieve all roles
             # (also if retrieved before as a neighbour with names only)
             self.prefetch_role_values(
@@ -414,28 +415,22 @@ class EntityDisplay:
                 )
         # neighbours: names only, if not retrieved yet
         neighbours = {iri for entity in entities for iri in self.shown_iris(entity)}
-        for roles, entities_in_group in self.roles_by_group_names(neighbours - self.values_by_entity_role.keys()).values():
+        for roles, entities_in_group in self.get_roles_by_group_names(
+                neighbours - self.values_by_entity_role.keys()
+                ).values():
             self.prefetch_role_values(entities_in_group, STANDARD_VIEW_ROLES, roles)
 
-    def roles_by_group_names(self, entities: set[IRI]) -> dict[frozenset[str], tuple[PredicateRoles, set[IRI]]]:
+    def get_roles_by_group_names(
+            self, entities: set[IRI]
+            ) -> dict[frozenset[str], tuple[PredicateRoles, set[IRI]]]:
         """
         The entities divided by their combination of groups, each part with
-        its roles: entities in the same groups have the same roles, so each
+        its aggregated roles: entities in the same groups have the same roles, so each
         part can be retrieved in one batch.
         """
-        divided: dict[frozenset[str], set[IRI]] = {}
-        for entity, group_names in get_group_names_by_entity(
-                self.manager, self.kg_profile, entities
-                ).items():
-            divided.setdefault(group_names, set()).add(entity)
-        return {
-            group_names: (
-                roles_of_entity(self.kg_profile.roles,
-                                map(self.kg_profile.get_group, group_names)),
-                members,
-            )
-            for group_names, members in divided.items()
-        }
+        return entities_by_effective_roles(
+            self.kg_profile, get_group_names_by_entity(self.manager, self.kg_profile, entities)
+        )
 
     def prefetch_role_values(self, entities: set[IRI], role_names: Iterable[str], roles: PredicateRoles) -> None:
         """

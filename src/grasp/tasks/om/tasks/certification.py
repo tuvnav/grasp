@@ -51,13 +51,13 @@ from grasp.tasks.om.data_models.verification import (
 )
 from grasp.tasks.om.data_models.profile import KgProfile
 from grasp.tasks.om.foundation.types import IRI, Side
+from grasp.tasks.om.kg_operations.candidate_generation import sample_position
 from grasp.tasks.om.kg_operations.grouping import (
     groups_to_grouping,
     profile_partitions_to_grouping,
     retrieve_groups_by_entity,
     )
 from grasp.tasks.om.kg_operations.candidate_generation import retrieve_linked_entities
-from grasp.tasks.om.tasks.candidate_task import sample_position
 from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"

@@ -29,7 +29,7 @@ from grasp.tasks.om.data_models.profile import (
     PredicateRoles,
     RoleElementKind,
     RoleElementUsage,
-    effective_roles,
+    used_group_roles,
     role_elements_of,
     roles_from_elements,
     swap,
@@ -607,7 +607,7 @@ def group_defaults(
     grouping = single_group_grouping(profile, group)
     current = profile.get_group(group)
     usage = element_usage_in_roles(manager, grouping, profile.entity_space, profile.roles).get(group, {})
-    effective = effective_roles(profile.roles, current, usage)
+    effective = used_group_roles(profile.roles, current, usage)
     stats = group_name_stats(manager, grouping, profile.entity_space, group, effective)
     return current.model_copy(update={"local_name_type": local_name_type(stats)}, deep=True), stats
 

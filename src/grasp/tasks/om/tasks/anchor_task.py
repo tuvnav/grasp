@@ -52,6 +52,7 @@ from grasp.tasks.om.data_models.candidates import (
 from grasp.tasks.om.foundation.configuration import load_task_instructions
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS_DESCRIPTION, STANDARD_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
+from grasp.tasks.om.kg_operations.candidate_generation import retrieve_partition_names
 from grasp.tasks.om.kg_operations.candidate_selection import (
     build_candidate_rank_index,
     build_pair_signal_index,
@@ -71,7 +72,6 @@ from grasp.tasks.om.tasks.candidate_task import (
     parse_run_ensemble,
     prefetch_shown_entities,
     reselect_result,
-    retrieve_partition_names,
     run_strategy,
 )
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content

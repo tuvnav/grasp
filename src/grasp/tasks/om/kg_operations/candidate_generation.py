@@ -1,5 +1,6 @@
 import dataclasses
 from collections import defaultdict
+import hashlib
 from itertools import batched
 from typing import Callable, Collection, Iterable, Iterator
 import numpy as np
@@ -7,7 +8,9 @@ import numpy as np
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
-from grasp.tasks.om.data_models.candidates import WitnessWeighting
+from grasp.tasks.om.data_models.candidates import (
+    CandidateStrategy, EntitySample, Generator, VectorStrategy, WitnessWeighting,
+)
 from grasp.tasks.om.data_models.equivalence import (
     ExistingEquivalences
 )
@@ -25,6 +28,7 @@ from grasp.tasks.om.data_models.profile import (
     KgProfile,
     PredicatePattern,
     PredicateRoles,
+    entities_by_effective_roles,
 )
 from grasp.tasks.om.foundation.text_normalization import NORMALIZATION_LEVELS, NormalizationLevel
 from grasp.tasks.om.foundation.text_vectors import (
@@ -32,7 +36,9 @@ from grasp.tasks.om.foundation.text_vectors import (
     count_text_vectors, vectorize_texts,
 )
 from grasp.tasks.om.foundation.types import IRI, SIDES, BindingType, Side
-from grasp.tasks.om.kg_operations.grouping import Grouping, profile_partitions_to_grouping, retrieve_groups_by_entity
+from grasp.tasks.om.kg_operations.grouping import (
+    Grouping, generate_group_grouping, profile_partitions_to_grouping, retrieve_groups_by_entity,
+)
 from grasp.tasks.om.sparql_access import retrieve_values, stream_rows, values_clause
 
 # normalized value -> [retrieved rows]. For key and vector strategies
@@ -45,10 +51,12 @@ type EntityPairIndex[P: EntityPair] = dict[tuple[IRI, IRI], P]
 
 def retrieve_value_rows(
         manager: KgManager,
+        kg_profile: KgProfile,
         grouping: Grouping,
         entity_space: Iterable[str],
         value_source: ValuePatternSource,
-        roles: PredicateRoles,
+        # restrict to already matched entities for
+        # neighbour strategy
         object_iris: Collection[IRI] | None = None
         ) -> Iterator[ValueRow]:
 
@@ -58,10 +66,18 @@ def retrieve_value_rows(
 
     groups_by_entity = retrieve_groups_by_entity(manager, grouping, entity_space)
 
-    for role_name, pattern in named_value_patterns(value_source, roles):
+    entities_by_pattern: dict[tuple[str, str], tuple[PredicatePattern, set[IRI]]] = {}
+    for effective_roles, entities in entities_by_effective_roles(kg_profile, groups_by_entity).values():
+        for role_name, pattern in named_value_patterns(value_source, effective_roles):
+            entities_by_pattern.setdefault(
+                (role_name, pattern.model_dump_json()),
+                (pattern, set())
+                )[1].update(entities)
+
+    for (role_name, _), (pattern, entities) in entities_by_pattern.items():
         values_by_entity = retrieve_values(
-            manager, groups_by_entity, pattern.sparql_branches(), literals_only=False
-            )
+            manager, entities, pattern.sparql_branches(), literals_only=False
+        )
         for entity, values in values_by_entity.items():
             for value in values:
                 if value.typ == BindingType.BNODE:
@@ -827,3 +843,130 @@ def neighbour_entity_pairs_to_candidates(
         alignment_state, entity_pairs, population_group_names,
         partition_names_by_entity, build_neighbour_candidate, witnesses_by_entity
     )
+
+
+# --- trial runs: the sample of the larger population ---
+
+# trial runs: the most entities of the larger population that are compared, per
+# vectorizer (in a small KG the key strategy is cheap and runs on the whole population)
+TRIAL_ENTITY_LIMITS: dict[Vectorizer, int] = {
+    "idf_char_3grams": 5000,
+    "embedding": 5_000,
+}
+
+
+def trial_entity_limit(strategy: CandidateStrategy) -> int | None:
+    """The trial limit of a strategy; None: no sampling."""
+    if isinstance(strategy, VectorStrategy):
+        return TRIAL_ENTITY_LIMITS.get(strategy.vectorizer)
+    return None
+
+
+def choose_sampled_side(population_sizes: dict[Side, int], limit: int | None) -> Side | None:
+    """The side to sample in a trial run: the one with the larger population, if it is above the limit (the source on equal
+    sizes); None: compare both whole."""
+    larger_side = max(SIDES, key=lambda side: population_sizes[side])  # first maximum: the source
+    if limit is None or population_sizes[larger_side] <= limit:
+        return None
+    return larger_side
+
+
+def sample_position(entity: IRI, seed: int) -> float:
+    """The fixed position of an entity in [0, 1) for a seed: a stable hash of
+    both (not Python's hash, which changes between processes), so it is the
+    same in every run and every population."""
+    digest = hashlib.blake2b(f"{seed}|{entity}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest) / 2**64
+
+
+def draw_entity_sample(entities: Iterable[IRI], size: int, seed: int) -> frozenset[IRI]:
+    """
+    A random sample of about `size` entities: those whose sample position
+    lies below the share size / number of entities. Consistent across runs:
+    the same entities and seed give the same sample, and of two populations
+    an entity in both is in both samples if it is in the one with the smaller
+    share (nested samples, the most overlap two samples can have).
+    """
+    distinct_entities = set(entities)
+    if not distinct_entities:
+        return frozenset()
+    sampling_share = size / len(distinct_entities)
+    return frozenset(entity for entity in distinct_entities if sample_position(entity, seed) < sampling_share)
+
+
+def draw_trial_sample(
+        generator: Generator,
+        populations_by_side: dict[Side, frozenset[IRI]],
+        seed: int,
+        ) -> EntitySample | None:
+    """
+    The sample of a trial run (see the module docstring); None: no sampling
+    needed. populations_by_side: the populations, already without the
+    entities that have an equivalence.
+    """
+    limit = trial_entity_limit(generator.strategy)
+    side = choose_sampled_side(
+        {side: len(population) for side, population in populations_by_side.items()},
+        limit
+        )
+    if side is None or limit is None:
+        return None
+    population = populations_by_side[side]
+    return EntitySample(
+        side=side,
+        entities=draw_entity_sample(population, min(limit, len(population)), seed)
+        )
+
+
+# --- the values a strategy compares, the partitions of the entities ---
+
+def retrieve_strategy_value_rows(
+        manager: KgManager,
+        kg_profile: KgProfile,
+        generator: Generator,
+        side: Side,
+        entity_sample: EntitySample | None = None,
+        object_iris: Collection[IRI] | None = None,
+        alternative_value_pattern_source: ValuePatternSource | None = None
+        ) -> Iterator[ValueRow]:
+    """
+    The values a strategy compares on one side (its value_pattern_source: roles,
+    or the structure relations of a neighbour strategy): of the entities of all
+    groups (rivals outside the population included); on a sampled side only
+    those of the sampled entities. object_iris: only values among these (a
+    neighbour strategy: the entities of the witnesses).
+    alternative_value_pattern_source: these values instead of the strategy's
+    (a key run on a name role: the other name roles, for its rivals). The
+    caller checks the value source first (tasks/candidate_task.py:
+    check_value_pattern_source).
+    """
+    value_pattern_source = (
+        alternative_value_pattern_source if alternative_value_pattern_source is not None
+        else generator.strategy.value_pattern_source(side)
+        )
+    side_sample = entity_sample if entity_sample is not None and entity_sample.side == side else None
+    value_rows = retrieve_value_rows(
+        manager,
+        kg_profile,
+        generate_group_grouping(kg_profile, generator.population, side),
+        kg_profile.entity_space,
+        value_pattern_source,
+        object_iris,
+    )
+    if side_sample is None:
+        return value_rows
+    return (row for row in value_rows if row.entity in side_sample.entities)
+
+
+def retrieve_partition_names(
+        managers: dict[Side, KgManager],
+        alignment_state: AlignmentState,
+        ) -> dict[Side, dict[IRI, str]]:
+    """The partition of every entity, per side. Depends only on the profiles, so it
+    is retrieved once per run and reused by every strategy."""
+    partition_names_by_entity = {}
+    for side in SIDES:
+        kg_profile = alignment_state.get_kg_profile(side)
+        partition_names_by_entity[side] = retrieve_partitions_by_entity(
+            managers[side], kg_profile, kg_profile.entity_space)
+    return partition_names_by_entity

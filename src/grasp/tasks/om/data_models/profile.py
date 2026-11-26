@@ -39,7 +39,7 @@ from __future__ import annotations
 from collections import defaultdict
 from enum import StrEnum, auto
 import re
-from typing import Any, Iterable, Literal, Self, get_args
+from typing import Any, Iterable, Literal, Mapping, Self, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -593,14 +593,14 @@ def derived_group_roles(
     )
 
 
-def effective_roles(
+def used_group_roles(
         kg_roles: PredicateRoles, group: GroupProfile, usage: RoleElementUsage
         ) -> PredicateRoles:
     elements = role_elements_of(derived_group_roles(kg_roles, usage)) - set(group.removed)
     return roles_from_elements(role_elements_with_added(elements, group.added))
 
 
-def roles_of_entity(
+def effective_roles_of_entity(
         kg_roles: PredicateRoles, groups: Iterable[GroupProfile]
         ) -> PredicateRoles:
     """
@@ -618,9 +618,37 @@ def roles_of_entity(
     return roles_from_elements(elements)
 
 
-def check_structure(relations: list[StructureRelation]) -> list[str]:
-    """Problems of a list of structure relations: duplicate names, inverse_of
-    naming no relation of the list, or inverses that do not point back."""
+def entities_by_effective_roles(
+        kg_profile: KgProfile, group_names_by_entity: Mapping[IRI, Iterable[str]]
+) -> dict[frozenset[str], tuple[PredicateRoles, set[IRI]]]:
+    """
+    The entities divided by their combination of groups of the profile, each
+    part with its effective roles (effective_roles_of_entity: the KG-wide roles with the
+    deviations of its groups). Names that are no group of the profile (inline
+    groups of a population) are left out. Entities in the same groups have the
+    same roles, so each part can be retrieved in one batch in later steps.
+    """
+    profile_group_names = set(kg_profile.group_names())
+    entities_by_group_combination: dict[frozenset[str], set[IRI]] = {}
+    for entity, group_names in group_names_by_entity.items():
+        entities_by_group_combination.setdefault(
+            frozenset(group_names) & profile_group_names, set()
+            ).add(entity)
+    return {
+        group_names: (
+            effective_roles_of_entity(
+                kg_profile.roles, map(kg_profile.get_group, group_names)
+                ),
+            members
+            ) for group_names, members in entities_by_group_combination.items()
+    }
+
+
+def check_structure_relations(relations: list[StructureRelation]) -> list[str]:
+    """
+    Problems of a list of structure relations: duplicate names, inverse_of
+    naming no relation of the list, or inverses that do not point back.
+    """
     problems = []
     by_name: dict[str, StructureRelation] = {}
     for relation in relations:
@@ -778,6 +806,18 @@ class KgProfile(BaseModel):
         if group is None:
             raise ValueError(unknown_name_message("group", group_name, self.group_names()))
         return group
+
+    def get_effective_roles_of_all_groups(self) -> list[PredicateRoles]:
+        """
+        The KG-wide roles and the effective roles of each group that is not excluded
+        """
+        return [
+            self.roles,
+            *(
+                effective_roles_of_entity(self.roles, [group]) 
+                for group in self.groups if not group.excluded
+                )
+            ]
 
     def competes(self, partition_a: str, partition_b: str) -> bool:
         """Whether entities of the two partitions of this KG compete with each other."""

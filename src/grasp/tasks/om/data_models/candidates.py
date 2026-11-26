@@ -69,6 +69,16 @@ class Population(BaseModel):
         }
 
 
+@dataclass(frozen=True)
+class EntitySample:
+    """
+    The entities of one side's population that a trial run compares; the
+    other side is compared whole.
+    """
+    side: Side
+    entities: frozenset[IRI]
+
+
 # values of an entity: one role name of its profile (names, codes, ...),
 # one structure relation kind (subsumption, partonomy, ...),
 # a structure relation name (subclass_of), '^' for the other direction,

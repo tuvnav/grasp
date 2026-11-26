@@ -28,11 +28,10 @@ would lose the true counterparts and distort every signal.
 from collections import Counter
 import dataclasses
 from enum import StrEnum, auto
-import hashlib
 from itertools import chain
 import random
 from dataclasses import dataclass, field
-from typing import Any, Callable, Collection, Iterable, Iterator, Sequence, get_args
+from typing import Any, Callable, Collection, Sequence, get_args
 
 from grasp.configs import GraspConfig
 from grasp.manager import KgManager
@@ -40,7 +39,6 @@ from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import (
-    CandidateStrategy,
     CandidateStrategyType,
     Generator,
     KeyStrategy,
@@ -60,6 +58,7 @@ from grasp.tasks.om.data_models.candidates import (
     TriedRun,
     Candidate,
     EntityCandidates,
+    EntitySample,
     Hub,
     KeyHub,
     KeyMatch,
@@ -70,14 +69,10 @@ from grasp.tasks.om.data_models.candidates import (
     VectorHub,
     VectorMatch,
     POPULATION_REST,
-    GroupRef,
-    Population,
     ValuePatternSource,
-    ValueRow,
 )
 from grasp.tasks.om.data_models.profile import (
     StructureRelationKind,
-    GroupDefinition,
     KgProfile,
     describe_profile,
 )
@@ -106,7 +101,11 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
 from grasp.tasks.om.kg_operations.grouping import (
-    Grouping, retrieve_groups_by_entity, profile_groups_to_grouping,
+    in_population,
+    population_group_names,
+    profile_groups_to_grouping,
+    retrieve_groups_by_entity,
+    retrieve_side_population,
 )
 from grasp.tasks.om.kg_operations.candidate_generation import (
     NeighbourIndex,
@@ -122,8 +121,9 @@ from grasp.tasks.om.kg_operations.candidate_generation import (
     get_normalization_examples,
     split_name_key_runs,
     vector_entity_pairs_to_candidates,
-    retrieve_partitions_by_entity,
-    retrieve_value_rows,
+    draw_trial_sample,
+    retrieve_partition_names,
+    retrieve_strategy_value_rows,
 )
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import (
@@ -138,249 +138,38 @@ from grasp.utils import FunctionCallException, format_section
 from pydantic import ValidationError
 
 
-# TODO: Move to lower level
-def group_refs_of_side(population: Population, side: Side) -> list[GroupRef]:
-    return population.source_group_refs if side == Side.SOURCE else population.target_group_refs
-
-
-def inline_groups(population: Population, side: Side) -> list[GroupDefinition]:
-    """The groups a strategy defines inline for one side (not in the KgProfile)."""
-    return [group_ref for group_ref in group_refs_of_side(population, side) if isinstance(group_ref, GroupDefinition)]
-
-
-def population_group_names(kg_profile: KgProfile, population: Population, side: Side) -> set[str]:
-    """
-    The names of the groups of one side's population. REST stands for all groups
-    of the profile that are not excluded (for now; later: only the entities that
-    have no equivalence yet). Raises FunctionCallException for a name that is
-    neither a group of the profile nor defined inline, and for an inline group
-    named like a group of the profile.
-    """
-    clashing = sorted(group.name for group in inline_groups(population, side)
-                      if kg_profile.has_group(group.name))
-    if clashing:
-        raise FunctionCallException(
-            f"Groups defined inline must have new names; already groups of {kg_profile.kg_name}: {clashing}")
-
-    names: set[str] = set()
-    for group_ref in group_refs_of_side(population, side):
-        if isinstance(group_ref, GroupDefinition):
-            names.add(group_ref.name)
-        elif group_ref == POPULATION_REST:
-            names |= set(kg_profile.group_names()) - set(kg_profile.excluded_group_names())
-        elif kg_profile.has_group(group_ref):
-            names.add(group_ref)
-        else:
-            raise FunctionCallException(
-                f"{group_ref} is not a group of {kg_profile.kg_name}; groups: {kg_profile.group_names()}, "
-                f"or {POPULATION_REST!r} for all of them, or define a group inline")
-    return names
-
-
-def generate_group_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """
-    The groups whose values are retrieved for one side: in a small KG all groups of
-    the profile and the inline groups (all are needed to count rivals outside the
-    population by group), without the entities of excluded groups.
-    """
-    return profile_groups_to_grouping(kg_profile, inline_groups(population, side))
-
-
-def generate_population_groups_grouping(kg_profile: KgProfile, population: Population, side: Side) -> Grouping:
-    """
-    The groups of one side's population only 
-    (no rivals), without the entities
-    of excluded groups.
-    """
-    all_groups = profile_groups_to_grouping(kg_profile, inline_groups(population, side))
-    group_names = population_group_names(kg_profile, population, side)
-    return Grouping(
-        tuple(member for member in all_groups.members if member[0] in group_names),
-        exclusive=False, minus=all_groups.minus,
-    )
-
-
-def in_population(pair: tuple[IRI, IRI], population_by_side: dict[Side, frozenset[IRI]]) -> bool:
-    """Both entities of a (source, target) pair are in their side's population."""
-    return pair[0] in population_by_side[Side.SOURCE] and pair[1] in population_by_side[Side.TARGET]
-
-
-def retrieve_side_population(
-        manager: KgManager,
-        kg_profile: KgProfile,
-        population: Population,
-        side: Side,
-        leave_out_entities: Collection[IRI] = ()
-) -> frozenset[IRI]:
-    """
-    The entities of one side's population, each once (also those without any
-    value of the strategy: the denominator of the signals), without the
-    leave_out_entities (those with an equivalence: they get no candidates).
-    """
-    groups_by_entity = retrieve_groups_by_entity(
-        manager,
-        generate_population_groups_grouping(kg_profile, population, side),
-        kg_profile.entity_space
-        )
-    return frozenset(groups_by_entity) - frozenset(leave_out_entities)
-
-
-# trial runs: the most entities of the larger population that are compared, per
-# vectorizer (in a small KG the key strategy is cheap and runs on the whole population)
-TRIAL_ENTITY_LIMITS: dict[Vectorizer, int] = {
-    "idf_char_3grams": 5000,
-    "embedding": 5_000,
-}
-
-
-@dataclass(frozen=True)
-class EntitySample:
-    """
-    The entities of one side's population that a trial run compares; the
-    other side is compared whole.
-    """
-    side: Side
-    entities: frozenset[IRI]
-
-
-def trial_entity_limit(strategy: CandidateStrategy) -> int | None:
-    """The trial limit of a strategy; None: no sampling."""
-    if isinstance(strategy, VectorStrategy):
-        return TRIAL_ENTITY_LIMITS.get(strategy.vectorizer)
-    return None
-
-
-def choose_sampled_side(population_sizes: dict[Side, int], limit: int | None) -> Side | None:
-    """The side to sample in a trial run: the one with the larger population, if it is above the limit (the source on equal
-    sizes); None: compare both whole."""
-    larger_side = max(SIDES, key=lambda side: population_sizes[side])  # first maximum: the source
-    if limit is None or population_sizes[larger_side] <= limit:
-        return None
-    return larger_side
-
-
-def sample_position(entity: IRI, seed: int) -> float:
-    """The fixed position of an entity in [0, 1) for a seed: a stable hash of
-    both (not Python's hash, which changes between processes), so it is the
-    same in every run and every population."""
-    digest = hashlib.blake2b(f"{seed}|{entity}".encode(), digest_size=8).digest()
-    return int.from_bytes(digest) / 2**64
-
-
-def draw_entity_sample(entities: Iterable[IRI], size: int, seed: int) -> frozenset[IRI]:
-    """
-    A random sample of about `size` entities: those whose sample position
-    lies below the share size / number of entities. Consistent across runs:
-    the same entities and seed give the same sample, and of two populations
-    an entity in both is in both samples if it is in the one with the smaller
-    share (nested samples, the most overlap two samples can have).
-    """
-    distinct_entities = set(entities)
-    if not distinct_entities:
-        return frozenset()
-    sampling_share = size / len(distinct_entities)
-    return frozenset(entity for entity in distinct_entities if sample_position(entity, seed) < sampling_share)
-
-
-def draw_trial_sample(
-        generator: Generator,
-        populations_by_side: dict[Side, frozenset[IRI]],
-        seed: int,
-        ) -> EntitySample | None:
-    """
-    The sample of a trial run (see the module docstring); None: no sampling
-    needed. populations_by_side: the populations, already without the
-    entities that have an equivalence.
-    """
-    limit = trial_entity_limit(generator.strategy)
-    side = choose_sampled_side(
-        {side: len(population) for side, population in populations_by_side.items()},
-        limit
-        )
-    if side is None or limit is None:
-        return None
-    population = populations_by_side[side]
-    return EntitySample(
-        side=side,
-        entities=draw_entity_sample(population, min(limit, len(population)), seed)
-        )
-
-
 def check_value_pattern_source(
         value_pattern_source: ValuePatternSource, kg_profile: KgProfile
         ):
     """
     A name in the value source is a role, a structure relation or relation
     kind of the profile, or a path of them (each step checked), and has a
-    pattern there: a role that is not set, or a kind without a relation, gives
-    no values. Checked before querying, for a message the LLM can act on.
+    pattern there, in the KG-wide roles or in the effective roles of a group:
+    a role that is set nowhere, or a kind without a relation, gives no values.
+    Checked before querying, for a message the LLM can act on.
     """
     if not isinstance(value_pattern_source, str):
         return  # an own pattern
-    try:
-        pattern = kg_profile.roles.predicate_pattern_by_name(value_pattern_source)
-    except ValueError as error:
-        raise FunctionCallException(f"{kg_profile.kg_name}: {error}") from error
-    if pattern is None:
+
+    patterns, errors = [], []
+    for roles in kg_profile.get_effective_roles_of_all_groups():
+        try:
+            patterns.append(roles.predicate_pattern_by_name(value_pattern_source))
+        # a relation that only some groups define
+        except ValueError as error:
+            errors.append(error)
+
+    if not patterns:
         raise FunctionCallException(
-            f"{kg_profile.kg_name}: {value_pattern_source!r} gives no values: a role in it is not set in the "
-            "profile, or the profile has no structure relation of a kind in it")
+            f"{kg_profile.kg_name}: {errors[0]}"
+            ) from errors[0]
+
+    if all(pattern is None for pattern in patterns):
+        raise FunctionCallException(
+            f"{kg_profile.kg_name}: {value_pattern_source!r} gives no values: a role in it is set neither "
+            "KG-wide nor in a group of the profile, or the profile has no structure relation of a kind in it")
 
 
-def retrieve_strategy_value_rows(
-        manager: KgManager,
-        kg_profile: KgProfile,
-        generator: Generator,
-        side: Side,
-        entity_sample: EntitySample | None = None,
-        object_iris: Collection[IRI] | None = None,
-        alternative_value_pattern_source: ValuePatternSource | None = None
-        ) -> Iterator[ValueRow]:
-    """
-    The values a strategy compares on one side (its value_pattern_source: roles,
-    or the structure relations of a neighbour strategy): of the entities of all
-    groups (rivals outside the population included); on a sampled side only
-    those of the sampled entities. object_iris: only values among these (a
-    neighbour strategy: the entities of the witnesses).
-    alternative_value_pattern_source: these values instead of the strategy's
-    (a key run on a name role: the other name roles, for its rivals).
-    """
-    value_pattern_source = (
-        alternative_value_pattern_source if alternative_value_pattern_source is not None
-        else generator.strategy.value_pattern_source(side)
-        )
-    check_value_pattern_source(value_pattern_source, kg_profile)
-    side_sample = entity_sample if entity_sample is not None and entity_sample.side == side else None
-    value_rows = retrieve_value_rows(
-        manager,
-        generate_group_grouping(kg_profile, generator.population, side),
-        kg_profile.entity_space,
-        value_pattern_source,
-        kg_profile.roles,
-        object_iris,
-    )
-    if side_sample is None:
-        return value_rows
-    return (row for row in value_rows if row.entity in side_sample.entities)
-
-
-def retrieve_partition_names(
-        managers: dict[Side, KgManager],
-        alignment_state: AlignmentState,
-        ) -> dict[Side, dict[IRI, str]]:
-    """The partition of every entity, per side. Depends only on the profiles, so it
-    is retrieved once per run and reused by every strategy."""
-    partition_names_by_entity = {}
-    for side in SIDES:
-        kg_profile = alignment_state.get_kg_profile(side)
-        partition_names_by_entity[side] = retrieve_partitions_by_entity(
-            managers[side], kg_profile, kg_profile.entity_space)
-    return partition_names_by_entity
-
-# TODO:
-# ------------------------------------------------------------------
-# From here functions really belong in this file
-# ------------------------------------------------------------------
 
 
 CANDIDATE_BUDGET_PER_ENTITY = 30
@@ -461,15 +250,17 @@ def get_key_candidates(
         group_names_by_side[side] = population_group_names(
             kg_profile, generator.population, side
             )
+        # the projection must give values
+        check_value_pattern_source(strategy.values.by_side(side), kg_profile)
         if retrieve_all_name_roles:
-            # the projection must give values; the rivals come from every name role that is set
-            check_value_pattern_source(strategy.values.by_side(side), kg_profile)
+            # the rivals come from every name role that is set
             value_rows = chain.from_iterable(
                 retrieve_strategy_value_rows(
                     managers[side], kg_profile, generator,
                     side, entity_sample, alternative_value_pattern_source=role)
                 for role in sorted(NAME_ROLES)
-                if kg_profile.roles.predicate_pattern_by_name(role) is not None
+                if any(roles.predicate_pattern_by_name(role) is not None
+                       for roles in kg_profile.get_effective_roles_of_all_groups())
             )
         else:
             value_rows = retrieve_strategy_value_rows(
@@ -583,6 +374,7 @@ def get_vector_candidates(
     for side in SIDES:
         kg_profile = alignment_state.get_kg_profile(side)
         group_names_by_side[side] = population_group_names(kg_profile, generator.population, side)
+        check_value_pattern_source(generator.strategy.value_pattern_source(side), kg_profile)
         value_rows = retrieve_strategy_value_rows(managers[side], kg_profile, generator, side, entity_sample)
         # exactly one level: words (string_normalization above)
         (index_by_side[side],) = build_side_indices(
@@ -656,6 +448,7 @@ def get_neighbour_candidates(
         group_names_by_side[side] = population_group_names(
             kg_profile, generator.population, side
             )
+        check_value_pattern_source(generator.strategy.value_pattern_source(side), kg_profile)
         value_rows = retrieve_strategy_value_rows(
             managers[side], kg_profile, generator,
             side, entity_sample, witnesses_by_entity[side].keys()
