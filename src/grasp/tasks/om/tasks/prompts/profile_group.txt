@@ -9,6 +9,8 @@ Your task:
 
 Your changes apply to this group only. If an element is wrong for the whole knowledge graph, report it with __RAISE_FLAG__ on the roles stage.
 
+__ROLE_FUNCTIONS__
+
 Steps:
 1. Read the roles and the statistics; inspect a few typical entities of the group with all their predicates.
 2. Test additions with __TRY_PATTERN__, then change the roles with __EDIT_ROLE__, __SET_STRUCTURE_RELATION__ and __REMOVE_STRUCTURE_RELATION__.

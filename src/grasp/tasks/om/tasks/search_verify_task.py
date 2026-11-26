@@ -9,7 +9,8 @@ The variant (CandidateJudgeVariant) decides how the unit is shown: focused
 (the focus entities are named, each with its list) or clusters (two lists of
 entities, the focus not named), with or without the signals of the candidates
 (what each strategy found for the pair, bundled by strategy, strongest first),
-in rank order or shuffled. The judge sees the evidence of the strategies, never the
+in rank order or shuffled, with or without the profiles of both knowledge
+graphs. The judge sees the evidence of the strategies, never the
 decisions of other judges.
 
 set_equivalence checks that both entities exist (know_before_use), lie in the
@@ -58,6 +59,7 @@ from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
 from grasp.tasks.om.tasks.task_input import managers_by_side
+from grasp.tasks.om.tasks.verify_task import describe_knowledge_graphs
 from grasp.utils import FunctionCallException, format_section
 
 SIDES = (Side.SOURCE, Side.TARGET)
@@ -558,9 +560,10 @@ class SearchVerifyTask(GraspTask):
                 self.known.add(entity)
                 if entity in display.contexts_by_entity:
                     self.known.update(display.shown_iris(entity))
-        if state.variant.presentation == "focused":
-            return focused_input(state)
-        return clusters_input(state)
+        unit_input = focused_input(state) if state.variant.presentation == "focused" else clusters_input(state)
+        if not state.variant.profiles:
+            return unit_input
+        return format_display_content(describe_knowledge_graphs(state.entity_displays)) + "\n\n" + unit_input
 
     def system_information(self) -> str:
         info = fill_function_name_placeholders(

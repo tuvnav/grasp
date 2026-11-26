@@ -18,13 +18,13 @@ import random
 from typing import Literal
 
 from grasp.tasks.om.data_models.candidates import (
-    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
+    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, CandidateStrategyType, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
     EntityCandidates,
-    Candidate, StrategyResult, StrategySignals, Stratum, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
+    Candidate, CandidateStrategy, StrategyResult, StrategySignals, Stratum, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
 
     )
 from grasp.tasks.om.data_models.verification import GetCandidateLayersOf, GetCandidateSignalsOf, FocusEntity, JudgingUnit, ListedCandidate
-from grasp.tasks.om.foundation.text_normalization import NormalizationLevel, normalization_level_order, words
+from grasp.tasks.om.foundation.text_normalization import EXTENDED_LEVELS, NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
 
@@ -374,11 +374,53 @@ def cut_pareto_layers_by_budget(
     return new_index, too_ambiguous_entities
 
 
+def is_exact(signal: MatchSignal) -> bool:
+    """
+    Exact evidence: a key on a standard normalization level, equal texts of a
+    vector match, a witness that no other entities share.
+    """
+    match signal:
+        case KeyMatchSignal():
+            return signal.level not in EXTENDED_LEVELS
+        case VectorMatchSignal():
+            return signal.texts[0] == signal.texts[1]
+        case NeighboursMatchSignal():
+            return signal.bucket_size == (1, 1)
+
+
+def comparison_method(strategy: CandidateStrategy) -> str:
+    """How a run compares: 'key', 'neighbours' or, for a vector run, its vectorizer."""
+    return strategy.vectorizer if isinstance(strategy, VectorStrategy) else strategy.kind
+
+
+def family_strength(
+        run_ids: Sequence[str], signals_by_run: dict[str, list[MatchSignal]], comparison_method_by_run: dict[str, str]
+        ) -> str:
+    """
+    How strongly the runs of one family found a pair: exact if one of them gave
+    an exact match (is_exact); else fuzzy_confirmed if runs of several comparison
+    methods found it (e.g. character 3-grams and an embedding: they fail on
+    different pairs), fuzzy_unconfirmed if only one method did.
+    """
+    if any(is_exact(signal) for run_id in run_ids for signal in signals_by_run.get(run_id, [])):
+        return "exact"
+    if len({comparison_method_by_run[run_id] for run_id in run_ids}) > 1:
+        return "fuzzy_confirmed"
+    return "fuzzy_unconfirmed"
+
+
 def build_venn_index(
     pareto_index: ParetoIndex,
     candidate_rank_index: CandidateRankIndex,
-    run_ensemble: RunEnsemble
+    run_ensemble: RunEnsemble,
+    pair_signal_index: PairSignalIndex,
+    comparison_method_by_run: dict[str, str],
 ) -> VennIndex:
+    """
+    The pairs of the cut lists by their Venn cell: the families of the runs that
+    found them, each with its strength (family_strength), e.g.
+    {'names:exact', 'neighbours over subsumption:fuzzy_unconfirmed'}.
+    """
 
     venn_index: VennIndex = {}
     entity_pairs: set[tuple[IRI, IRI]] = set()
@@ -401,9 +443,16 @@ def build_venn_index(
             ).get(source_entity, {}).keys()
         all_evidence_runs = runs_finding_source_to_target | runs_finding_target_to_source
 
-        run_families = frozenset(run_ensemble.family(run) for run in all_evidence_runs)
+        run_ids_by_family: dict[str, list[str]] = defaultdict(list)
+        for run_id in all_evidence_runs:
+            run_ids_by_family[run_ensemble.family(run_id)].append(run_id)
+        signals_by_run = pair_signal_index.get((source_entity, target_entity), {})
+        venn_cell = frozenset(
+            f"{family}:{family_strength(run_ids, signals_by_run, comparison_method_by_run)}"
+            for family, run_ids in run_ids_by_family.items()
+            )
 
-        venn_index.setdefault(run_families, []).append((source_entity, target_entity))
+        venn_index.setdefault(venn_cell, []).append((source_entity, target_entity))
 
     return venn_index
 
@@ -438,31 +487,35 @@ def evaluable_entities(
 def merge_candidate_runs(
         run_ensemble: RunEnsemble,
         strategy_results_by_run: dict[str, StrategyResult],
+        comparison_method_by_run: dict[str, str],
         budget: int,
         max_first_sublayer_size: int,
         ) -> MergedCandidates:
     """
     The candidate lists of the ensemble per entity: Pareto layers of the generate
     runs, sublayers by the corroborate runs, cut by the budget; the Venn index
-    of the pairs in the cut lists; and the entities on which the merge can be
-    evaluated.
+    of the pairs in the cut lists (comparison_method_by_run: see comparison_method);
+    and the entities on which the merge can be evaluated.
     """
     candidate_rank_index = build_candidate_rank_index(run_ensemble, strategy_results_by_run)
     uncut_pareto_index = build_pareto_index(candidate_rank_index, run_ensemble)
     cut_pareto_index, too_ambiguous_entities = cut_pareto_layers_by_budget(
         uncut_pareto_index, budget, max_first_sublayer_size
         )
+    pair_signal_index = build_pair_signal_index(run_ensemble, strategy_results_by_run)
     return MergedCandidates(
         run_ensemble=run_ensemble,
         candidate_rank_index=candidate_rank_index,
         uncut_pareto_layers_by_entity=uncut_pareto_index,
         pareto_layers_by_entity=cut_pareto_index,
-        venn_index=build_venn_index(cut_pareto_index, candidate_rank_index, run_ensemble),
+        venn_index=build_venn_index(
+            cut_pareto_index, candidate_rank_index, run_ensemble, pair_signal_index, comparison_method_by_run
+            ),
         too_ambiguous_entities=frozenset(too_ambiguous_entities),
         evaluable_entities={
             side: evaluable_entities(run_ensemble, strategy_results_by_run, side) for side in SIDES
             },
-        pair_signal_index=build_pair_signal_index(run_ensemble, strategy_results_by_run)
+        pair_signal_index=pair_signal_index
         )
 
 
@@ -585,6 +638,56 @@ def strata_of(venn_index: VennIndex) -> list[Stratum]:
         ],
         key=lambda stratum: len(stratum.pairs)
         )
+
+
+def families_of_values(
+        run_ensemble: RunEnsemble, runs: dict[str, tuple[Generator, StrategyResult]]
+        ) -> dict[str, str]:
+    """
+    The family of each run by its values: runs on the same value projection
+    share one, whatever their kind of comparison, named by the role names
+    ('names', 'names~synonyms'), with 'neighbours over' for neighbour runs, or,
+    for own patterns, after the first run on them.
+    """
+    family_by_own_values: dict[str, str] = {}
+    family_by_run: dict[str, str] = {}
+    for run_id in run_ensemble.run_ids():
+        strategy = runs[run_id][0].strategy
+        source, target = (strategy.values.by_side(side) for side in (Side.SOURCE, Side.TARGET))
+        if isinstance(source, str) and isinstance(target, str):
+            values = source if source == target else f"{source}~{target}"
+        else:
+            own_values = "~".join(
+                value_source if isinstance(value_source, str) else value_source.model_dump_json()
+                for value_source in (source, target)
+                )
+            values = family_by_own_values.setdefault(own_values, run_id)
+        family_by_run[run_id] = (
+            f"neighbours over {values}" if strategy.kind == CandidateStrategyType.NEIGHBOURS else values
+            )
+    return family_by_run
+
+
+def join_families(run_ensemble: RunEnsemble, runs: dict[str, tuple[Generator, StrategyResult]]) -> RunEnsemble:
+    """
+    The ensemble with the families of the candidate stage: runs on the same
+    values are one family (families_of_values); runs on different values that
+    the LLM gave one family name join theirs under that name (e.g. an own
+    pattern and a preset role on mostly the same values). The LLM can join
+    families, not split them: a name given only to runs on the same values
+    changes nothing.
+    """
+    family_by_run = families_of_values(run_ensemble, runs)
+    for named_family in sorted({run.family for run in run_ensemble.runs if run.family}):
+        joined = {family_by_run[run.run_id] for run in run_ensemble.runs if run.family == named_family}
+        if len(joined) < 2:
+            continue
+        family_by_run = {
+            run_id: named_family if family in joined else family for run_id, family in family_by_run.items()
+            }
+    return run_ensemble.model_copy(update={"runs": [
+        run.model_copy(update={"family": family_by_run[run.run_id]}) for run in run_ensemble.runs
+        ]})
 
 
 def build_verification_strata(
@@ -908,11 +1011,11 @@ def build_pair_signal_index(
         ensemble: RunEnsemble, strategy_results_by_run: dict[str, StrategyResult]
         ) -> PairSignalIndex:
     """
-    The matches of every pair the 'generate' runs of the ensemble selected, per
-    run; a pair selected from both sides is collected once.
+    The matches of every pair the runs of the ensemble selected, per run; a
+    pair selected from both sides is collected once.
     """
     index: PairSignalIndex = {}
-    for run_id in ensemble.run_ids("generate"):
+    for run_id in ensemble.run_ids():
         for (side, entity), selected_candidates in strategy_results_by_run[run_id].selected.items():
             for candidate in selected_candidates.selected_candidates:
                 pair = to_source_target_pair(side, entity, candidate.candidate_entity)

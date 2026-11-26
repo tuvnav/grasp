@@ -1,0 +1,18 @@
+What the roles are used for (set them by their consequences):
+- names: preferred names. Wherever an entity is shown (to you, to the matching strategies and to the judges), its first name is its label; without a name it is shown by its IRI. Names are the default values that anchor and candidate strategies compare, and the first lexical evidence of the judges. An identifier put into names gives matches that look exact but are meaningless.
+- synonyms: alternative names. Shown with the entity and compared by the strategies, alone or against names. Put only true alternative names here: broader, narrower or related terms make entities look equivalent that are not.
+- definitions: textual definitions or descriptions. Shown to the judges to decide what an entity means; strategies can compare them. Editorial notes or change logs here mislead the judges.
+- codes: identifiers of the entity in its own system (notations, IDs). Shown with the entity, they tell apart entities with the same name; they are rarely compared, since the other knowledge graph usually uses another system.
+- cross_references: codes or IRIs of the entity in other systems. If both knowledge graphs refer to the same external system, these are evidence independent of the names.
+- noise: hidden from every display of an entity and never compared. Use it for values that only distract (formatting, provenance, media files), never for names or structure.
+- predicates without a role: still shown as further edges of an entity, but no strategy compares them unless they are named in an own pattern, and they have no logical meaning.
+- structure relations between entities, each with a name, a kind, its algebra and a predicate pattern: shown with every entity in both directions (?s to ?o and the inverse), a symmetric one only once. Neighbour strategies propagate over them: a pair of entities is supported when their neighbours over the same kind of relation are already matched. Their kind and algebra decide which logical consequences of an equivalence are checked and repaired:
+  - subsumption: the hierarchy. An equivalence implies relations between the sub- and superclasses of both entities; cycles are conflicts.
+  - membership: an instance and its class (classes are ?o).
+  - partonomy: parts; used as neighbours, no logical consequences for an equivalence.
+  - disjointness: two disjoint entities cannot both be equivalent to the same entity; such equivalences are conflicts.
+  - other: shown and used as neighbours, no logical consequences.
+  - transitive: chains are followed (A below B below C, so A below C); set it only if it holds (skos:broader is not transitive).
+  - symmetric: both directions mean the same.
+  - inverse_of: only for two relations that cannot be written as one with ^.
+  A relation with the wrong kind costs both ways: a loose "related to" as subsumption creates a false hierarchy and false conflicts; a real hierarchy left as other loses the propagation over the hierarchy and the logical checks.

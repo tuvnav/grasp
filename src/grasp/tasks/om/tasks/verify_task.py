@@ -199,6 +199,9 @@ def function_definitions(function_names: list[VerifyFunction]) -> list[dict]:
                     {
                         "name": VerifyFunction.STOP,
                         "description": "Finish the task after you have established your decision.",
+                        # some APIs (Mistral) require parameters; an empty object
+                        # schema makes some vllm models generate endlessly (cea.py)
+                        "parameters": {},
                     }
                 )
             case VerifyFunction.SET_VERDICT:
@@ -362,25 +365,25 @@ def input_instructions(
         )
     if not state.profiles:
         return entities_text
-    return format_display_content(
-        Section(
-            "Knowledge graphs",
-            subsections=[
-                describe_knowledge_graph(state, side)
-                for side in (Side.SOURCE, Side.TARGET)
-                ]
-        )
-        ) + "\n\n" + entities_text
+    return format_display_content(describe_knowledge_graphs(state.entity_displays)) + "\n\n" + entities_text
 
 
-def describe_knowledge_graph(state: VerifyState, side: Side) -> Section:
+def describe_knowledge_graph(display: EntityDisplay, side: Side) -> Section:
     """The knowledge graph of a side with its description and profile (with findings)."""
-    display = state.entity_displays[side]
     profile = describe_profile(display.kg_profile, findings=True)
     return Section(
         f"{display.manager.kg} ({side})",
         [display.manager.description or "", *profile.content],
         profile.subsections,
+        )
+
+
+def describe_knowledge_graphs(entity_displays: dict[Side, EntityDisplay]) -> Section:
+    """Both knowledge graphs with their profiles, for a judge (JudgeVariant.profiles,
+    CandidateJudgeVariant.profiles)."""
+    return Section(
+        "Knowledge graphs",
+        subsections=[describe_knowledge_graph(entity_displays[side], side) for side in (Side.SOURCE, Side.TARGET)],
         )
 
 

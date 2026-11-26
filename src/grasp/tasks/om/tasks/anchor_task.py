@@ -68,6 +68,7 @@ from grasp.tasks.om.tasks.candidate_task import (
     format_hubs,
     format_share,
     format_start_message,
+    parse_run_ensemble,
     prefetch_shown_entities,
     reselect_result,
     retrieve_partition_names,
@@ -561,17 +562,6 @@ def anchor_function_definitions() -> list[dict]:
     ]
 
 
-def parse_anchor_ensemble(state: CandidateTaskState, runs: Any) -> RunEnsemble:
-    try:
-        run_ensemble = RunEnsemble.model_validate({"runs": runs})
-    except ValidationError as error:
-        raise FunctionCallException(f"Invalid runs: {format_validation_error(error)}") from error
-    unknown_run_ids = [run_id for run_id in run_ensemble.run_ids() if run_id not in state.runs]
-    if unknown_run_ids:
-        raise FunctionCallException(f"Unknown run ids {unknown_run_ids}; existing runs: {list(state.runs)}")
-    return run_ensemble
-
-
 def try_anchor_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     generator = anchor_generator(fn_args)
     try:
@@ -607,7 +597,7 @@ def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
 
 
 def evaluate_anchor_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
-    run_ensemble = parse_anchor_ensemble(state, fn_args.get("runs"))
+    run_ensemble = parse_run_ensemble(state, fn_args.get("runs"))
     return format_display_content(Section(
         "Ensemble " + ", ".join(run_ensemble.run_ids()),
         format_anchor_merge(merge_anchors(run_ensemble, state.runs), state.entity_displays),
@@ -621,7 +611,7 @@ def finish(state: CandidateTaskState, fn_args: dict) -> str:
         raise FunctionCallException("runs must be a list of runs (it may be empty)")
     if not rationale:
         raise FunctionCallException("A rationale is required")
-    state.run_ensemble = parse_anchor_ensemble(state, runs) if runs else None
+    state.run_ensemble = parse_run_ensemble(state, runs) if runs else None
     state.rationale = rationale
     state.finished = True
     if state.run_ensemble is None:

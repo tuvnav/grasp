@@ -665,9 +665,11 @@ type VennIndex = dict[frozenset[str], list[tuple[IRI, IRI]]]
 class EnsembleRun(BaseModel):
     """
     A tried run in an ensemble of runs to merge. family: the kind of its
-    evidence, named by the LLM: runs of one family count as one source of
-    evidence for a pair (a Venn cell is a set of families), whatever their
-    roles; None: a family of its own.
+    evidence: runs of one family count as one source of evidence for a pair (a
+    Venn cell is a set of families), whatever their roles. Anchor stage: named
+    by the LLM, None: a family of its own; candidate stage: runs on the same
+    values are always one family, the LLM may join others
+    (kg_operations/candidate_selection.py: join_families).
     """
     model_config = ConfigDict(extra="forbid")
     run_id: str
@@ -848,7 +850,8 @@ class MergedCandidates:
     # corroborate runs; before and after the budget
     uncut_pareto_layers_by_entity: ParetoIndex
     pareto_layers_by_entity: ParetoIndex
-    # the pairs of the cut lists by the families of the runs that selected them
+    # the pairs of the cut lists by the families of the runs that selected them,
+    # each with its strength (e.g. 'names:exact'; build_venn_index)
     venn_index: VennIndex
     # entities whose first sublayer is larger than allowed: no list
     too_ambiguous_entities: frozenset[EntityKey]
@@ -883,8 +886,9 @@ class EnsembleEvaluation:
 
 class Stratum(BaseModel):
     """
-    The pairs of one Venn cell: found by exactly these run families; label: a
-    further division of the cell (anchors: e.g. head or specific), empty if none.
+    The pairs of one Venn cell: found by exactly these run families (candidate
+    stage: each with its strength, e.g. 'names:exact'); label: a further
+    division of the cell (anchors: e.g. head or specific), empty if none.
     """
     families: frozenset[str]
     pairs: list[tuple[IRI, IRI]]

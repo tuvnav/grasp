@@ -43,6 +43,15 @@ def fill_function_name_placeholders(text: str, function_names: type[StrEnum]) ->
 
 
 EQUIVALENCE_PLACEHOLDER = "__EQUIVALENCE_CONDITION__"
+ROLE_FUNCTIONS_PLACEHOLDER = "__ROLE_FUNCTIONS__"
+
+
+def add_role_functions(text: str) -> str:
+    """
+    Puts what the profile roles are used for (profile_role_functions.txt) at
+    its placeholder, in the prompts of the stages that edit roles.
+    """
+    return text.replace(ROLE_FUNCTIONS_PLACEHOLDER, load_prompt("profile_role_functions.txt"))
 
 
 def add_equivalence_condition(text: str, config: GraspConfig) -> str:

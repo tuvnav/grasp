@@ -107,7 +107,7 @@ from grasp.tasks.om.sparql_access import (
     retrieve_values,
 )
 from grasp.tasks.om.tasks.prompting import (
-    BLANK_NODE_RULE, fill_function_name_placeholders, format_validation_error, inline_schema, load_prompt,
+    BLANK_NODE_RULE, add_role_functions, fill_function_name_placeholders, format_validation_error, inline_schema, load_prompt,
     )
 from grasp.utils import FunctionCallException, format_section
 
@@ -1931,7 +1931,8 @@ class ProfileStageTask(GraspTask):
 
     def system_information(self) -> str:
         info = fill_function_name_placeholders(
-            load_prompt("profile_common.txt") + "\n\n" + load_prompt(self.prompt_file), ProfileFunctionName
+            load_prompt("profile_common.txt") + "\n\n" + add_role_functions(load_prompt(self.prompt_file)),
+            ProfileFunctionName
             )
         task_instructions = load_task_instructions(self.config)
         if task_instructions:

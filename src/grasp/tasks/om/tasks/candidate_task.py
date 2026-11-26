@@ -100,7 +100,8 @@ from grasp.tasks.om.foundation.text_normalization import (
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    NAME_ROLES, compares_names, evaluate_merged_candidates, filter_informative_matches, flatten_layers, merge_candidate_runs,
+    NAME_ROLES, comparison_method, compares_names, evaluate_merged_candidates, filter_informative_matches, flatten_layers, join_families,
+    merge_candidate_runs,
     select_candidates, summarize_candidate_selection,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
@@ -827,6 +828,7 @@ def run_full_ensemble(
     return merge_candidate_runs(
         run_ensemble,
         strategy_results_by_run,
+        {run_id: comparison_method(generators_by_run[run_id].strategy) for run_id in run_ensemble.run_ids()},
         CANDIDATE_BUDGET_PER_ENTITY,
         MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER
         )
@@ -971,10 +973,11 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
     Merges the candidate lists of tried runs and shows the merge on the
     entities where it equals a merge of full runs.
     """
-    run_ensemble = parse_run_ensemble(state, fn_args.get("runs"))
+    run_ensemble = join_families(parse_run_ensemble(state, fn_args.get("runs")), state.runs)
     merged = merge_candidate_runs(
         run_ensemble,
         {run_id: result for run_id, (_, result) in state.runs.items()},
+        {run_id: comparison_method(generator.strategy) for run_id, (generator, _) in state.runs.items()},
         CANDIDATE_BUDGET_PER_ENTITY,
         MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
         )
@@ -1010,7 +1013,7 @@ def finish(state: CandidateTaskState, fn_args: dict) -> str:
         raise FunctionCallException("runs must be a list of runs (it may be empty)")
     if not rationale:
         raise FunctionCallException("A rationale is required")
-    state.run_ensemble = parse_run_ensemble(state, runs) if runs else None
+    state.run_ensemble = join_families(parse_run_ensemble(state, runs), state.runs) if runs else None
     state.rationale = rationale
     state.finished = True
     if state.run_ensemble is None:
@@ -1591,7 +1594,7 @@ def format_ensemble_evaluation_of_side(
                 ]
             ))
         items.append(Item(
-            "pairs by the families of the runs that selected them (Venn cells)",
+            "pairs by the families of the runs that selected them, each with its strength (Venn cells)",
             [
                 Item(f"{format_venn_cell(cell)}: {num_pairs} pairs")
                 for cell, num_pairs in evaluation.pairs_by_cell
@@ -1877,8 +1880,7 @@ ENSEMBLE_RUNS_SCHEMA = {
     "description": "Tried runs whose candidate lists are merged per entity. The candidates of the generate "
                    "runs form the lists (a candidate ranked better than another in every generate run comes "
                    "first); corroborate runs add no candidates, they only order tied candidates. Runs of one "
-                   "family count as one kind of evidence when the pairs are grouped (e.g. two key runs on "
-                   "different groups).",
+                   "family count as one kind of evidence when the pairs are grouped.",
     "items": {
         "type": "object",
         "properties": {
@@ -1886,8 +1888,11 @@ ENSEMBLE_RUNS_SCHEMA = {
             "role": {"type": "string", "enum": list(get_args(RunRole.__value__)),
                      "description": "generate (default) or corroborate."},
             "family": {"type": "string",
-                       "description": "Name of the kind of evidence of the run; runs whose evidence is "
-                                      "alike (e.g. on the same names) share one family. Default: the run id."},
+                       "description": "Runs on the same values (the same value projection on both sides) "
+                                      "are always one family. Give runs on different values one family name "
+                                      "if their values mostly overlap, e.g. when a strategy projects by a "
+                                      "pattern you defined yourself instead of a preset role and its values "
+                                      "mostly coincide with those of another strategy."},
         },
         "required": ["run_id"],
     },
@@ -1952,7 +1957,8 @@ def candidate_functions() -> list[dict]:
                 f"Merges the candidate lists of tried runs per entity (at most {CANDIDATE_BUDGET_PER_ENTITY} "
                 f"candidates, more only if more than that are tied on the first rank) and shows the merge "
                 f"on the entities every run of their population compared: how many get a list, how long "
-                f"the lists are, the pairs per combination of families that selected them, and examples."
+                f"the lists are, the pairs per combination of families that selected them (each with its "
+                f"strength), and examples."
             ),
             "parameters": {"type": "object", "properties": {"runs": ENSEMBLE_RUNS_SCHEMA}, "required": ["runs"]},
         },

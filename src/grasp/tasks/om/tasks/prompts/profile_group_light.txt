@@ -10,6 +10,8 @@ Your main task is to find pitfalls for matching the entities of this group, and 
 
 Change roles only if you see a clear error, and check the local name type. If an element is wrong for the whole knowledge graph, report it with __RAISE_FLAG__ on the roles stage.
 
+__ROLE_FUNCTIONS__
+
 Steps:
 1. Read the roles and the statistics; inspect a few typical entities of the group.
 2. Measure the pitfalls you suspect with SPARQL queries.

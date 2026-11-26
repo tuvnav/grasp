@@ -13,6 +13,8 @@ You can change every part of the profile, with the functions of the stages:
 - partitions: __TEST_PARTITION__, __SET_PARTITION__, __REMOVE_PARTITION__, __SET_COMPETITION__
 - groups: __TEST_GROUP__, __SET_GROUP__, __EXCLUDE_GROUP__, __REMOVE_GROUP__, __SET_LOCAL_NAME_TYPE__
 - roles: __SHOW_ROLES__, __TRY_PATTERN__, __EDIT_ROLE__, __SET_STRUCTURE_RELATION__, __REMOVE_STRUCTURE_RELATION__. Without group they work on the KG-wide roles; with group on that group only, which then deviates from the KG-wide roles. If an element is wrong for the whole knowledge graph, change it KG-wide; if it is wrong in one group only, change it for that group.
+__ROLE_FUNCTIONS__
+
 The parts depend on each other, and the profile keeps them consistent: after a change of the entity space everything is counted again, after a change of the partitions the coverage of the KG-wide roles, after a change of the groups or of the KG-wide roles the roles of the groups (a group keeps its own deviations).
 
 Correct what a flag points to, with the smallest change that fixes it; do not redo a stage. Change the entity space or the partitions only if a flag shows they are wrong, since all other parts build on them.

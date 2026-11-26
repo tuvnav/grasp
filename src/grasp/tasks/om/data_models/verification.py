@@ -215,6 +215,8 @@ class CandidateJudgeVariant(BaseModel):
     show_signals: bool = True      # the signals that ranked the candidates
     # pareto: the candidates in rank order; random: shuffled per unit (seeded by the unit)
     candidate_order: Literal["pareto", "random"] = "pareto"
+    # the judge sees the profiles of both knowledge graphs
+    profiles: bool = False
     max_steps: int = 20
 
     @property
@@ -223,6 +225,7 @@ class CandidateJudgeVariant(BaseModel):
             self.presentation,
             "signals" if self.show_signals else "no_signals",
             "ranked" if self.candidate_order == "pareto" else "shuffled",
+            *(["profiles"] if self.profiles else []),
             ])
 
 
