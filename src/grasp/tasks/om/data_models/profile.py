@@ -819,6 +819,13 @@ class KgProfile(BaseModel):
                 )
             ]
 
+    def is_role_set(self, role_name: str) -> bool:
+        """Whether a role or relation kind has a pattern KG-wide or in a group: it can give values."""
+        return any(
+            roles.predicate_pattern_by_name(role_name) is not None
+            for roles in self.get_effective_roles_of_all_groups()
+            )
+
     def competes(self, partition_a: str, partition_b: str) -> bool:
         """Whether entities of the two partitions of this KG compete with each other."""
         return all(pair.partitions() != {partition_a, partition_b} for pair in self.non_competing_pairs)

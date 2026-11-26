@@ -12,18 +12,21 @@ Order (select_<...>_candidates):
        selection.mutual
 """
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import math
 import random
 from typing import Literal
 
 from grasp.tasks.om.data_models.candidates import (
-    Anchor, AnchorMerge, AnchorSpecificity, CandidateRankIndex, CandidateStrategyType, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
+    Anchor, AnchorMerge, AnchorSpecificity, AnchorStageResult, CandidateRankIndex, FamilyRoundOutcome, CandidateStrategyKind, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
     EntityCandidates,
     Candidate, CandidateStrategy, StrategyResult, StrategySignals, Stratum, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
 
     )
-from grasp.tasks.om.data_models.verification import GetCandidateLayersOf, GetCandidateSignalsOf, FocusEntity, JudgingUnit, ListedCandidate
+from grasp.tasks.om.data_models.verification import (
+    CertificationResult, GetCandidateLayersOf, GetCandidateSignalsOf, FocusEntity, JudgingUnit, ListedCandidate,
+    UnitJudgment,
+)
 from grasp.tasks.om.foundation.text_normalization import EXTENDED_LEVELS, NormalizationLevel, normalization_level_order, words
 from grasp.tasks.om.foundation.types import IRI, SIDES, EntityKey, Side
 
@@ -388,25 +391,38 @@ def is_exact(signal: MatchSignal) -> bool:
             return signal.bucket_size == (1, 1)
 
 
-def comparison_method(strategy: CandidateStrategy) -> str:
-    """How a run compares: 'key', 'neighbours' or, for a vector run, its vectorizer."""
+def strategy_type(strategy: CandidateStrategy) -> str:
+    """
+    The strategy type of a run, finer than its kind: 'key', 'neighbours' or,
+    for a vector run, its vectorizer ('idf_char_3grams', 'embedding'); types
+    fail on different pairs.
+    """
     return strategy.vectorizer if isinstance(strategy, VectorStrategy) else strategy.kind
 
 
 def family_strength(
-        run_ids: Sequence[str], signals_by_run: dict[str, list[MatchSignal]], comparison_method_by_run: dict[str, str]
+        run_ids: Sequence[str], signals_by_run: dict[str, list[MatchSignal]], strategy_type_by_run: dict[str, str]
         ) -> str:
     """
     How strongly the runs of one family found a pair: exact if one of them gave
-    an exact match (is_exact); else fuzzy_confirmed if runs of several comparison
-    methods found it (e.g. character 3-grams and an embedding: they fail on
-    different pairs), fuzzy_unconfirmed if only one method did.
+    an exact match (is_exact); else several_types if runs of several strategy
+    types found it (strategy_type, e.g. idf_char_3grams and embedding: they fail
+    on different pairs), one_type if only one type did. STRENGTH_DESCRIPTIONS
+    says them in words.
     """
     if any(is_exact(signal) for run_id in run_ids for signal in signals_by_run.get(run_id, [])):
         return "exact"
-    if len({comparison_method_by_run[run_id] for run_id in run_ids}) > 1:
-        return "fuzzy_confirmed"
-    return "fuzzy_unconfirmed"
+    if len({strategy_type_by_run[run_id] for run_id in run_ids}) > 1:
+        return "several_types"
+    return "one_type"
+
+
+# the strengths of family_strength in words, for the LLM
+STRENGTH_DESCRIPTIONS = {
+    "exact": "exact matches",
+    "several_types": "matched by 2+ strategy types",
+    "one_type": "matched by 1 strategy type",
+}
 
 
 def build_venn_index(
@@ -414,12 +430,12 @@ def build_venn_index(
     candidate_rank_index: CandidateRankIndex,
     run_ensemble: RunEnsemble,
     pair_signal_index: PairSignalIndex,
-    comparison_method_by_run: dict[str, str],
+    strategy_type_by_run: dict[str, str],
 ) -> VennIndex:
     """
     The pairs of the cut lists by their Venn cell: the families of the runs that
     found them, each with its strength (family_strength), e.g.
-    {'names:exact', 'neighbours over subsumption:fuzzy_unconfirmed'}.
+    {'names:exact', 'neighbours over subsumption:one_type'}.
     """
 
     venn_index: VennIndex = {}
@@ -448,7 +464,7 @@ def build_venn_index(
             run_ids_by_family[run_ensemble.family(run_id)].append(run_id)
         signals_by_run = pair_signal_index.get((source_entity, target_entity), {})
         venn_cell = frozenset(
-            f"{family}:{family_strength(run_ids, signals_by_run, comparison_method_by_run)}"
+            f"{family}:{family_strength(run_ids, signals_by_run, strategy_type_by_run)}"
             for family, run_ids in run_ids_by_family.items()
             )
 
@@ -487,14 +503,14 @@ def evaluable_entities(
 def merge_candidate_runs(
         run_ensemble: RunEnsemble,
         strategy_results_by_run: dict[str, StrategyResult],
-        comparison_method_by_run: dict[str, str],
+        strategy_type_by_run: dict[str, str],
         budget: int,
         max_first_sublayer_size: int,
         ) -> MergedCandidates:
     """
     The candidate lists of the ensemble per entity: Pareto layers of the generate
     runs, sublayers by the corroborate runs, cut by the budget; the Venn index
-    of the pairs in the cut lists (comparison_method_by_run: see comparison_method);
+    of the pairs in the cut lists (strategy_type_by_run: see strategy_type);
     and the entities on which the merge can be evaluated.
     """
     candidate_rank_index = build_candidate_rank_index(run_ensemble, strategy_results_by_run)
@@ -509,7 +525,7 @@ def merge_candidate_runs(
         uncut_pareto_layers_by_entity=uncut_pareto_index,
         pareto_layers_by_entity=cut_pareto_index,
         venn_index=build_venn_index(
-            cut_pareto_index, candidate_rank_index, run_ensemble, pair_signal_index, comparison_method_by_run
+            cut_pareto_index, candidate_rank_index, run_ensemble, pair_signal_index, strategy_type_by_run
             ),
         too_ambiguous_entities=frozenset(too_ambiguous_entities),
         evaluable_entities={
@@ -663,7 +679,7 @@ def families_of_values(
                 )
             values = family_by_own_values.setdefault(own_values, run_id)
         family_by_run[run_id] = (
-            f"neighbours over {values}" if strategy.kind == CandidateStrategyType.NEIGHBOURS else values
+            f"neighbours over {values}" if strategy.kind == CandidateStrategyKind.NEIGHBOURS else values
             )
     return family_by_run
 
@@ -675,12 +691,20 @@ def join_families(run_ensemble: RunEnsemble, runs: dict[str, tuple[Generator, St
     the LLM gave one family name join theirs under that name (e.g. an own
     pattern and a preset role on mostly the same values). The LLM can join
     families, not split them: a name given only to runs on the same values
-    changes nothing.
+    splits nothing; it names their family if all its runs carry it (e.g. an
+    own pattern, which has no name of its own).
     """
     family_by_run = families_of_values(run_ensemble, runs)
     for named_family in sorted({run.family for run in run_ensemble.runs if run.family}):
         joined = {family_by_run[run.run_id] for run in run_ensemble.runs if run.family == named_family}
         if len(joined) < 2:
+            (value_family,) = joined
+            if all(run.family == named_family for run in run_ensemble.runs
+                   if family_by_run[run.run_id] == value_family):
+                family_by_run = {
+                    run_id: named_family if family == value_family else family
+                    for run_id, family in family_by_run.items()
+                    }
             continue
         family_by_run = {
             run_id: named_family if family in joined else family for run_id, family in family_by_run.items()
@@ -1064,3 +1088,94 @@ def run_signal_infos(
         normalization=strategy.normalization if isinstance(strategy, KeyStrategy) else None,
         vectorizer=strategy.vectorizer if isinstance(strategy, VectorStrategy) else None,
         witness_weighting=strategy.witness_weighting if isinstance(strategy, NeighbourStrategy) else None)
+
+
+# --- the strategy history: per family and round, what it contributed and how it fared ---
+
+def new_outcome(family: str, strategy_types: set[str], stage: str, round_number: int) -> FamilyRoundOutcome:
+    return FamilyRoundOutcome(
+        family=family, strategy_types=sorted(strategy_types), stage=stage, round=round_number,
+        pairs_by_strength={}, pairs_of_this_family_only=0, checked=0, rejected=0,
+        )
+
+
+def add_pairs(outcome: FamilyRoundOutcome, strength: str, number: int, of_this_family_only: bool) -> None:
+    outcome.pairs_by_strength[strength] = outcome.pairs_by_strength.get(strength, 0) + number
+    if of_this_family_only:
+        outcome.pairs_of_this_family_only += number
+
+
+def sorted_by_pairs(outcomes: Iterable[FamilyRoundOutcome]) -> list[FamilyRoundOutcome]:
+    return sorted(outcomes, key=lambda outcome: (-sum(outcome.pairs_by_strength.values()), outcome.family))
+
+
+def anchor_round_outcomes(
+        round_number: int, anchor_stage_result: AnchorStageResult, certification_result: CertificationResult
+        ) -> list[FamilyRoundOutcome]:
+    """
+    Per strategy family of an anchor round: the anchors of its certification
+    strata (all exact, but on a coarse normalization level: one_type), those
+    of strata it alone found, and the verdicts the stop rule counted. The
+    families follow the rule of the candidate stage (join_families: one per
+    value source), whatever the anchor stage named; a stratum of several
+    families counts for each.
+    """
+    ensemble = anchor_stage_result.run_ensemble
+    if ensemble is None:
+        return []
+    generators = {run_id: (tried_run.generator, None) for run_id, tried_run in anchor_stage_result.runs.items()}
+    joined = join_families(ensemble, generators)
+    value_family_by_anchor_family = {run.family_name: joined.family(run.run_id) for run in ensemble.runs}
+    outcomes: dict[str, FamilyRoundOutcome] = {}
+    for family in set(value_family_by_anchor_family.values()):
+        strategy_types = {strategy_type(generators[run.run_id][0].strategy) for run in joined.runs if run.family == family}
+        outcomes[family] = new_outcome(family, strategy_types, "anchors", round_number)
+    for stratum in certification_result.strata:
+        decision = stratum.decision
+        anchor_families, _, label = decision.stratum.partition("/")
+        families = {value_family_by_anchor_family[name] for name in anchor_families.split("+")}
+        strength = "one_type" if "extended" in label else "exact"
+        for family in families:
+            outcome = outcomes[family]
+            add_pairs(outcome, strength, decision.size, len(families) == 1)
+            outcome.checked += decision.counted
+            outcome.rejected += decision.rejects
+    return sorted_by_pairs(outcomes.values())
+
+
+def candidate_round_outcomes(
+        round_number: int, merged_candidates: MergedCandidates,
+        strategy_type_by_run: dict[str, str], unit_judgments: Sequence[UnitJudgment]
+        ) -> list[FamilyRoundOutcome]:
+    """
+    Per strategy family of a candidate round: the pairs of the cut lists by
+    their strength in the family (the Venn cells), those it alone found, the
+    pairs of a judged unit's lists (checked) and of them those no judge set
+    (rejected). A pair of several families counts for each.
+    """
+    ensemble = merged_candidates.run_ensemble
+    outcomes = {
+        family: new_outcome(
+            family, {strategy_type_by_run[run.run_id] for run in ensemble.runs if run.family_name == family},
+            "candidates", round_number)
+        for family in {run.family_name for run in ensemble.runs}
+        }
+    venn_cell_by_pair = families_by_pair(merged_candidates.venn_index)
+    accepted = {tuple(pair) for judgment in unit_judgments for pair in judgment.equivalences}
+    checked = {
+        pair
+        for judgment in unit_judgments if judgment.error is None
+        for focus in judgment.unit.focus
+        for candidate in focus.candidates
+        if (pair := to_source_target_pair(Side(focus.side), focus.entity, candidate.entity)) in venn_cell_by_pair
+        }
+    for pair, venn_cell in venn_cell_by_pair.items():
+        families = {element.rsplit(":", 1)[0] for element in venn_cell}
+        for element in venn_cell:
+            family, strength = element.rsplit(":", 1)
+            outcome = outcomes[family]
+            add_pairs(outcome, strength, 1, len(families) == 1)
+            if pair in checked:
+                outcome.checked += 1
+                outcome.rejected += pair not in accepted
+    return sorted_by_pairs(outcomes.values())

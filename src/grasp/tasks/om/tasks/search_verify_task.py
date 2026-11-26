@@ -33,7 +33,7 @@ from grasp.tasks.base import GraspTask
 from grasp.tasks.entities import prepare_entity
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import (
-    CandidateStrategyType,
+    CandidateStrategyKind,
     KeyMatchSignal,
     MatchSignal,
     NeighboursMatchSignal,
@@ -130,7 +130,7 @@ def strategy_name(run: RunSignalInfos) -> str:
     'key', 'neighbours' or, for a vector run, its vectorizer.
     """
     return (
-        run.vectorizer if run.kind == CandidateStrategyType.VECTOR
+        run.vectorizer if run.kind == CandidateStrategyKind.VECTOR
         and run.vectorizer is not None
         else run.kind
     )

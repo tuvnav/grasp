@@ -33,7 +33,7 @@ from grasp.tasks.om.data_models.candidates import (
     AnchorSpecificity,
     AnchorStageResult,
     CandidateRankIndex,
-    CandidateStrategyType,
+    CandidateStrategyKind,
     Generator,
     KeyStrategy,
     PairSignalIndex,
@@ -68,6 +68,7 @@ from grasp.tasks.om.tasks.candidate_task import (
     format_normalization_examples,
     format_hubs,
     format_share,
+    format_baseline_runs,
     format_start_message,
     parse_run_ensemble,
     prefetch_shown_entities,
@@ -83,7 +84,7 @@ from grasp.tasks.om.tasks.prompting import (
     inline_schema,
     load_prompt,
 )
-from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
+from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state, resolve_strategy_history
 from grasp.utils import FunctionCallException, format_section
 
 # the selection of every anchor run: the unique candidate only (the anchor rule)
@@ -170,7 +171,7 @@ def run_full_anchor_ensemble(
         run_id: (generators_by_run[run_id], run_strategy(
             managers, alignment_state, generators_by_run[run_id],
             entity_memberships,
-            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY],
+            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyKind.KEY],
             ))
         for run_id in run_ensemble.run_ids()
         }
@@ -352,7 +353,7 @@ def format_anchor_result(
         result: StrategyResult,
         anchors: list[Anchor],
         entity_displays: dict[Side, EntityDisplay],
-        ) -> str:
+        ) -> Section:
     sizes = {side: result.signals[side].population_size for side in SIDES}
     with_match = {side: sum(1 for (s, _), selected in result.selected.items()
                             if s == side and selected.collected.candidates) for side in SIDES}
@@ -413,7 +414,7 @@ def format_anchor_result(
             "Example entities without an anchor",
             [format_ambiguous_entity(result, entity, entity_displays) for entity in ambiguous]
             ))
-    return format_display_content(Section(f"Result {run_id}", subsections=subsections))
+    return Section(f"Result {run_id}", subsections=subsections)
 
 
 def format_anchor_merge(
@@ -566,17 +567,45 @@ def anchor_function_definitions() -> list[dict]:
 
 
 def try_anchor_strategy(state: CandidateTaskState, fn_args: dict) -> str:
+    return format_display_content(run_tried_anchor_strategy(state, fn_args))
+
+
+def run_tried_anchor_strategy(state: CandidateTaskState, fn_args: dict) -> Section:
+    """
+    A trial run of the key strategy in the arguments of try_anchor_strategy,
+    added to the runs of the task: its anchors and statistics.
+    """
     generator = anchor_generator(fn_args)
     try:
         result = run_strategy(
             state.kg_managers, state.alignment_state, generator,
             state.entity_memberships,
-            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyType.KEY], trial=True,
+            MAX_ENTITY_PAIRS_PER_BUCKET[CandidateStrategyKind.KEY], trial=True,
             )
     except (ValueError, NotImplementedError) as error:
         raise FunctionCallException(str(error)) from error
     run_id = state.add_run(generator, result)
     return format_anchor_result(run_id, result, run_anchors_of(state, run_id), state.entity_displays)
+
+
+def default_anchor_arguments(alignment_state: AlignmentState) -> list[dict]:
+    """
+    The arguments of try_anchor_strategy for the baseline runs, as far as the
+    profiles allow: names against names on all groups (pairs of partitions
+    that do not compete are left out anyway), names against synonyms in each
+    direction a side has synonyms, and cross-references if both KGs have them.
+    """
+    source, target = (alignment_state.get_kg_profile(side) for side in SIDES)
+    arguments = []
+    if source.is_role_set("names") and target.is_role_set("names"):
+        arguments.append({"source_values": "names"})
+        if target.is_role_set("synonyms"):
+            arguments.append({"source_values": "names", "target_values": "synonyms"})
+        if source.is_role_set("synonyms"):
+            arguments.append({"source_values": "synonyms", "target_values": "names"})
+    if source.is_role_set("cross_references") and target.is_role_set("cross_references"):
+        arguments.append({"source_values": "cross_references"})
+    return arguments
 
 
 def show_anchors(state: CandidateTaskState, fn_args: dict) -> str:
@@ -649,12 +678,18 @@ class OMAnchorTask(GraspTask):
             entity_memberships=retrieve_entity_memberships(
                 kg_managers, alignment_state
             ),
+            strategy_history=resolve_strategy_history(input),
             entity_displays={
                 side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
                 for side in SIDES
             },
         )
-        return format_start_message(self.state) + "\n\nNo anchor strategy has been tried yet."
+        baseline_runs = None if self.state.strategy_history.has_stage("anchors") else format_baseline_runs(
+            self.state, default_anchor_arguments(alignment_state), run_tried_anchor_strategy,
+            AnchorFunctionName.TRY_ANCHOR_STRATEGY)
+        if baseline_runs is None:
+            return format_start_message(self.state) + "\n\nNo anchor strategy has been tried yet."
+        return format_start_message(self.state, baseline_runs)
 
     def system_information(self) -> str:
         info = fill_function_name_placeholders(

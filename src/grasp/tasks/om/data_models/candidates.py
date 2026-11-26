@@ -152,7 +152,8 @@ class StringNormalization(BaseModel):
         return self
 
 
-class CandidateStrategyType(StrEnum):
+class CandidateStrategyKind(StrEnum):
+    """The kind of a strategy (its field kind); its strategy type also tells the vectorizer (candidate_selection.py: strategy_type)."""
     KEY = auto()
     VECTOR = auto()
     NEIGHBOURS = auto()
@@ -164,7 +165,7 @@ class KeyStrategy(BaseModel):
     name). The anchor rule is a key strategy on names with a unique selection.
     """
     model_config = ConfigDict(extra="forbid")
-    kind: Literal[CandidateStrategyType.KEY] = CandidateStrategyType.KEY
+    kind: Literal[CandidateStrategyKind.KEY] = CandidateStrategyKind.KEY
     values: ValuePatterns = ValuePatterns()
     normalization: StringNormalization = StringNormalization()
 
@@ -183,7 +184,7 @@ class VectorStrategy(BaseModel):
     on the normalization level words.
     """
     model_config = ConfigDict(extra="forbid")
-    kind: Literal[CandidateStrategyType.VECTOR] = CandidateStrategyType.VECTOR
+    kind: Literal[CandidateStrategyKind.VECTOR] = CandidateStrategyKind.VECTOR
     values: ValuePatterns = ValuePatterns()
     vectorizer: Vectorizer = "idf_char_3grams"
     model_name: str | None = None  # embedding model; None: foundation.text_vectors.DEFAULT_EMBEDDING_MODEL
@@ -215,7 +216,7 @@ class NeighbourStrategy(BaseModel):
     relation in the same direction.
     """
     model_config = ConfigDict(extra="forbid")
-    kind: Literal[CandidateStrategyType.NEIGHBOURS] = CandidateStrategyType.NEIGHBOURS
+    kind: Literal[CandidateStrategyKind.NEIGHBOURS] = CandidateStrategyKind.NEIGHBOURS
     values: ValuePatterns = ValuePatterns(source=StructureRelationKind.SUBSUMPTION)
     min_witnesses: int = Field(default=1, ge=1)
     witness_weighting: WitnessWeighting = "count"
@@ -282,7 +283,7 @@ class Match(ABC):
 
     @property
     @abstractmethod
-    def kind(self) -> CandidateStrategyType:
+    def kind(self) -> CandidateStrategyKind:
         ...
 
 
@@ -296,8 +297,8 @@ class KeyMatch(Match):
     key: str
 
     @property
-    def kind(self) -> CandidateStrategyType:
-        return CandidateStrategyType.KEY
+    def kind(self) -> CandidateStrategyKind:
+        return CandidateStrategyKind.KEY
 
 
 @dataclass(frozen=True)
@@ -307,8 +308,8 @@ class VectorMatch(Match):
     cosine: float
 
     @property
-    def kind(self) -> CandidateStrategyType:
-        return CandidateStrategyType.VECTOR
+    def kind(self) -> CandidateStrategyKind:
+        return CandidateStrategyKind.VECTOR
 
 
 @dataclass(frozen=True)
@@ -338,8 +339,8 @@ class NeighbourMatch(Match):
         return 1 / math.sqrt(self.num_source_entities * self.num_target_entities)
 
     @property
-    def kind(self) -> CandidateStrategyType:
-        return CandidateStrategyType.NEIGHBOURS
+    def kind(self) -> CandidateStrategyKind:
+        return CandidateStrategyKind.NEIGHBOURS
 
 
 @dataclass
@@ -835,6 +836,34 @@ class TriedRun(BaseModel):
     num_hubs: int
 
 
+class FamilyRoundOutcome(BaseModel):
+    """
+    What one strategy family contributed in one round of a stage and how its
+    checked pairs turned out: a row of the strategy history shown to the next
+    stages (kg_operations/candidate_selection.py: anchor_round_outcomes,
+    candidate_round_outcomes).
+    """
+    model_config = ConfigDict(extra="forbid")
+    family: str                        # e.g. "names", "codes-registry"
+    strategy_types: list[str]          # key, idf_char_3grams, embedding, neighbours
+    stage: Literal["anchors", "candidates"]
+    round: int
+    pairs_by_strength: dict[str, int]  # exact / several_types / one_type -> pairs
+    pairs_of_this_family_only: int
+    checked: int                       # pairs a judge looked at
+    rejected: int                      # checked pairs a judge did not accept
+
+
+class StrategyHistory(BaseModel):
+    """The outcomes of the strategy families in all earlier rounds, in round order."""
+    model_config = ConfigDict(extra="forbid")
+    outcomes: list[FamilyRoundOutcome] = []
+
+    def has_stage(self, stage: Literal["anchors", "candidates"]) -> bool:
+        """Whether a round of this stage is in the history (then the next one is not its first)."""
+        return any(outcome.stage == stage for outcome in self.outcomes)
+
+
 class CandidateStageResult(BaseModel):
     """The output of the candidate stage: the ensemble of runs selected for the
     full runs, and all tried runs. finished: the LLM called finish (otherwise
@@ -947,7 +976,7 @@ class RunSignalInfos(BaseModel):
     stage: Literal["anchors", "candidates"]
     round: int
     run_id: str
-    kind: CandidateStrategyType
+    kind: CandidateStrategyKind
     values_projection: ValuePatterns
     normalization: StringNormalization | None = None  # key only
     vectorizer: Vectorizer | None = None  # vector only

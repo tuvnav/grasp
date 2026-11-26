@@ -28,10 +28,11 @@ would lose the true counterparts and distort every signal.
 """
 from collections import Counter
 import dataclasses
+import json
 from enum import StrEnum, auto
 from itertools import chain
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Collection, Sequence, get_args
 
 from grasp.configs import GraspConfig
@@ -40,7 +41,7 @@ from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import (
-    CandidateStrategyType,
+    CandidateStrategyKind,
     Generator,
     KeyStrategy,
     NormalizationExample,
@@ -54,6 +55,7 @@ from grasp.tasks.om.data_models.candidates import (
     RunEnsemble,
     RunRole,
     SelectedCandidates,
+    StrategyHistory,
     StrategyResult,
     StrategySignals,
     TriedRun,
@@ -96,7 +98,7 @@ from grasp.tasks.om.foundation.text_normalization import (
 from grasp.tasks.om.foundation.text_vectors import Vectorizer
 from grasp.tasks.om.foundation.types import IRI, SIDES, Side
 from grasp.tasks.om.kg_operations.candidate_selection import (
-    NAME_ROLES, comparison_method, compares_names, evaluate_merged_candidates, filter_informative_matches, flatten_layers, join_families,
+    NAME_ROLES, STRENGTH_DESCRIPTIONS, strategy_type, compares_names, evaluate_merged_candidates, filter_informative_matches, flatten_layers, join_families,
     merge_candidate_runs,
     select_candidates, summarize_candidate_selection,
 )
@@ -134,7 +136,7 @@ from grasp.tasks.om.tasks.prompting import (
     format_validation_error,
     load_prompt,
 )
-from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state
+from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state, resolve_strategy_history
 from grasp.utils import FunctionCallException, format_section
 from pydantic import ValidationError
 
@@ -265,8 +267,7 @@ def get_key_candidates(
                     alternative_value_pattern_source=role
                     )
                 for role in sorted(NAME_ROLES)
-                if any(roles.predicate_pattern_by_name(role) is not None
-                       for roles in kg_profile.get_effective_roles_of_all_groups())
+                if kg_profile.is_role_set(role)
             )
         else:
             value_rows = retrieve_strategy_value_rows(
@@ -587,7 +588,7 @@ def run_strategy(
     value_wordsets = None
     normalization_examples = None
     match generator.strategy.kind:
-        case CandidateStrategyType.KEY:
+        case CandidateStrategyKind.KEY:
             collected, hubs, confirmed_equivalences, value_wordsets, normalization_examples = get_key_candidates(
                 managers, alignment_state, generator,
                 entity_memberships.partition_names_by_entity,
@@ -595,7 +596,7 @@ def run_strategy(
                 max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
-        case CandidateStrategyType.VECTOR:
+        case CandidateStrategyKind.VECTOR:
             collected, hubs, confirmed_equivalences = get_vector_candidates(
                 managers, alignment_state, generator,
                 entity_memberships.partition_names_by_entity,
@@ -603,7 +604,7 @@ def run_strategy(
                 max_entity_pairs_per_bucket,
                 entity_sample=entity_sample,
             )
-        case CandidateStrategyType.NEIGHBOURS:
+        case CandidateStrategyKind.NEIGHBOURS:
             collected, hubs, confirmed_equivalences = get_neighbour_candidates(
                 managers, alignment_state, generator,
                 entity_memberships.partition_names_by_entity,
@@ -674,7 +675,7 @@ def run_full_ensemble(
     return merge_candidate_runs(
         run_ensemble,
         strategy_results_by_run,
-        {run_id: comparison_method(generators_by_run[run_id].strategy) for run_id in run_ensemble.run_ids()},
+        {run_id: strategy_type(generators_by_run[run_id].strategy) for run_id in run_ensemble.run_ids()},
         CANDIDATE_BUDGET_PER_ENTITY,
         MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER
         )
@@ -685,6 +686,8 @@ class CandidateTaskState:
     kg_managers: dict[Side, KgManager]
     alignment_state: AlignmentState  # doesn't change over the task
     entity_memberships: EntityMemberships  # retrieved once in the setup
+    # what the strategy families of the earlier rounds contributed (empty in the first round)
+    strategy_history: StrategyHistory = field(default_factory=StrategyHistory)
     runs: dict[str, tuple[Generator, StrategyResult]] = field(default_factory=dict)
     # how entities are shown, per side; keeps the names retrieved so far
     entity_displays: dict[Side, EntityDisplay] = field(default_factory=dict)
@@ -717,15 +720,23 @@ func_reg = FunctionRegistry()
 # most (source entities x target entities); a larger bucket is a hub: it gives
 # no pairs (neighbours: it only adds witnesses to pairs of other buckets).
 # Provisional values, to be checked on the hub counts of the first runs
-MAX_ENTITY_PAIRS_PER_BUCKET: dict[CandidateStrategyType, int] = {
-    CandidateStrategyType.KEY: 1_000,
-    CandidateStrategyType.VECTOR: 1_000,
-    CandidateStrategyType.NEIGHBOURS: 100,
+MAX_ENTITY_PAIRS_PER_BUCKET: dict[CandidateStrategyKind, int] = {
+    CandidateStrategyKind.KEY: 1_000,
+    CandidateStrategyKind.VECTOR: 1_000,
+    CandidateStrategyKind.NEIGHBOURS: 100,
 }
 
 
 @func_reg.register(CandidateFunctionName.TRY_STRATEGY)
 def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
+    return format_display_content(run_tried_strategy(state, fn_args))
+
+
+def run_tried_strategy(state: CandidateTaskState, fn_args: dict) -> Section:
+    """
+    A trial run of the generator in the arguments of try_strategy, added to
+    the runs of the task: its result with examples.
+    """
     try:
         generator = Generator(**fn_args.get("generator", {}))
     except ValidationError as error:
@@ -747,9 +758,7 @@ def try_strategy(state: CandidateTaskState, fn_args: dict) -> str:
     run_id = state.add_run(generator, result)
     examples = choose_examples(result)
     prefetch_shown_entities(examples, result.hubs, state.entity_displays)
-    return format_display_content(
-        format_strategy_result(f"Result {run_id}", result, examples, state.entity_displays)
-        )
+    return format_strategy_result(f"Result {run_id}", result, examples, state.entity_displays)
 
 
 def reselect_result(
@@ -823,7 +832,7 @@ def evaluate_run_ensemble(state: CandidateTaskState, fn_args: dict) -> str:
     merged = merge_candidate_runs(
         run_ensemble,
         {run_id: result for run_id, (_, result) in state.runs.items()},
-        {run_id: comparison_method(generator.strategy) for run_id, (generator, _) in state.runs.items()},
+        {run_id: strategy_type(generator.strategy) for run_id, (generator, _) in state.runs.items()},
         CANDIDATE_BUDGET_PER_ENTITY,
         MAX_CANDIDATES_IN_FIRST_PARETO_SUBLAYER,
         )
@@ -1585,15 +1594,95 @@ def format_alignment_status(state: CandidateTaskState) -> Section:
         ])
 
 
-def format_start_message(state: CandidateTaskState) -> str:
+def format_strategy_history(history: StrategyHistory) -> Section | None:
+    """
+    One row per strategy family and round of the earlier rounds; None in the
+    first round.
+    """
+    if not history.outcomes:
+        return None
+    rows = []
+    for outcome in history.outcomes:
+        pairs = sum(outcome.pairs_by_strength.values())
+        by_strength = ", ".join(
+            f"{number} {STRENGTH_DESCRIPTIONS[strength]}"
+            for strength, number in sorted(outcome.pairs_by_strength.items(), key=lambda item: -item[1])
+            )
+        rows.append((
+            outcome.family,
+            ", ".join(outcome.strategy_types),
+            f"{outcome.stage}, round {outcome.round}",
+            f"{pairs}: {by_strength}; {outcome.pairs_of_this_family_only} by this family only",
+            str(outcome.checked),
+            f"{outcome.rejected} ({outcome.rejected / outcome.checked:.0%})" if outcome.checked else "-",
+            ))
+    return Section("Strategy families tried so far", [
+        "Strategies on the same values form one family. Per family and round: the pairs it contributed, "
+        "by the strength of their evidence; how many of them a judge checked; and how many checked pairs "
+        "a judge did not accept (rejected).",
+        Table(("strategy family (values compared)", "strategy types used", "round", "pairs contributed",
+               "checked by judges", "rejected"), rows),
+        ])
+
+
+def default_candidate_arguments(alignment_state: AlignmentState) -> list[dict]:
+    """
+    The arguments of try_strategy for the baseline runs of a first candidate
+    round, as far as the profiles allow: a key and a character 3-gram vector
+    run on names, and a neighbour run over subsumption if both KGs have such
+    relations and there are equivalences (its witnesses).
+    """
+    profiles = [alignment_state.get_kg_profile(side) for side in SIDES]
+    arguments = []
+    if all(profile.is_role_set("names") for profile in profiles):
+        arguments += [
+            {"generator": {"strategy": {"kind": "key"}}},
+            {"generator": {"strategy": {"kind": "vector", "vectorizer": "idf_char_3grams"}}},
+            ]
+    if alignment_state.equivalences and all(profile.is_role_set("subsumption") for profile in profiles):
+        arguments.append({"generator": {"strategy": {"kind": "neighbours", "values": {"source": "subsumption"}}}})
+    return arguments
+
+
+def format_baseline_runs(
+        state: CandidateTaskState, arguments_list: list[dict],
+        run_function: Callable[[CandidateTaskState, dict], Section], function_name: str
+        ) -> Section | None:
+    """
+    Baseline runs computed before the first LLM call, as if the LLM had called
+    the function: each result with its call (the runs are in state.runs). A
+    call that fails (e.g. no values) is shown with its error. None: no runs.
+    """
+    if not arguments_list:
+        return None
+    run_sections = []
+    for arguments in arguments_list:
+        call = f"Call: {function_name}({json.dumps(arguments)})"
+        try:
+            result = run_function(state, arguments)
+        except FunctionCallException as error:
+            run_sections.append(Section("Failed baseline run", [call, f"Error: {error}"]))
+            continue
+        run_sections.append(replace(result, content=[call, *result.content]))
+    return Section(
+        "Baseline runs",
+        ["Computed before you started, as if you had made these calls: a first picture of the results "
+         "and examples of the calls. The runs can join an ensemble like your own."],
+        run_sections,
+        )
+
+
+def format_start_message(state: CandidateTaskState, baseline_runs: Section | None = None) -> str:
     knowledge_graphs = Section(
         "Knowledge graphs",
         subsections=[format_knowledge_graph(state, side) for side in SIDES],
         )
-    return (
-        format_display_content(knowledge_graphs)
-        + "\n\n" + format_display_content(format_alignment_status(state))
-    )
+    strategy_history = format_strategy_history(state.strategy_history)
+    return "\n\n".join(
+        format_display_content(section)
+        for section in (knowledge_graphs, strategy_history, format_alignment_status(state), baseline_runs)
+        if section is not None
+        )
 
 # ---------------------------------------------------------------- function definitions
 
@@ -1675,7 +1764,7 @@ GENERATOR_SCHEMA = {
                 "equivalence by the same kind of structure relation (e.g. subclasses of matched classes)."
             ),
             "properties": {
-                "kind": {"type": "string", "enum": [str(kind) for kind in CandidateStrategyType]},
+                "kind": {"type": "string", "enum": [str(kind) for kind in CandidateStrategyKind]},
                 "values": {
                     "type": "object",
                     "description": "The values compared, one per side: key and vector compare them directly, "
@@ -1840,6 +1929,7 @@ class OMCandidateTask(GraspTask):
             kg_managers=kg_managers,
             alignment_state=alignment_state,
             entity_memberships=retrieve_entity_memberships(kg_managers, alignment_state),
+            strategy_history=resolve_strategy_history(input),
             entity_displays={
                 side: EntityDisplay(
                     kg_managers[side], alignment_state.get_kg_profile(side)
@@ -1847,7 +1937,12 @@ class OMCandidateTask(GraspTask):
                 for side in SIDES
             },
         )
-        return format_start_message(self.state) + "\n\nNo strategy has been tried yet."
+        baseline_runs = None if self.state.strategy_history.has_stage("candidates") else format_baseline_runs(
+            self.state, default_candidate_arguments(alignment_state), run_tried_strategy,
+            CandidateFunctionName.TRY_STRATEGY)
+        if baseline_runs is None:
+            return format_start_message(self.state) + "\n\nNo strategy has been tried yet."
+        return format_start_message(self.state, baseline_runs)
 
     def system_information(self) -> str:
         return system_information(self.config)

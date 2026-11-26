@@ -9,6 +9,8 @@ If no strategy gives reliable anchors, select none: e.g. if the knowledge graphs
 
 You can try strategies with __TRY_ANCHOR_STRATEGY__: other values (names, synonyms, codes, cross-references, or a pattern of your own), another normalization ladder, and other groups on each side (the population). Each run compares one value source per side; a term that is a name in one knowledge graph may be a synonym in the other, so try names against names, names against synonyms and synonyms against names as separate runs. Anchors come only from an entity's own values. Relations to other entities (superclasses, domain and range, part-of) need anchors first; they are used in the candidate stage, not here. Uniqueness is always checked against all competing entities of both knowledge graphs, so a smaller population does not make its anchors look more unique.
 
+Baseline runs may have been computed before you started (shown with their calls): use them as a first picture and as examples of the calls, include one in an ensemble only if it helps, and look on purpose for what they miss.
+
 Steps:
 1. Look at the descriptions of the knowledge graphs and at the existing equivalences. Do both describe the same kind of things? Do they have names in a common language? Do the entities carry codes or references of a shared system?
 2. Try the strategies that could give anchors and compare their results: how many entities get anchors, how many stay ambiguous, how many anchors are head or extended, and whether the examples are equivalent. Look at more anchors, head anchors with a low information content and ambiguous entities with __SHOW_ANCHORS__.
