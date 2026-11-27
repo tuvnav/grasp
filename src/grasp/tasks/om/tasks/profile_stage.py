@@ -89,6 +89,7 @@ from grasp.tasks.om.kg_operations.profile_statistics import (
     PredicateCoverage,
     DirectionalUsage,
     canon_roles,
+    declared_structure_relations,
     complement,
     default_roles,
     get_predicate_usage,
@@ -1287,14 +1288,19 @@ class RoleEditor(Editor):
         if not role_elements_of(roles):
             if not create_missing:
                 raise ValueError("The profile has no roles")
-            # the canon is counted for the default: the
-            # editor counts only what is added later
+            canon = canon_roles()
+            # the canon and the restriction relations this knowledge graph
+            # declares are counted for the default: the editor counts only
+            # what is added later
+            candidate_roles = canon.model_copy(update={
+                "structure": canon.structure + declared_structure_relations(kg_manager, canon.structure)
+                })
             role_element_usage = element_usage_in_roles(
                 kg_manager, grouping, entity_space,
-                canon_roles(), role_element_usage_by_direction
+                candidate_roles, role_element_usage_by_direction
                 )
-            roles = default_roles(role_element_usage, group_sizes, partition_names)
-            counted_role_elements = set(role_elements_of(canon_roles()))
+            roles = default_roles(candidate_roles, role_element_usage, group_sizes, partition_names)
+            counted_role_elements = set(role_elements_of(candidate_roles))
         return cls(
             **base,
             unit="partition",

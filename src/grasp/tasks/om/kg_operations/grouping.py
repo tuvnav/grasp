@@ -26,7 +26,6 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     UNIVERSE,
 )
 from grasp.tasks.om.sparql_access import (
-    retrieve_values,
     select_rows,
     union_of,
     as_batched_values_blocks,
@@ -275,24 +274,22 @@ def members_by_group(groups_by_entity: dict[IRI, set[str]]) -> dict[str, set[IRI
 
 def retrieve_counts_by_group(
         manager: KgManager,
-        grouping: Grouping | None,
-        space: Iterable[str],
+        groups_by_entity: dict[IRI, set[str]],
         sparql_pattern: str
         ) -> dict[str, int]:
     """
-    Per group: its entities with at least one value
-    of the pattern (over ?s and ?o).
+    Per group: its entities with at least one value of the pattern (over ?s
+    and ?o). One query over the whole knowledge graph, whose subjects outside
+    the groups are left out here: a pattern costs one query, whether it
+    matches many entities or none.
     """
-    groups_by_entity = retrieve_grouping_by_entity(manager, grouping, space)
-    entities_with_value = retrieve_values(
-        manager,
-        groups_by_entity,
-        [sparql_pattern],
-        literals_only=False
-        )
-
+    subjects = {
+        IRI(row["s"].value)
+        for row in select_rows(manager, f"SELECT DISTINCT ?s WHERE {{ {sparql_pattern} FILTER(BOUND(?o)) }}")
+        if "s" in row
+        }
     return dict(Counter(
-        group_name for entity in entities_with_value
+        group_name for entity in subjects & groups_by_entity.keys()
         for group_name in groups_by_entity[entity]
         ))
 

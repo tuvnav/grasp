@@ -45,8 +45,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent
 from grasp.tasks.om.foundation.types import IRI, LocalNameType
-from grasp.tasks.om.foundation.rdf_vocabulary import RDF_TYPE, VOCABULARY, VOCABULARY_PREFIXES
-
+from grasp.tasks.om.foundation.rdf_vocabulary import (
+    RDF_TYPE, VOCABULARY, VOCABULARY_PREFIXES, RDF_FIRST, RDF_REST
+)
 INVERSE_PREFIX = "^"
 PATH_SEPARATOR = "/"
 
@@ -220,28 +221,76 @@ _OWL = "http://www.w3.org/2002/07/owl#"
 _SKOS = "http://www.w3.org/2004/02/skos/core#"
 _PART_OF = "http://purl.obolibrary.org/obo/BFO_0000050"
 _NOT_VOCABULARY = " && ".join(f'!STRSTARTS(STR(?o), "{ns}")' for ns in VOCABULARY)
+_RDF_LIST = f"<{RDF_REST}>*/<{RDF_FIRST}>"
+# both directions: an equivalence may be written with the class expression as
+# subject or as object
+_EQUIVALENT = f"(<{_OWL}equivalentClass>|^<{_OWL}equivalentClass>)"
+
+
+def existential_restriction_patterns(property_iri: str) -> list[str]:
+    """
+    ?s below or equivalent to (property some ?o), written directly or as a
+    member of an intersection: the two shapes OWL serializations use.
+    """
+    restriction = f"[ <{_OWL}onProperty> <{property_iri}> ; <{_OWL}someValuesFrom> ?o ]"
+    return [
+        f"?s (<{_RDFS}subClassOf>|{_EQUIVALENT}) {restriction} . FILTER(isIRI(?s) && isIRI(?o))",
+        f"?s (<{_RDFS}subClassOf>|{_EQUIVALENT}) [ <{_OWL}intersectionOf>/{_RDF_LIST} {restriction} ] "
+        f". FILTER(isIRI(?s) && isIRI(?o))",
+    ]
 
 
 # default structure relations, read from ?s (specific) to ?o (general); the
-# default profile keeps those used in a partition
+# default profile keeps those used in a partition. Besides plain triples they
+# read what the RDFS, OWL and SKOS specifications entail through class
+# expressions (blank nodes, RDF lists), so that no profile task has to write
+# such patterns.
 DEFAULT_STRUCTURE_RELATIONS = [
-    # without the blank nodes of OWL restrictions (part_of, existential_restriction)
-    _structure("subclass_of", StructureRelationKind.SUBSUMPTION,
-               patterns=[f"?s <{_RDFS}subClassOf> ?o . FILTER(isIRI(?o))"]),
+    _structure(
+        "subclass_of", StructureRelationKind.SUBSUMPTION,
+        patterns=[
+            f"?s <{_RDFS}subClassOf> ?o . FILTER(isIRI(?o))",
+            # S below or equivalent to (A and B): S below A
+            f"?s (<{_RDFS}subClassOf>|{_EQUIVALENT}) [ <{_OWL}intersectionOf>/{_RDF_LIST} ?o ] "
+            f". FILTER(isIRI(?s) && isIRI(?o))",
+            # O equivalent to (A or B): A below O
+            f"?o {_EQUIVALENT} [ <{_OWL}unionOf>/{_RDF_LIST} ?s ] . FILTER(isIRI(?s) && isIRI(?o))",
+            # O the disjoint union of A, B: A below O
+            f"?o <{_OWL}disjointUnionOf>/{_RDF_LIST} ?s . FILTER(isIRI(?s))",
+            ]),
     _structure("subproperty_of", StructureRelationKind.SUBSUMPTION, [_RDFS + "subPropertyOf"]),
     # skos:broader is not transitive by the SKOS specification, only skos:broaderTransitive
-    _structure("broader", StructureRelationKind.SUBSUMPTION, [_SKOS + "broader"], transitive=False),
-    _structure("broader_transitive", StructureRelationKind.SUBSUMPTION, [_SKOS + "broaderTransitive"]),
+    _structure(
+        "broader", StructureRelationKind.SUBSUMPTION, [_SKOS + "broader"],
+        patterns=[f"?s ^<{_SKOS}narrower> ?o"], transitive=False,
+        ),
+    _structure(
+        "broader_transitive", StructureRelationKind.SUBSUMPTION, [_SKOS + "broaderTransitive"],
+        patterns=[f"?s ^<{_SKOS}narrowerTransitive> ?o"],
+        ),
     # types from the vocabulary (owl:Class, owl:NamedIndividual) declare the kind, not a membership
-    _structure("instance_of", StructureRelationKind.MEMBERSHIP,
-               patterns=[f"?s <{RDF_TYPE}> ?o . FILTER(isIRI(?o) && {_NOT_VOCABULARY})"]),
+    _structure(
+        "instance_of", StructureRelationKind.MEMBERSHIP,
+        patterns=[f"?s <{RDF_TYPE}> ?o . FILTER(isIRI(?o) && {_NOT_VOCABULARY})"],
+        ),
     _structure("in_scheme", StructureRelationKind.MEMBERSHIP, [_SKOS + "inScheme"]),
-    _structure("part_of", StructureRelationKind.PARTONOMY, [_PART_OF],
-               patterns=[f"?s <{_RDFS}subClassOf> [ <{_OWL}onProperty> <{_PART_OF}> ; <{_OWL}someValuesFrom> ?o ]"]),
-    # any existential restriction; often a partonomy under a KG-specific property
-    # (e.g. UNDEFINED_part_of in the OAEI Anatomy track), which the profile task can tell
-    _structure("disjoint_with", StructureRelationKind.DISJOINTNESS,
-               [_OWL + "disjointWith", _OWL + "propertyDisjointWith"]),
+    _structure(
+        "part_of", StructureRelationKind.PARTONOMY, [_PART_OF],
+        patterns=existential_restriction_patterns(_PART_OF),
+        ),
+    # existential restrictions under other properties are added per knowledge
+    # graph (declared_structure_relations in profile_statistics)
+    _structure(
+        "disjoint_with", StructureRelationKind.DISJOINTNESS,
+        [_OWL + "disjointWith", _OWL + "propertyDisjointWith"],
+        patterns=[
+            f"?allDisjoint <{RDF_TYPE}> <{_OWL}AllDisjointClasses> ; <{_OWL}members>/{_RDF_LIST} ?s , ?o "
+            f". FILTER(isIRI(?s) && isIRI(?o) && ?s != ?o)",
+            # the members of a disjoint union are pairwise disjoint
+            f"?union <{_OWL}disjointUnionOf> ?members . ?members {_RDF_LIST} ?s . ?members {_RDF_LIST} ?o "
+            f". FILTER(isIRI(?s) && isIRI(?o) && ?s != ?o)",
+            ],
+        ),
 ]
 
 
@@ -814,7 +863,7 @@ class KgProfile(BaseModel):
         return [
             self.roles,
             *(
-                effective_roles_of_entity(self.roles, [group]) 
+                effective_roles_of_entity(self.roles, [group])
                 for group in self.groups if not group.excluded
                 )
             ]

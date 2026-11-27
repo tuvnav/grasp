@@ -102,7 +102,7 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
     merge_candidate_runs,
     select_candidates, summarize_candidate_selection,
 )
-from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay
+from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay, clip_value
 from grasp.tasks.om.kg_operations.grouping import (
     EntityMemberships,
     get_entities_of_population_side,
@@ -362,12 +362,13 @@ def get_vector_candidates(
             dict[tuple[Side, IRI], EntityCandidates],
             list[VectorHub],
             list[tuple[IRI, IRI]],
+            list[float],
         ]:
     """
     The candidates of a vector strategy for every entity in its population, on
     both sides, the text pairs whose entities would give too many entity
     pairs (above max_entity_pairs_per_bucket), the existing equivalences found
-    again. The strategy compares the texts on the level words (vector strategies
+    again and their best cosines. The strategy compares the texts on the level words (vector strategies
     have no transforms). neighbours_per_text: how many nearest texts of
     the other side each text keeps (a pre-cut before the selection, larger than
     any top_k). entity_sample: a trial run compares only these entities on their
@@ -428,10 +429,12 @@ def get_vector_candidates(
     candidates_by_entity = vector_entity_pairs_to_candidates(
         alignment_state, entity_pairs, group_names_by_side, partition_names_by_entity, existing_equivs_by_entity
         )
+    confirmed_equivalences = find_confirmed_equivalences(entity_pairs, existing_equivs_by_entity)
     return (
         candidates_by_entity,
         vector_hubs,
-        find_confirmed_equivalences(entity_pairs, existing_equivs_by_entity)
+        confirmed_equivalences,
+        [entity_pairs[pair].best_cosine() for pair in confirmed_equivalences],
         )
 
 
@@ -587,6 +590,7 @@ def run_strategy(
     # 1. collect
     value_wordsets = None
     normalization_examples = None
+    confirmed_equivalence_cosines = None
     match generator.strategy.kind:
         case CandidateStrategyKind.KEY:
             collected, hubs, confirmed_equivalences, value_wordsets, normalization_examples = get_key_candidates(
@@ -597,7 +601,7 @@ def run_strategy(
                 entity_sample=entity_sample,
             )
         case CandidateStrategyKind.VECTOR:
-            collected, hubs, confirmed_equivalences = get_vector_candidates(
+            collected, hubs, confirmed_equivalences, confirmed_equivalence_cosines = get_vector_candidates(
                 managers, alignment_state, generator,
                 entity_memberships.partition_names_by_entity,
                 group_names_by_entity_by_side,
@@ -647,7 +651,8 @@ def run_strategy(
             ),
         hubs=hubs,
         value_wordsets=value_wordsets,
-        normalization_examples=normalization_examples
+        normalization_examples=normalization_examples,
+        confirmed_equivalence_cosines=confirmed_equivalence_cosines,
         )
 
 
@@ -667,7 +672,9 @@ def run_full_ensemble(
             managers,
             alignment_state,
             generators_by_run[run_name],
-            entity_memberships
+            entity_memberships,
+            # the same hubs as in the trial runs the LLM chose from
+            MAX_ENTITY_PAIRS_PER_BUCKET[generators_by_run[run_name].strategy.kind],
             )
         for run_name in run_ensemble.run_ids()
     }
@@ -758,7 +765,8 @@ def run_tried_strategy(state: CandidateTaskState, fn_args: dict) -> Section:
     run_id = state.add_run(generator, result)
     examples = choose_examples(result)
     prefetch_shown_entities(examples, result.hubs, state.entity_displays)
-    return format_strategy_result(f"Result {run_id}", result, examples, state.entity_displays)
+    return format_strategy_result(
+        f"Result {run_id}", result, examples, state.entity_displays, generator.selection.min_cosine)
 
 
 def reselect_result(
@@ -794,7 +802,11 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
         raise FunctionCallException(f"Invalid selection object: {format_validation_error(error)}") from error
 
     generator, result = state.runs[run_id]
-    new_generator = generator.model_copy(update={"selection": selection})
+    try:
+        # validated: e.g. min_cosine only for a vector strategy
+        new_generator = Generator(population=generator.population, strategy=generator.strategy, selection=selection)
+    except ValidationError as error:
+        raise FunctionCallException(f"Invalid selection object: {format_validation_error(error)}") from error
     new_result = reselect_result(result, selection)
     new_run_id = state.add_run(new_generator, new_result)
 
@@ -803,7 +815,7 @@ def reselect(state: CandidateTaskState, fn_args: dict) -> str:
     return format_display_content(
         format_strategy_result(
             f"Result {new_run_id} (run {run_id} with another selection)",
-            new_result, examples, state.entity_displays,
+            new_result, examples, state.entity_displays, selection.min_cosine,
             )
         )
 
@@ -992,6 +1004,60 @@ def format_share(share: float) -> str:
     return f"{share:.0%}"
 
 
+def cosine_quantiles(cosines: Sequence[float]) -> str:
+    """E.g. '10 % below 0.84, 25 % below 0.88, median 0.91'."""
+    ordered = sorted(cosines)
+
+    def quantile(share: float) -> float:
+        return ordered[min(len(ordered) - 1, int(share * len(ordered)))]
+
+    return f"10 % below {quantile(0.1):.2f}, 25 % below {quantile(0.25):.2f}, median {quantile(0.5):.2f}"
+
+
+def best_cosines(result: StrategyResult, side: Side) -> list[float]:
+    """The cosine of each entity's best candidate on one side, before min_cosine."""
+    return [
+        max(
+            candidate.entity_pair.best_cosine() 
+            for candidate in entity_candidates.candidates
+            )
+        for (candidate_side, _), entity_candidates in result.collected.items()
+        if candidate_side == side and entity_candidates.candidates
+        ]
+
+
+def format_cosines(result: StrategyResult, min_cosine: float | None) -> list[SectionContent]:
+    """
+    Vector runs: the cosines to choose min_cosine from (each entity's best
+    candidate, the existing equivalences found again) and what a set min_cosine
+    left out; nothing for other strategies.
+    """
+    if result.confirmed_equivalence_cosines is None:
+        return []
+    content: list[SectionContent] = []
+    best_by_side = {side: best_cosines(result, side) for side in SIDES}
+    if any(best_by_side.values()):
+        content.append(Item("cosine of each entity's best candidate, before min_cosine: " + "; ".join(
+            f"{side}: {cosine_quantiles(cosines)}" for side, cosines in best_by_side.items() if cosines)))
+    if result.confirmed_equivalence_cosines:
+        content.append(Item(
+            "cosine of the existing equivalences found again (to calibrate min_cosine): "
+            f"{cosine_quantiles(result.confirmed_equivalence_cosines)} "
+            f"({len(result.confirmed_equivalence_cosines)} pairs)"))
+    if min_cosine is not None:
+        cosines_by_entity = [
+            [candidate.entity_pair.best_cosine() for candidate in entity_candidates.candidates]
+            for entity_candidates in result.collected.values() if entity_candidates.candidates
+            ]
+        num_left_out = sum(cosine < min_cosine for cosines in cosines_by_entity for cosine in cosines)
+        num_candidates = sum(len(cosines) for cosines in cosines_by_entity)
+        num_entities_without = sum(max(cosines) < min_cosine for cosines in cosines_by_entity)
+        content.append(Item(
+            f"min_cosine {min_cosine} left out {num_left_out} of {num_candidates} candidates; "
+            f"{num_entities_without} entities lost all their candidates"))
+    return content
+
+
 def format_found_again(result: StrategyResult) -> str | None:
     """
     The existing equivalences the run finds again. Their entities are not in
@@ -1098,13 +1164,13 @@ def format_match(
     roles = f"roles: ({own_role} - {candidate_role})"
     match match:
         case KeyMatch():
-            return f'matched by key "{match.key}" on normalization level "{match.level}", {roles}'
+            return f'matched by key "{clip_value(match.key)}" on normalization level "{match.level}", {roles}'
         case VectorMatch():
             own_text, candidate_text = (
                 (match.source_text, match.target_text) if own_side == Side.SOURCE
                 else (match.target_text, match.source_text)
                 )
-            return f'matched by texts: "{own_text}" ~ "{candidate_text}", cosine {match.cosine:.2f}, {roles}'
+            return f'matched by texts: "{clip_value(own_text)}" ~ "{clip_value(candidate_text)}", cosine {match.cosine:.2f}, {roles}'
         case NeighbourMatch():
             source_witness, target_witness = match.witness
             witness = (
@@ -1279,10 +1345,12 @@ def format_strategy_result(
         result: StrategyResult,
         examples: list[SelectedCandidates],
         entity_displays: dict[Side, EntityDisplay],
+        min_cosine: float | None = None,
         ) -> Section:
     """
     The LLM view of a run: the signals per side, the existing equivalences found
-    again, the largest hubs, and the example entities with their selection
+    again, for a vector run its cosines (format_cosines; min_cosine: the
+    threshold of its selection), the largest hubs, and the example entities with their selection
     (choose_examples; prefetch_shown_entities first). The full result stays in
     the task state (show_candidates).
     """
@@ -1291,6 +1359,7 @@ def format_strategy_result(
         Section(
             "Signals",
             [format_signals(result.signals[side]) for side in SIDES] + ([found_again] if found_again else [])
+            + format_cosines(result, min_cosine)
             )
         ]
     if result.hubs:
@@ -1312,10 +1381,10 @@ def format_strategy_result(
 
 def format_normalization_example(example: NormalizationExample) -> str:
     """The value, then each step that changes it: 'Fore-Brain' → words: 'fore brain' → …"""
-    steps = [repr(example.value)]
+    steps = [repr(clip_value(example.value))]
     if example.transformed != example.value:
-        steps.append(f"transforms: {example.transformed!r}")
-    steps += [f"{level}: {key!r}" for level, key in example.keys_by_level]
+        steps.append(f"transforms: {clip_value(example.transformed)!r}")
+    steps += [f"{level}: {clip_value(key)!r}" for level, key in example.keys_by_level]
     return " → ".join(steps) if len(steps) > 1 else f"{steps[0]} (unchanged on every level)"
 
 
@@ -1727,6 +1796,11 @@ SELECTION_SCHEMA = {
                   "description": "Places of a list; tied candidates are taken whole or not at all. Default 5."},
         "mutual": {"type": "boolean", "description": "Keep only candidates whose own list has the entity."},
         "unique": {"type": "boolean", "description": "Keep only the unique candidate (alone in front from both sides)."},
+        "min_cosine": {"type": "number", "minimum": 0, "maximum": 1,
+                       "description": "Vector strategies only: leave out candidates whose cosine is below it, so "
+                                      "that clearly wrong ones reach no list and no judge. Choose it from the cosines "
+                                      "of the result (best candidate per entity, existing equivalences found again); "
+                                      "what is cut off is lost for good. Default: none."},
     },
 }
 

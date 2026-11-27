@@ -23,6 +23,9 @@ from grasp.manager import KgManager
 from grasp.tasks.om.data_models.profile import (
     DEFAULT_STRUCTURE_RELATIONS,
     GroupProfile,
+    StructureRelation,
+    StructureRelationKind,
+    existential_restriction_patterns,
     KgProfile,
     PredicatePattern,
     RoleElement,
@@ -41,6 +44,10 @@ from grasp.tasks.om.foundation.rdf_vocabulary import (
     CROSS_REFERENCE_PREDICATES,
     DEFINITION_PREDICATES,
     DEFAULT_LABEL_PREDICATES,
+    OWL_ON_PROPERTY,
+    OWL_SOME_VALUES_FROM,
+    OWL_SYMMETRIC_PROPERTY,
+    OWL_TRANSITIVE_PROPERTY,
     RDF_TYPE,
     SYNONYM_PREDICATES,
     UNCATEGORIZED,
@@ -344,14 +351,101 @@ def canon_roles() -> PredicateRoles:
     )
 
 
+# the properties of the existential OWL restrictions; whether classes use
+# them (existential_restriction_patterns) the coverage of the default tells
+RESTRICTION_PROPERTIES_QUERY = f"""
+SELECT DISTINCT ?p WHERE {{
+  ?restriction <{OWL_ON_PROPERTY}> ?p ; <{OWL_SOME_VALUES_FROM}> ?value .
+  FILTER(isIRI(?p) && isIRI(?value))
+}}"""
+
+
+def unique_relation_name(name: str, taken_names: set[str]) -> str:
+    """name, or name_2, name_3, ... if a relation has it already; reserves it."""
+    unique_name, number = name, 2
+    while unique_name in taken_names:
+        unique_name, number = f"{name}_{number}", number + 1
+    taken_names.add(unique_name)
+    return unique_name
+
+
+def relation_name(property_iri: str, labels: list[str]) -> str:
+    """
+    The local name of a property if it speaks (is_speaking_name), else its
+    first label with words joined by underscores (BFO_0000051: has_part), else
+    the local name.
+    """
+    name = local_name(property_iri)
+    if is_speaking_name(name) or not labels:
+        return name
+    return re.sub(r"\W+", "_", labels[0]).strip("_") or name
+
+
+def declared_structure_relations(
+        manager: KgManager, canon_relations: list[StructureRelation]
+        ) -> list[StructureRelation]:
+    """
+    A relation of kind other for every property of the knowledge graph's
+    existential OWL restrictions that no canon relation covers, with the
+    transitivity and symmetry the knowledge graph declares for it; the
+    profile task tells its kind (e.g. a partonomy under a property of its
+    own, such as UNDEFINED_part_of in the OAEI Anatomy track).
+    """
+    covered_properties = {
+        predicate for relation in canon_relations
+        for predicate in relation.predicate_pattern.predicates
+        }
+    restriction_properties = sorted(
+        {IRI(row["p"].value) for row in select_rows(manager, RESTRICTION_PROPERTIES_QUERY)}
+        - covered_properties
+        )
+    if not restriction_properties:
+        return []
+
+    declared_types_by_property: dict[str, set[str]] = defaultdict(set)
+    labels_by_property: dict[str, list[str]] = defaultdict(list)
+    values = " ".join(f"<{property_iri}>" for property_iri in restriction_properties)
+    label_values = " ".join(f"<{predicate}>" for predicate in DEFAULT_LABEL_PREDICATES)
+    for row in select_rows(manager, f"""
+            SELECT ?p ?type ?label WHERE {{
+              VALUES ?p {{ {values} }}
+              OPTIONAL {{
+                VALUES ?type {{ <{OWL_TRANSITIVE_PROPERTY}> <{OWL_SYMMETRIC_PROPERTY}> }}
+                ?p <{RDF_TYPE}> ?type
+              }}
+              OPTIONAL {{ VALUES ?labelPredicate {{ {label_values} }} ?p ?labelPredicate ?label }}
+            }}"""):
+        if "type" in row:
+            declared_types_by_property[row["p"].value].add(row["type"].value)
+        if "label" in row:
+            labels_by_property[row["p"].value].append(row["label"].value)
+
+    taken_names = {relation.name for relation in canon_relations}
+    return [
+        StructureRelation(
+            name=unique_relation_name(
+                relation_name(property_iri, sorted(labels_by_property[property_iri])), taken_names
+                ),
+            kind=StructureRelationKind.OTHER,
+            transitive=OWL_TRANSITIVE_PROPERTY in declared_types_by_property[property_iri],
+            symmetric=OWL_SYMMETRIC_PROPERTY in declared_types_by_property[property_iri],
+            source="declared",
+            predicate_pattern=PredicatePattern(
+                predicates=[property_iri],
+                patterns=existential_restriction_patterns(property_iri),
+                ),
+            )
+        for property_iri in restriction_properties
+        ]
+
+
 # element of a structure relation -> (num entities as ?s, num entities as ?o)
 type DirectionalUsage = dict[RoleElement, tuple[int, int]]
 
 
 def count_entities_by_predicate(
         manager: KgManager,
-        grouping: Grouping | None,
-        space: Iterable[str],
+        groups_by_entity: dict[IRI, set[str]],
         predicates: Iterable[str],
         triple: str
         ) -> dict[str, dict[str, int]]:
@@ -364,7 +458,7 @@ def count_entities_by_predicate(
     if not predicates:
         return counts
     values = " ".join(f"<{p}>" for p in predicates)
-    for group_name, members in members_by_group(retrieve_grouping_by_entity(manager, grouping, space)).items():
+    for group_name, members in members_by_group(groups_by_entity).items():
         for predicate, n in count_entities_by_key(manager, members, f"VALUES ?p {{ {values} }} {triple}", "p").items():
             counts[predicate][group_name] = n
     return counts
@@ -386,6 +480,8 @@ def element_usage_in_roles(
     every pattern in its own (an invalid pattern fails alone).
     """
     usage: dict[str, RoleElementUsage] = defaultdict(dict)
+    # once for all elements: every count needs the groups of the entities
+    groups_by_entity = retrieve_grouping_by_entity(manager, grouping, space)
     elements = role_elements_of(roles)
     non_structure_predicates = [
         e for e in elements if e.kind == RoleElementKind.PREDICATE
@@ -407,8 +503,7 @@ def element_usage_in_roles(
     # non structure fields: count entities as ?s
     non_structure_counts = count_entities_by_predicate(
         manager,
-        grouping,
-        space,
+        groups_by_entity,
         (str(e.definition) for e in non_structure_predicates),
         "?s ?p ?o"
         )
@@ -417,17 +512,17 @@ def element_usage_in_roles(
             usage[group][element] = n
     for element in non_structure_patterns:
         for group, n in retrieve_counts_by_group(
-                manager, grouping, space, str(element.sparql())
+                manager, groups_by_entity, str(element.sparql())
                 ).items():
             usage[group][element] = n
 
     # structure relations: entities as ?s and as ?o
     relation_iris = [str(e.definition) for e in structure_predicates]
     as_subject = count_entities_by_predicate(
-        manager, grouping, space, relation_iris, "?s ?p ?o"
+        manager, groups_by_entity, relation_iris, "?s ?p ?o"
         )
     as_object = count_entities_by_predicate(
-        manager, grouping, space, relation_iris, "?o ?p ?s"
+        manager, groups_by_entity, relation_iris, "?o ?p ?s"
         )
     counts_by_direction: dict[RoleElement, tuple[dict[str, int], dict[str, int]]] = {
         element: (
@@ -439,9 +534,9 @@ def element_usage_in_roles(
     for element in structure_patterns:
         pattern = str(element.sparql())
         counts_by_direction[element] = (
-            retrieve_counts_by_group(manager, grouping, space, pattern),
+            retrieve_counts_by_group(manager, groups_by_entity, pattern),
             # the entities as ?o: the pattern with ?s and ?o swapped
-            retrieve_counts_by_group(manager, grouping, space, swap(pattern)),
+            retrieve_counts_by_group(manager, groups_by_entity, swap(pattern)),
             )
     for element, (subject_counts, object_counts) in counts_by_direction.items():
         for group in set(subject_counts) | set(object_counts):
@@ -453,13 +548,15 @@ def element_usage_in_roles(
 
 
 def default_roles(
+        candidate_roles: PredicateRoles,
         role_element_usage: dict[str, RoleElementUsage],
         group_sizes: dict[str, int],
         active_groups: Iterable[str]
         ) -> PredicateRoles:
     """
-    Canon elements covering at least MIN_DEFAULT_COVERAGE of
-    an active group or partition.
+    The elements of candidate_roles (the canon and the declared structure
+    relations) covering at least MIN_DEFAULT_COVERAGE of an active group or
+    partition.
     """
     kept_role_elements_without_structure_properties = {
         role_element for group in active_groups if group_sizes.get(group)
@@ -472,7 +569,7 @@ def default_roles(
     }
     return roles_from_elements(
         frozenset(
-            element for element in role_elements_of(canon_roles())
+            element for element in role_elements_of(candidate_roles)
             if element in kept_role_elements_without_structure_properties
             or (
                 element.kind == RoleElementKind.RELATION_PROPERTIES

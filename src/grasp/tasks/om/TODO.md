@@ -1,9 +1,10 @@
 ## Unbedingt notwendig
-- Ziele der Strukturrollen im Prompt erklären.
 - Berechenbare Relationen berechnen statt setzen: Subsumption ↔ Membership: Aus den Partitionen ableitbar: ?s Instanz und ?o Klasse → Membership; beide in derselben Partition → Subsumption
 - Ablation: DEFAULTS ein- und ausschaltbar
-- Familien wählen in den Prompt: unabhängige Informationsquellen = Fehler korrelieren nicht mit Beispielen: "Give runs the same family if they draw on the same information of the entities (the same values, or values derived from or containing one another), whatever their technique, population or selection; mutual runs take the family of the run they select from. Use a new family only for information whose errors are unlikely to coincide with those of the existing families."
-- Kandidatenstrata in Reihenfolge der Stratumstärke bewerten mit Abbruchkriterium bei abfallenden Matches, pro Gruppe/Partition je nach Gruppengröße -> Recallrunde gleich schneiden!
+- '### Example entities without an anchor' in der Ankerstufe keine klare Aussage, warum keine Anker trotz Kandidaten
+- doppelte '## Knowledge graphs'-ÜBerschrift in Ankerzertifizierung (1-Shot)
+- Kein guter Übergang Knowledge Graphs und 'Consider the following entities:' in Ankerzertifizierung
+- Examples bei Ensemble Evaluation (candidates) sollten eine eigene Subsection sein... Vielleicht stärkere Strata zuerst
 
 ## Optimierungsideen
 - "Default canon checked: ..." in Profiling.roles: Als Liste statt Textblock 

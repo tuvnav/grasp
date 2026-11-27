@@ -13,6 +13,7 @@ Order (select_<...>_candidates):
 """
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
+import dataclasses
 import math
 import random
 from typing import Literal
@@ -20,7 +21,7 @@ from typing import Literal
 from grasp.tasks.om.data_models.candidates import (
     Anchor, AnchorMerge, AnchorSpecificity, AnchorStageResult, CandidateRankIndex, FamilyRoundOutcome, CandidateStrategyKind, EnsembleEvaluation, Generator, KeyCandidate, KeyEntityPair, KeyMatch, KeyMatchSignal, KeyStrategy, Match, MatchSignal, MergedCandidates, NeighbourMatch, NeighbourStrategy, NeighboursMatchSignal, PairSignalIndex, ParetoIndex, RunEnsemble, RunSignalInfos, SelectedCandidates, Selection,
     EntityCandidates,
-    Candidate, CandidateStrategy, StrategyResult, StrategySignals, Stratum, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
+    Candidate, CandidateStrategy, StrategyResult, StrategySignals, Stratum, VectorCandidate, VectorMatch, VectorMatchSignal, VectorStrategy, VennIndex,
 
     )
 from grasp.tasks.om.data_models.verification import (
@@ -128,6 +129,19 @@ def select_candidates(
     """
     The selection of every entity of both sides (see the module docstring).
     """
+    # 0. vector strategies: the candidates below min_cosine are left out; the
+    # collection itself stays whole (a later selection may lower the threshold)
+    collected_by_entity = candidates_by_entity
+    if selection.min_cosine is not None:
+        candidates_by_entity = {
+            entity_key: dataclasses.replace(entity_candidates, candidates=[
+                candidate for candidate in entity_candidates.candidates
+                if not isinstance(candidate, VectorCandidate)
+                or candidate.entity_pair.best_cosine() >= selection.min_cosine
+                ])
+            for entity_key, entity_candidates in candidates_by_entity.items()
+            }
+
     # 1. whole tie groups that fit into top_k, on both sides
     tie_groups_by_entity: dict[EntityKey, list[list[Candidate]]] = {}
     dropped_rank_by_entity: dict[EntityKey, float | None] = {}
@@ -158,7 +172,7 @@ def select_candidates(
         elif selection.mutual:
             tie_groups = filter_tie_groups(tie_groups, mutual_candidates)
         selected_by_entity[entity_key] = SelectedCandidates(
-            collected=entity_candidates,
+            collected=collected_by_entity[entity_key],
             tie_rank_groups=tie_groups,
             dropped_tie_group_rank=dropped_rank_by_entity[entity_key],
             mutual_candidates=mutual_candidates,

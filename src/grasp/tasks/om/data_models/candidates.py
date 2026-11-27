@@ -250,6 +250,9 @@ class Selection(BaseModel):
     top_k: int = Field(default=5, ge=1)
     mutual: bool = False  # keep only candidates whose own list contains the entity too
     unique: bool = False  # keep only the unique candidate: alone on the finest level and mutual (anchor rule)
+    # vector strategies only: candidates whose best cosine is below it are left
+    # out (before the tie groups and top_k); None: no threshold
+    min_cosine: float | None = Field(default=None, ge=0, le=1)
 
 
 class Generator(BaseModel):
@@ -257,6 +260,12 @@ class Generator(BaseModel):
     population: Population = Population()
     strategy: CandidateStrategy = KeyStrategy()
     selection: Selection = Selection()
+
+    @model_validator(mode="after")
+    def min_cosine_only_for_vectors(self) -> Self:
+        if self.selection.min_cosine is not None and self.strategy.kind != CandidateStrategyKind.VECTOR:
+            raise ValueError("selection.min_cosine is only for vector strategies")
+        return self
 
 
 @dataclass(frozen=True)
@@ -823,6 +832,10 @@ class StrategyResult[H: Hub]:
     # key strategy: per side a few values through its transforms and levels;
     # None: another strategy
     normalization_examples: dict[Side, list[NormalizationExample]] | None = None
+    # vector strategy: the best cosine of each existing equivalence it finds
+    # again (before the selection; only those within the nearest texts of the
+    # comparison, so rather too high); None: another strategy
+    confirmed_equivalence_cosines: list[float] | None = None
 
 
 class TriedRun(BaseModel):

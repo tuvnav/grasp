@@ -54,7 +54,7 @@ from grasp.tasks.om.foundation.configuration import know_before_use, load_task_i
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent, format_display_content
 from grasp.tasks.om.foundation.text_normalization import normalization_level_order
-from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
+from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay, clip_value
 from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
@@ -181,10 +181,11 @@ def format_match_signal(signal: MatchSignal, entity_displays: dict[Side, EntityD
     match signal:
         case KeyMatchSignal():
             source_values, target_values = signal.values
-            return (f'key "{signal.key}" on level "{signal.level}" from '
-                    f"{', '.join(map(repr, source_values))} ~ {', '.join(map(repr, target_values))}")
+            return (f'key "{clip_value(signal.key)}" on level "{signal.level}" from '
+                    f"{', '.join(repr(clip_value(value)) for value in source_values)} ~ "
+                    f"{', '.join(repr(clip_value(value)) for value in target_values)}")
         case VectorMatchSignal():
-            return f'"{signal.texts[0]}" ~ "{signal.texts[1]}"'
+            return f'"{clip_value(signal.texts[0])}" ~ "{clip_value(signal.texts[1])}"'
         case NeighboursMatchSignal():
             source_witness, target_witness = signal.witness
             # own patterns: strategy names them; structure relation kinds:

@@ -83,6 +83,11 @@ def label_with_shortened_iri(label: str | None, shortened_iri: str) -> str:
     return f"'{label}' <{shortened_iri}>" if label else f"<{shortened_iri}>"
 
 
+# the most characters of a compared value (a key, a text, a value of a key)
+# in candidate lists and signals: long literals such as definitions are cut
+MAX_SHOWN_VALUE_CHARS = 50
+
+
 def clip(text: str, max_chars: int) -> str:
     """
     Whitespace collapsed, cut at max_chars.
@@ -91,6 +96,11 @@ def clip(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + " …"
+
+
+def clip_value(value: str) -> str:
+    """A compared value as shown in candidate lists and signals: clipped at MAX_SHOWN_VALUE_CHARS."""
+    return clip(value, MAX_SHOWN_VALUE_CHARS)
 
 
 def shortened_vocabulary_name(iri: str) -> str | None:

@@ -75,6 +75,9 @@ RDF_REST = IRI("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest")
 
 
 OWL_ON_PROPERTY = IRI("http://www.w3.org/2002/07/owl#onProperty")
+OWL_SOME_VALUES_FROM = IRI("http://www.w3.org/2002/07/owl#someValuesFrom")
+OWL_TRANSITIVE_PROPERTY = IRI("http://www.w3.org/2002/07/owl#TransitiveProperty")
+OWL_SYMMETRIC_PROPERTY = IRI("http://www.w3.org/2002/07/owl#SymmetricProperty")
 
 
 def local_name(iri: str) -> str:

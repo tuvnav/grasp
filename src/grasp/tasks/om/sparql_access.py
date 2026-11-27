@@ -25,8 +25,9 @@ from grasp.sparql.utils import READ_TIMEOUT, execute
 from grasp.tasks.om.foundation.types import IRI, BindingType, BlankNodeTree
 
 
-# IRIs per VALUES block in batch queries
-BATCH_SIZE = 200
+# IRIs per VALUES block in batch queries (blocks above MAX_INLINE_VALUES go
+# in as placeholders after the prefix fixing, see as_batched_values_blocks)
+BATCH_SIZE = 5000
 # VALUES blocks with more IRIs are put into
 # a query after its prefixes are fixed
 MAX_INLINE_VALUES = 100
@@ -159,11 +160,15 @@ def expand_values_blocks(sparql: str) -> str:
 def as_batched_values_blocks(iris: Iterable[IRI]) -> Iterable[str]:
     """
     The IRIs as VALUES contents (<a> <b> ...) in blocks of BATCH_SIZE; IRIs
-    that cannot be written in SPARQL (INVALID_IRI_CHARACTERS) are left out.
+    that cannot be written in SPARQL (INVALID_IRI_CHARACTERS) are left out. A
+    block of more than MAX_INLINE_VALUES IRIs is a placeholder that
+    prepare_query replaces by the IRIs (as in values_clause).
     """
     iris = sorted({iri for iri in iris if not INVALID_IRI_CHARACTERS.search(iri)})
     for start in range(0, len(iris), BATCH_SIZE):
-        yield " ".join(f"<{iri}>" for iri in iris[start:start + BATCH_SIZE])
+        block = iris[start:start + BATCH_SIZE]
+        terms = " ".join(f"<{iri}>" for iri in block)
+        yield terms if len(block) <= MAX_INLINE_VALUES else replace_values_by_placeholder(terms)
 
 
 def prepare_query(manager: KgManager, sparql: str) -> str:
