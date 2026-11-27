@@ -49,7 +49,7 @@ from grasp.tasks.om.data_models.verification import (
     VerdictOption,
     VerifyInput,
 )
-from grasp.tasks.om.data_models.profile import KgProfile
+from grasp.tasks.om.data_models.profile import EntityMemberships, KgProfile
 from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.kg_operations.candidate_generation import sample_position
 from grasp.tasks.om.kg_operations.grouping import (
@@ -58,6 +58,7 @@ from grasp.tasks.om.kg_operations.grouping import (
     retrieve_grouping_by_entity,
     )
 from grasp.tasks.om.kg_operations.candidate_generation import retrieve_linked_entities
+from grasp.tasks.om.tasks.task_input import to_task_input
 from grasp.utils import format_enumerate, format_section
 
 VERIFY_TASK = "om-verify"
@@ -248,7 +249,7 @@ def run_one_shot(
     config = config.model_copy(update={"tool_choice": "required"})
     task = get_task(VERIFY_TASK, kg_managers, config)
     # setup first: the system information depends on the input (competitors, mode)
-    user_message = task.setup(verify_input.model_dump(mode="json"))
+    user_message = task.setup(to_task_input(verify_input))
     system = (
         task.system_information() + "\n\n"
         + format_judged_kgs(verify_input, kg_managers, kg_notes)
@@ -432,12 +433,14 @@ def choose_competitors(
 def verify_input_builder(
         alignment_state: AlignmentState,
         candidates_of: CandidatesOf | None,
+        entity_memberships: EntityMemberships | None,
         num_competitors_per_side: int = NUM_COMPETITORS_PER_SIDE
         ) -> BuildVerifyInput:
     """
-    Builds the judge's input of a pair: the two KGs with their profiles and,
-    with candidates_of (all candidates found so far per entity, best first),
-    the rivals of the pair. Without it, no competitors.
+    Builds the judge's input of a pair: the two KGs with their profiles, the
+    entity memberships (the groups of the shown entities) and, with
+    candidates_of (all candidates found so far per entity, best first), the
+    rivals of the pair. Without it, no competitors.
     """
     def build_verify_input(pair: tuple[IRI, IRI]) -> VerifyInput:
         return VerifyInput(
@@ -450,7 +453,8 @@ def verify_input_builder(
             competitors=(
                 choose_competitors(candidates_of, pair, num_competitors_per_side)
                 if candidates_of is not None else {}
-                )
+                ),
+            entity_memberships=entity_memberships,
             )
 
     return build_verify_input
@@ -463,17 +467,20 @@ def certify(
         judge_variant: JudgeVariant,
         judge_for_stratum: JudgeForStratum,
         certification_params: CertificationParams,
+        entity_memberships: EntityMemberships | None,
         ) -> CertificationResult:
     """
     Certifies every stratum of pairs of the alignment state's two KGs.
     judge_for_stratum: the judge function per stratum, built by the caller
     with judge_variant (which here only selects the competitors and names the
     result). candidates_of: all candidates found so far per entity, best
-    first; used only by variants with competitors.
+    first; used only by variants with competitors. entity_memberships: the
+    groups of the shown entities for the judges (None: they query them).
     """
     build_verify_input = verify_input_builder(
         alignment_state,
         candidates_of if judge_variant.competitors else None,
+        entity_memberships,
         )
     certified_strata = certify_strata(
         strata,

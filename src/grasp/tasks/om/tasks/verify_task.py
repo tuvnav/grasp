@@ -15,9 +15,10 @@ from grasp.tasks.om.foundation.configuration import (
 from grasp.tasks.om.foundation.types import IRI, Side
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
+from grasp.tasks.om.tasks.judge_functions import SHOW_ENTITIES, show_entities, show_entities_definition
 from grasp.tasks.om.foundation.rendering import Section, format_display_content
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
-from grasp.tasks.om.tasks.task_input import managers_by_side
+from grasp.tasks.om.tasks.task_input import group_names_by_entity, managers_by_side
 from grasp.utils import FunctionCallException, format_section
 
 
@@ -51,6 +52,7 @@ class VerifyState:
 
 
 class VerifyFunction(StrEnum):
+    SHOW_ENTITIES = SHOW_ENTITIES  # agentic only
     ACCEPT = "accept"
     REJECT = "reject"
     UNSURE = "unsure"
@@ -75,6 +77,13 @@ def judge_focus_pair(state: VerifyState, fn_args: dict, function_name: VerifyFun
         rationale=rationale,
     )
     return f"You judged {state.source_iri} and {state.target_iri} {judged_as}."
+
+
+@func_reg.register(VerifyFunction.SHOW_ENTITIES)
+def show_entities_of_kg(state: VerifyState, fn_args: dict, known: set[str]) -> str:
+    return show_entities(
+        {state.source_kg: state.entity_displays[Side.SOURCE], state.target_kg: state.entity_displays[Side.TARGET]},
+        fn_args, known)
 
 
 @func_reg.register(VerifyFunction.ACCEPT)
@@ -172,7 +181,7 @@ def stop(state: VerifyState, fn_args: dict, known: set[str]) -> str:
     return "Stopping"
 
 
-def function_definitions(function_names: list[VerifyFunction]) -> list[dict]:
+def function_definitions(function_names: list[VerifyFunction], kg_names: list[str]) -> list[dict]:
     rationale_property = {
         "type": "string",
         "description": "Short explanation of your decision.",
@@ -194,6 +203,8 @@ def function_definitions(function_names: list[VerifyFunction]) -> list[dict]:
     res = []
     for func_name in function_names:
         match func_name:
+            case VerifyFunction.SHOW_ENTITIES:
+                res.append(show_entities_definition(kg_names))
             case VerifyFunction.STOP:
                 res.append(
                     {
@@ -291,7 +302,9 @@ def verify_prompt(competitors: bool, agentic: bool, config: GraspConfig) -> str:
         further_steps += (
             "- Use the built in functions to explore "
             "the involved ontologies if you regard the "
-            "provided context as insufficient.\n"
+            "provided context as insufficient. To see an entity "
+            "the way the presented ones are shown, call "
+            f"{VerifyFunction.SHOW_ENTITIES} instead of querying its triples.\n"
         )
         notes = (
             f"Note that you only have {config.max_steps} "
@@ -423,8 +436,12 @@ class OMVerifyTask(GraspTask):
             source_iri=verify_input.source_iri,
             target_iri=verify_input.target_iri,
             entity_displays={
-                Side.SOURCE: EntityDisplay(managers[Side.SOURCE], verify_input.source_profile),
-                Side.TARGET: EntityDisplay(managers[Side.TARGET], verify_input.target_profile),
+                Side.SOURCE: EntityDisplay(
+                    managers[Side.SOURCE], verify_input.source_profile,
+                    group_names_by_entity(verify_input.entity_memberships, Side.SOURCE)),
+                Side.TARGET: EntityDisplay(
+                    managers[Side.TARGET], verify_input.target_profile,
+                    group_names_by_entity(verify_input.entity_memberships, Side.TARGET)),
             },
             agentic=verify_input.agentic,
             competitors_by_side=verify_input.competitors,
@@ -450,18 +467,21 @@ class OMVerifyTask(GraspTask):
             function_names = [VerifyFunction.ACCEPT, VerifyFunction.REJECT, VerifyFunction.UNSURE]
 
         if self.state.agentic:
-            function_names.append(VerifyFunction.STOP)
+            function_names += [VerifyFunction.SHOW_ENTITIES, VerifyFunction.STOP]
         return function_names
 
     def function_definitions(self) -> list[dict]:
-        return function_definitions(self.offered_functions())
+        return function_definitions(self.offered_functions(), self.kg_names())
 
     def verdict_functions(self) -> list[VerifyFunction]:
-        return [f for f in self.offered_functions() if f != VerifyFunction.STOP]
+        return [f for f in self.offered_functions() if f not in (VerifyFunction.SHOW_ENTITIES, VerifyFunction.STOP)]
 
     def final_step_functions(self) -> list[dict] | None:
         # the last allowed step must submit a verdict
-        return function_definitions(self.verdict_functions())
+        return function_definitions(self.verdict_functions(), self.kg_names())
+
+    def kg_names(self) -> list[str]:
+        return [self.state.source_kg, self.state.target_kg]
 
     def budget_message(self, steps_left: int, final: bool) -> str:
         names = " or ".join(f"'{f.value}'" for f in self.verdict_functions())

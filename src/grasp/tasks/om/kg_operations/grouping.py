@@ -13,6 +13,7 @@ from grasp.manager import KgManager
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import POPULATION_REST, GroupRef, Population
 from grasp.tasks.om.data_models.profile import (
+    EntityMemberships,
     GroupDefinition,
     GroupOrigin,
     GroupProfile,
@@ -222,6 +223,12 @@ def default_non_competing_pairs(
         ]
 
 
+# a membership query runs once per run (EntityMemberships) or per strategy run
+# (inline groups) and may scan the whole KG: a cold QLever cache can take
+# longer than the read timeout of other queries
+MEMBERSHIP_READ_TIMEOUT = 60
+
+
 def retrieve_members(
         manager: KgManager, membership_sparql: str, entity_space: Iterable[str] = ()
         ) -> set[IRI]:
@@ -232,7 +239,7 @@ def retrieve_members(
     query = f"SELECT DISTINCT ?s WHERE {{ {membership_sparql} FILTER(isIRI(?s)) }}"
     space = tuple(entity_space)
     return {
-        IRI(row["s"].value) for row in select_rows(manager, query)
+        IRI(row["s"].value) for row in select_rows(manager, query, MEMBERSHIP_READ_TIMEOUT)
         if not space or row["s"].value.startswith(space)
         }
 
@@ -365,18 +372,6 @@ def in_population(
     return pair[0] in population_by_side[Side.SOURCE] and pair[1] in population_by_side[Side.TARGET]
 
 
-@dataclass(frozen=True)
-class EntityMemberships:
-    """
-    The partition and the profile groups of every entity of the entity space,
-    per side. They depend only on the profiles, so they are retrieved once per
-    task (retrieve_entity_memberships) and shared by every strategy run.
-    Entities of excluded groups have no groups.
-    """
-    partition_names_by_entity: dict[Side, dict[IRI, str]]
-    group_names_by_entity: dict[Side, dict[IRI, set[str]]]
-
-
 def retrieve_entity_memberships(
         managers: dict[Side, KgManager], alignment_state: AlignmentState
         ) -> EntityMemberships:
@@ -399,7 +394,8 @@ def retrieve_entity_memberships(
             kg_profile.entity_space
             )
 
-    return EntityMemberships(partition_names_by_entity, group_names_by_entity)
+    return EntityMemberships(
+        partition_names_by_entity=partition_names_by_entity, group_names_by_entity=group_names_by_entity)
 
 
 def strategy_group_names_by_entity(

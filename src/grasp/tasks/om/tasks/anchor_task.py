@@ -27,6 +27,7 @@ from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
+from grasp.tasks.om.data_models.profile import EntityMemberships
 from grasp.tasks.om.data_models.candidates import (
     Anchor,
     AnchorMerge,
@@ -59,7 +60,6 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
     merge_anchors,
 )
 from grasp.tasks.om.kg_operations.entity_rendering import EntityDisplay
-from grasp.tasks.om.kg_operations.grouping import retrieve_entity_memberships
 from grasp.tasks.om.tasks.candidate_task import (
     GENERATOR_SCHEMA,
     MAX_ENTITY_PAIRS_PER_BUCKET,
@@ -84,7 +84,9 @@ from grasp.tasks.om.tasks.prompting import (
     inline_schema,
     load_prompt,
 )
-from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state, resolve_strategy_history
+from grasp.tasks.om.tasks.task_input import (
+    managers_by_side, resolve_alignment_state, resolve_entity_memberships, resolve_strategy_history,
+)
 from grasp.utils import FunctionCallException, format_section
 
 # the selection of every anchor run: the unique candidate only (the anchor rule)
@@ -158,15 +160,13 @@ def run_full_anchor_ensemble(
         alignment_state: AlignmentState,
         run_ensemble: RunEnsemble,
         generators_by_run: dict[str, Generator],
+        entity_memberships: EntityMemberships,
         ) -> tuple[AnchorMerge, list[Stratum], CandidateRankIndex, PairSignalIndex]:
     """
     The full runs of the selected ensemble: the merged anchors, their
     certification strata, and the candidate rank index of the runs with a
     wider selection (COMPETITOR_SELECTION), for the candidate store.
     """
-    entity_memberships = retrieve_entity_memberships(
-        managers, alignment_state
-    )
     runs = {
         run_id: (generators_by_run[run_id], run_strategy(
             managers, alignment_state, generators_by_run[run_id],
@@ -672,15 +672,16 @@ class OMAnchorTask(GraspTask):
     def setup(self, input: Any) -> str:
         alignment_state = resolve_alignment_state(input)
         kg_managers = managers_by_side(self, alignment_state.source_kg_name, alignment_state.target_kg_name)
+        entity_memberships = resolve_entity_memberships(input, kg_managers, alignment_state)
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
-            entity_memberships=retrieve_entity_memberships(
-                kg_managers, alignment_state
-            ),
+            entity_memberships=entity_memberships,
             strategy_history=resolve_strategy_history(input),
             entity_displays={
-                side: EntityDisplay(kg_managers[side], alignment_state.get_kg_profile(side))
+                side: EntityDisplay(
+                    kg_managers[side], alignment_state.get_kg_profile(side),
+                    entity_memberships.group_names_by_entity[side])
                 for side in SIDES
             },
         )

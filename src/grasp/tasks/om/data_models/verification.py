@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 from grasp.tasks.om.data_models.alignment_state import AlignmentState
 from grasp.tasks.om.data_models.candidates import RunEvidence
-from grasp.tasks.om.data_models.profile import KgProfile
+from grasp.tasks.om.data_models.profile import EntityMemberships, KgProfile
 from grasp.tasks.om.foundation.types import IRI, EntityKey, Side
 
 
@@ -47,6 +47,8 @@ class VerifyInput(BaseModel):
     competitors: dict[Side, list[IRI]] = {}
     # show the profiles of both knowledge graphs before the entities
     profiles: bool = False
+    # the groups of the shown entities; without them queried (to_task_input passes them as they are)
+    entity_memberships: EntityMemberships | None = None
 
 
 class JudgeMode(StrEnum):
@@ -251,6 +253,8 @@ class SearchVerifyInput(BaseModel):
     alignment_state: AlignmentState
     unit: JudgingUnit
     variant: CandidateJudgeVariant = CandidateJudgeVariant()
+    # the groups of the shown entities; without them queried (to_task_input passes them as they are)
+    entity_memberships: EntityMemberships | None = None
 
 
 class SearchVerifyResult(BaseModel):

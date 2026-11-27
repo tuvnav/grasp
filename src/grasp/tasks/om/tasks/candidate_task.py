@@ -12,9 +12,10 @@ Per strategy (run_strategy):
        top_k, mutual, the unique candidate, optional filters
     3. summarize: the four signals per side, over the whole population
        (count_population)
-Once per task (retrieve_entity_memberships): the partition and the profile
-groups of every entity, which do not depend on the strategy; a run only adds
-the groups its population defines inline (strategy_group_names_by_entity).
+Once per run, from the caller (EntityMemberships; a task run on its own
+retrieves them): the partition and the profile groups of every entity, which
+do not depend on the strategy; a run only adds the groups its population
+defines inline (strategy_group_names_by_entity).
 
 Trial runs (run_strategy with trial=True), while the LLM tries strategies: if
 the larger population is above the limit of the vectorizer
@@ -75,6 +76,7 @@ from grasp.tasks.om.data_models.candidates import (
     ValuePatternSource,
 )
 from grasp.tasks.om.data_models.profile import (
+    EntityMemberships,
     StructureRelationKind,
     KgProfile,
     describe_profile,
@@ -104,11 +106,9 @@ from grasp.tasks.om.kg_operations.candidate_selection import (
 )
 from grasp.tasks.om.kg_operations.entity_rendering import SHORT_VIEW, EntityDisplay, clip_value
 from grasp.tasks.om.kg_operations.grouping import (
-    EntityMemberships,
     get_entities_of_population_side,
     in_population,
     population_group_names,
-    retrieve_entity_memberships,
     strategy_group_names_by_entity,
 )
 from grasp.tasks.om.kg_operations.candidate_generation import (
@@ -136,7 +136,9 @@ from grasp.tasks.om.tasks.prompting import (
     format_validation_error,
     load_prompt,
 )
-from grasp.tasks.om.tasks.task_input import managers_by_side, resolve_alignment_state, resolve_strategy_history
+from grasp.tasks.om.tasks.task_input import (
+    managers_by_side, resolve_alignment_state, resolve_entity_memberships, resolve_strategy_history,
+)
 from grasp.utils import FunctionCallException, format_section
 from pydantic import ValidationError
 
@@ -660,12 +662,9 @@ def run_full_ensemble(
         managers: dict[Side, KgManager],
         alignment_state: AlignmentState,
         run_ensemble: RunEnsemble,
-        generators_by_run: dict[str, Generator]
+        generators_by_run: dict[str, Generator],
+        entity_memberships: EntityMemberships
         ) -> MergedCandidates:
-
-    entity_memberships = retrieve_entity_memberships(
-        managers, alignment_state
-    )
 
     strategy_results_by_run = {
         run_name: run_strategy(
@@ -692,7 +691,7 @@ def run_full_ensemble(
 class CandidateTaskState:
     kg_managers: dict[Side, KgManager]
     alignment_state: AlignmentState  # doesn't change over the task
-    entity_memberships: EntityMemberships  # retrieved once in the setup
+    entity_memberships: EntityMemberships  # from the input (retrieved in the setup if missing)
     # what the strategy families of the earlier rounds contributed (empty in the first round)
     strategy_history: StrategyHistory = field(default_factory=StrategyHistory)
     runs: dict[str, tuple[Generator, StrategyResult]] = field(default_factory=dict)
@@ -1999,15 +1998,16 @@ class OMCandidateTask(GraspTask):
     def setup(self, input: Any) -> str:
         alignment_state = resolve_alignment_state(input)
         kg_managers = managers_by_side(self, alignment_state.source_kg_name, alignment_state.target_kg_name)
+        entity_memberships = resolve_entity_memberships(input, kg_managers, alignment_state)
         self.state = CandidateTaskState(
             kg_managers=kg_managers,
             alignment_state=alignment_state,
-            entity_memberships=retrieve_entity_memberships(kg_managers, alignment_state),
+            entity_memberships=entity_memberships,
             strategy_history=resolve_strategy_history(input),
             entity_displays={
                 side: EntityDisplay(
-                    kg_managers[side], alignment_state.get_kg_profile(side)
-                    )
+                    kg_managers[side], alignment_state.get_kg_profile(side),
+                    entity_memberships.group_names_by_entity[side])
                 for side in SIDES
             },
         )

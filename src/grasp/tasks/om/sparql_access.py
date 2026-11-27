@@ -195,7 +195,9 @@ def stream_rows(manager: KgManager, sparql: str) -> Iterator[dict]:
         raise ValueError(query_failure_message(error)) from error
 
 
-def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
+def select_rows(
+        manager: KgManager, sparql: str, read_timeout: float = READ_TIMEOUT
+        ) -> list[dict[str, Binding]]:
     """
     Rows of a SELECT query as variable -> binding (unbound variables are missing).
     """
@@ -203,7 +205,7 @@ def select_rows(manager: KgManager, sparql: str) -> list[dict[str, Binding]]:
         prepare_query(manager, sparql),
         manager.endpoint,
         STATS_TIMEOUT,
-        READ_TIMEOUT,
+        read_timeout,
         0,
         manager.headers, manager.params, None, manager.auth)
     if not isinstance(result, SelectResult):

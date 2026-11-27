@@ -16,7 +16,7 @@ prefetch retrieves (SPARQL, in batches, cached for the whole task), show only
 formats what was retrieved.
 """
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from grasp.manager import KgManager
 from grasp.sparql.types import Binding
@@ -361,10 +361,13 @@ class EntityDisplay:
     """
     How the entities of one KG are shown. Each entity with the roles of its
     groups (entity_roles); objects outside the entity space without a name
-    are only counted in a context (e.g. images).
+    are only counted in a context (e.g. images). group_names_by_entity: the
+    profile groups of the entities of the entity space (EntityMemberships);
+    without them the groups of the shown entities are queried.
     """
     manager: KgManager
     kg_profile: KgProfile
+    group_names_by_entity: Mapping[IRI, set[str]] | None = None
     # entity -> role name (with INVERSE_PREFIX: the other direction) -> values;
     # retrieved entities without any value have an empty entry
     values_by_entity_role: dict[IRI, dict[str, ValueGroup]] = field(default_factory=dict)
@@ -437,9 +440,13 @@ class EntityDisplay:
         its aggregated roles: entities in the same groups have the same roles, so each
         part can be retrieved in one batch.
         """
-        return entities_by_effective_roles(
-            self.kg_profile, get_group_names_by_entity(self.manager, self.kg_profile, entities)
-        )
+        if self.group_names_by_entity is None:
+            group_names_by_entity = get_group_names_by_entity(self.manager, self.kg_profile, entities)
+        else:
+            group_names_by_entity = {
+                entity: frozenset(self.group_names_by_entity.get(entity, ())) for entity in entities
+                }
+        return entities_by_effective_roles(self.kg_profile, group_names_by_entity)
 
     def prefetch_role_values(self, entities: set[IRI], role_names: Iterable[str], roles: PredicateRoles) -> None:
         """
@@ -480,6 +487,13 @@ class EntityDisplay:
             used_as_predicate=retrieve_predicate_usage(self.manager, entity, membership_predicates(roles)),
             blank_nodes=retrieve_blank_nodes(self.manager, entity, BLANK_NODE_MAX_DEPTH) if has_blank_nodes else {},
         )
+
+    def has_content(self, entity: IRI) -> bool:
+        """Whether a prefetched entity has anything to show: role values, edges or a use as predicate."""
+        context = self.contexts_by_entity.get(entity)
+        has_values = any(self.values_by_entity_role.get(entity, {}).values())
+        return has_values or (context is not None and bool(
+            context.outgoing or context.incoming or context.used_as_predicate))
 
     def shown_iris(self, entity: IRI) -> set[IRI]:
         """All IRIs of the context of a main entity that may be shown with their name."""

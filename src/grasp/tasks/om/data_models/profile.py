@@ -44,7 +44,7 @@ from typing import Any, Iterable, Literal, Mapping, Self, get_args
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from grasp.tasks.om.foundation.rendering import Item, Section, SectionContent
-from grasp.tasks.om.foundation.types import IRI, LocalNameType
+from grasp.tasks.om.foundation.types import IRI, LocalNameType, Side
 from grasp.tasks.om.foundation.rdf_vocabulary import (
     RDF_TYPE, VOCABULARY, VOCABULARY_PREFIXES, RDF_FIRST, RDF_REST
 )
@@ -1113,3 +1113,16 @@ def describe_profile(profile: KgProfile, findings: bool = True) -> Section:
 def is_partition_copy(group: GroupProfile) -> bool:
     """A group that is a partition, unchanged and without own features."""
     return group.definition.origin == GroupOrigin.PARTITION and not group.definition.features
+
+
+class EntityMemberships(BaseModel):
+    """
+    The partition and the profile groups of every entity of the entity space,
+    per side. They depend only on the profiles, which do not change after the
+    profiling: retrieved once per run (retrieve_entity_memberships), passed to
+    the tasks and the full runs, shared by every strategy run. Entities of
+    excluded groups have no groups.
+    """
+    model_config = ConfigDict(frozen=True)
+    partition_names_by_entity: dict[Side, dict[IRI, str]]
+    group_names_by_entity: dict[Side, dict[IRI, set[str]]]

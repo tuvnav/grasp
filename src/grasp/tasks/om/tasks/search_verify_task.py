@@ -57,8 +57,9 @@ from grasp.tasks.om.foundation.text_normalization import normalization_level_ord
 from grasp.tasks.om.kg_operations.entity_rendering import LONG_VIEW, EntityDisplay, clip_value
 from grasp.tasks.om.sparql_access import ensure_known
 from grasp.tasks.om.tasks.function_registry import FunctionRegistry
+from grasp.tasks.om.tasks.judge_functions import SHOW_ENTITIES, show_entities, show_entities_definition
 from grasp.tasks.om.tasks.prompting import add_equivalence_condition, fill_function_name_placeholders, load_prompt
-from grasp.tasks.om.tasks.task_input import managers_by_side
+from grasp.tasks.om.tasks.task_input import group_names_by_entity, managers_by_side
 from grasp.tasks.om.tasks.verify_task import describe_knowledge_graphs
 from grasp.utils import FunctionCallException, format_section
 
@@ -69,6 +70,7 @@ STRATEGY_ORDER = ["key", "embedding", "idf_char_3grams", "neighbours"]  # strong
 
 
 class SearchVerifyFunctionName(StrEnum):
+    SHOW_ENTITIES = SHOW_ENTITIES
     SET_EQUIVALENCE = "set_equivalence"
     DELETE_EQUIVALENCE = "delete_equivalence"
     FINISH = "finish"
@@ -432,6 +434,12 @@ def resolve_entity(
     return full_iri
 
 
+@func_reg.register(SearchVerifyFunctionName.SHOW_ENTITIES)
+def show_entities_of_kg(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
+    return show_entities(
+        {kg_name: state.entity_displays[side] for side, kg_name in state.kg_names.items()}, fn_args, known)
+
+
 @func_reg.register(SearchVerifyFunctionName.SET_EQUIVALENCE)
 def set_equivalence(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     pair = (resolve_entity(state, Side.SOURCE, fn_args.get("source_entity"), known),
@@ -485,12 +493,13 @@ def finish(state: SearchVerifyState, fn_args: dict, known: set[str]) -> str:
     return f"Finished with {len(state.equivalences)} equivalences."
 
 
-def function_definitions(function_names: list[SearchVerifyFunctionName]) -> list[dict]:
+def function_definitions(function_names: list[SearchVerifyFunctionName], kg_names: list[str]) -> list[dict]:
     entity_properties = {
         "source_entity": {"type": "string", "description": "The exact IRI of the source entity."},
         "target_entity": {"type": "string", "description": "The exact IRI of the target entity."},
     }
     definitions = {
+        SearchVerifyFunctionName.SHOW_ENTITIES: show_entities_definition(kg_names),
         SearchVerifyFunctionName.SET_EQUIVALENCE: {
             "name": SearchVerifyFunctionName.SET_EQUIVALENCE,
             "description": "Sets an equivalence between a source and a target entity.",
@@ -544,7 +553,9 @@ class SearchVerifyTask(GraspTask):
             unit=search_verify_input.unit,
             variant=search_verify_input.variant,
             entity_displays={
-                side: EntityDisplay(managers[side], alignment_state.get_kg_profile(side))
+                side: EntityDisplay(
+                    managers[side], alignment_state.get_kg_profile(side),
+                    group_names_by_entity(search_verify_input.entity_memberships, side))
                 for side in SIDES
             },
             know_before_use=know_before_use(self.config),
@@ -583,11 +594,13 @@ class SearchVerifyTask(GraspTask):
         ]
 
     def function_definitions(self) -> list[dict]:
-        return function_definitions(list(SearchVerifyFunctionName))
+        return function_definitions(list(SearchVerifyFunctionName), list(self.state.kg_names.values()))
 
     def final_step_functions(self) -> list[dict] | None:
         # the last step can still set a last equivalence, and must finish
-        return function_definitions([SearchVerifyFunctionName.SET_EQUIVALENCE, SearchVerifyFunctionName.FINISH])
+        return function_definitions(
+            [SearchVerifyFunctionName.SET_EQUIVALENCE, SearchVerifyFunctionName.FINISH],
+            list(self.state.kg_names.values()))
 
     def budget_message(self, steps_left: int, final: bool) -> str:
         if final:
